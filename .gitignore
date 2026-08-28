@@ -1,0 +1,6 @@
+nft-forward
+nft-forward-linux-*
+*.db
+*.db-shm
+*.db-wal
+/tmp/

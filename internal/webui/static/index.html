@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>NFT Forward</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">⇄</span>
+    <div class="brand-txt">
+      <strong>NFT Forward</strong>
+      <small>端口转发 · 流量监控</small>
+    </div>
+  </div>
+  <div class="conn-chip">
+    <span id="pulse"></span>
+    <em id="status-txt">连接中…</em>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- ===== 首页 ===== -->
+  <section class="view on" id="view-home">
+    <div class="hero glass">
+      <div class="hero-label"><span>实时速率</span></div>
+      <div id="hero-rate" class="hero-rate">—</div>
+      <div class="hero-pair">
+        <div class="pair up"><div><small>↑ 上传</small><b id="hero-up">—</b></div></div>
+        <div class="pair down"><div><small>↓ 下载</small><b id="hero-down">—</b></div></div>
+      </div>
+    </div>
+
+    <div class="stats">
+      <div class="stat glass"><div class="stat-head"><span>今日流量</span></div><b id="kpi-today">—</b></div>
+      <div class="stat glass"><div class="stat-head"><span>累计流量</span></div><b id="kpi-total">—</b></div>
+      <div class="stat glass"><div class="stat-head"><span>TCP 连接</span></div><b id="kpi-tcp">—</b></div>
+      <div class="stat glass"><div class="stat-head"><span>UDP 会话</span></div><b id="kpi-udp">—</b></div>
+    </div>
+
+    <div class="panel glass">
+      <div class="panel-head">
+        <h2>转发规则</h2>
+        <button class="btn primary" id="btn-new-rule">＋ 新增</button>
+      </div>
+      <div id="rule-cards" class="node-list"></div>
+    </div>
+  </section>
+
+  <!-- ===== 每日 ===== -->
+  <section class="view" id="view-daily">
+    <div class="panel glass">
+      <div class="panel-head"><h2>每日流量趋势</h2><span class="hint">最近 60 天 · 全部规则</span></div>
+      <div id="daily-table"></div>
+    </div>
+  </section>
+
+  <!-- ===== 规则 ===== -->
+  <section class="view" id="view-rules">
+    <div class="panel glass">
+      <div class="panel-head">
+        <h2>规则详情</h2>
+        <select id="rule-select" aria-label="选择规则"></select>
+      </div>
+      <div id="rule-detail"></div>
+      <h3 class="subhead">该规则每日流量（最近 60 天）</h3>
+      <div id="rule-daily-table"></div>
+    </div>
+  </section>
+
+</main>
+
+<nav class="dock glass">
+  <button class="tab on" data-view="home"><span>首页</span></button>
+  <button class="tab" data-view="daily"><span>每日</span></button>
+  <button class="tab" data-view="rules"><span>规则</span></button>
+</nav>
+
+<!-- ===== 管理抽屉 ===== -->
+<div class="drawer-mask" id="drawer-mask"></div>
+<aside class="drawer" id="policy-drawer" role="dialog" aria-modal="true">
+  <header class="drawer-head">
+    <div><small>规则管理</small><h3 id="drawer-rule-name">—</h3></div>
+    <button class="icon-btn" id="drawer-close" aria-label="关闭">✕</button>
+  </header>
+  <div class="drawer-body">
+    <section class="sect">
+      <div class="sect-title">转发设置</div>
+      <div class="field"><small>规则名称</small><input type="text" id="pol-name"></div>
+      <div class="field"><small>监听地址</small><input type="text" id="pol-listen-addr" value="0.0.0.0"></div>
+      <div class="field"><small>监听端口</small><input type="number" id="pol-listen-port" min="1" max="65535"></div>
+      <div class="field"><small>目标地址</small><input type="text" id="pol-target-addr"></div>
+      <div class="field"><small>目标端口</small><input type="number" id="pol-target-port" min="1" max="65535"></div>
+      <div class="field"><small>协议</small>
+        <select id="pol-proto">
+          <option value="tcp">TCP</option>
+          <option value="udp">UDP</option>
+          <option value="tcp+udp">TCP + UDP</option>
+        </select>
+      </div>
+      <label class="switch-row"><div><b>启用</b></div>
+        <input type="checkbox" id="pol-enable" class="sw-input"><span class="sw"></span></label>
+    </section>
+
+    <section class="sect">
+      <div class="sect-title">流量配额</div>
+      <label class="switch-row"><div><b>启用配额</b></div>
+        <input type="checkbox" id="pol-quota-enable" class="sw-input"><span class="sw"></span></label>
+      <div class="field summary-field"><small>当前已用</small><output id="pol-quota-used">—</output></div>
+      <div id="pol-quota-box" class="box hidden">
+        <div class="field row">
+          <input type="number" id="pol-quota-val" min="1" placeholder="500">
+          <select id="pol-quota-unit"><option value="GiB">GiB</option><option value="TiB">TiB</option></select>
+        </div>
+      </div>
+      <button type="button" class="ghost-btn" id="pol-quota-reset">重置当前使用量（保留历史）</button>
+    </section>
+
+    <section class="sect">
+      <div class="sect-title">IP 数量限制</div>
+      <label class="switch-row"><div><b>启用限制</b></div>
+        <input type="checkbox" id="pol-ip-enable" class="sw-input"><span class="sw"></span></label>
+      <div class="field summary-field"><small>当前在线 IP</small><output id="pol-ip-active">—</output></div>
+      <div id="pol-ip-box" class="box hidden">
+        <div class="field"><small>最大同时在线数</small>
+          <input type="number" id="pol-ip-max" min="1" placeholder="3"></div>
+      </div>
+    </section>
+
+    <div class="danger-zone">
+      <button type="button" class="btn danger" id="pol-delete-rule">删除规则</button>
+    </div>
+    <div class="err" id="pol-error"></div>
+  </div>
+  <footer class="drawer-foot">
+    <button class="btn ghost" id="pol-cancel">取消</button>
+    <button class="btn primary" id="pol-save">保存</button>
+  </footer>
+</aside>
+
+<!-- ===== 在线 IP 抽屉 ===== -->
+<aside class="drawer" id="ips-drawer" role="dialog" aria-modal="true">
+  <header class="drawer-head">
+    <div><small>在线 IP</small><h3 id="ips-rule-name">—</h3></div>
+    <button class="icon-btn" id="ips-close" aria-label="关闭">✕</button>
+  </header>
+  <div class="drawer-body"><div id="ips-list" class="ips-list"></div></div>
+</aside>
+
+<div id="toast" role="status"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
