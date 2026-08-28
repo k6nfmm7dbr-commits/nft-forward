@@ -20,9 +20,9 @@ import (
 
 // 默认超时（可由 setter 覆盖，测试用）。
 const (
-	defaultIPIdle        = 60 * time.Second // 半开连接无流量判活窗口
-	defaultUDPIdle       = 120 * time.Second
-	defaultRejectedTTL   = 60 * time.Second
+	defaultIPIdle         = 60 * time.Second // 半开连接无流量判活窗口
+	defaultUDPIdle        = 120 * time.Second
+	defaultRejectedTTL    = 60 * time.Second
 	defaultProvisionalTTL = 10 * time.Second
 )
 
@@ -46,11 +46,11 @@ type RuleIPSnapshot struct {
 
 // RuleQuotaState 是单条规则的配额状态。
 type RuleQuotaState struct {
-	RuleID       int64  `json:"rule_id"`
-	Enabled      bool   `json:"quota_enabled"`
-	LimitBytes   int64  `json:"quota_limit_bytes"`
-	UsedBytes    int64  `json:"quota_used_bytes"`
-	State        string `json:"quota_state"` // unlimited / ok / exceeded
+	RuleID     int64  `json:"rule_id"`
+	Enabled    bool   `json:"quota_enabled"`
+	LimitBytes int64  `json:"quota_limit_bytes"`
+	UsedBytes  int64  `json:"quota_used_bytes"`
+	State      string `json:"quota_state"` // unlimited / ok / exceeded
 }
 
 // RuleState 合并单条规则的配额与 IP 状态（供 API / SSE / 状态徽标）。
@@ -68,11 +68,11 @@ type flowState struct {
 
 // Service 是策略编排服务。
 type Service struct {
-	db       *sql.DB
-	store    *forward.Store
-	runner   nft.Runner
-	nftConf  string
-	ctPath   string
+	db      *sql.DB
+	store   *forward.Store
+	runner  nft.Runner
+	nftConf string
+	ctPath  string
 
 	ipIdle         time.Duration
 	udpIdle        time.Duration
@@ -117,15 +117,15 @@ func New(db *sql.DB, store *forward.Store, runner nft.Runner, nftConf, ctPath st
 }
 
 // SetClock / setter 用于测试。
-func (s *Service) SetClock(fn func() time.Time)                              { s.now = fn }
+func (s *Service) SetClock(fn func() time.Time) { s.now = fn }
 func (s *Service) SetNFTApply(fn func(ctx context.Context, r nft.Runner, p, script string) error) {
 	s.nftApply = fn
 }
 func (s *Service) SetConntrack(fn func(path string) connection.Result) { s.conntrack = fn }
-func (s *Service) SetIPIdle(d time.Duration)                         { s.ipIdle = d }
-func (s *Service) SetUDPIdle(d time.Duration)                        { s.udpIdle = d }
-func (s *Service) SetRejectedTTL(d time.Duration)                    { s.rejectedTTL = d }
-func (s *Service) SetProvisionalTTL(d time.Duration)                 { s.provisionalTTL = d }
+func (s *Service) SetIPIdle(d time.Duration)                           { s.ipIdle = d }
+func (s *Service) SetUDPIdle(d time.Duration)                          { s.udpIdle = d }
+func (s *Service) SetRejectedTTL(d time.Duration)                      { s.rejectedTTL = d }
+func (s *Service) SetProvisionalTTL(d time.Duration)                   { s.provisionalTTL = d }
 
 // Ready 报告是否完成首次 reconcile。
 func (s *Service) Ready() bool {

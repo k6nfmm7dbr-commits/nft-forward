@@ -15,28 +15,28 @@ import (
 // RuleView 是规则的完整视图（供列表/详情）。
 type RuleView struct {
 	forward.Rule
-	Status    string      `json:"status"` // normal/disabled/quota_exceeded/ip_limited/error
-	Rate      traffic.Rate `json:"rate"`
-	TotalUp   int64       `json:"total_up"`
-	TotalDown int64       `json:"total_down"`
-	TodayUp   int64       `json:"today_up"`
-	TodayDown int64       `json:"today_down"`
-	ActiveIPs int         `json:"active_ip_count"`
+	Status    string                 `json:"status"` // normal/disabled/quota_exceeded/ip_limited/error
+	Rate      traffic.Rate           `json:"rate"`
+	TotalUp   int64                  `json:"total_up"`
+	TotalDown int64                  `json:"total_down"`
+	TodayUp   int64                  `json:"today_up"`
+	TodayDown int64                  `json:"today_down"`
+	ActiveIPs int                    `json:"active_ip_count"`
 	Quota     *policy.RuleQuotaState `json:"quota,omitempty"`
 	IPs       *policy.RuleIPSnapshot `json:"ips,omitempty"`
 }
 
 // FullSnapshot 是 SSE 首包 / summary 的完整快照。
 type FullSnapshot struct {
-	Now      int64       `json:"now"`
-	TotalUp  int64       `json:"total_up"`
-	TotalDown int64      `json:"total_down"`
-	TodayUp  int64       `json:"today_up"`
-	TodayDown int64      `json:"today_down"`
-	Rate     traffic.Rate `json:"rate"`
-	ConnTCP  int         `json:"conn_tcp"`
-	ConnUDP  int         `json:"conn_udp"`
-	Rules    []RuleView  `json:"rules"`
+	Now       int64        `json:"now"`
+	TotalUp   int64        `json:"total_up"`
+	TotalDown int64        `json:"total_down"`
+	TodayUp   int64        `json:"today_up"`
+	TodayDown int64        `json:"today_down"`
+	Rate      traffic.Rate `json:"rate"`
+	ConnTCP   int          `json:"conn_tcp"`
+	ConnUDP   int          `json:"conn_udp"`
+	Rules     []RuleView   `json:"rules"`
 }
 
 // buildFullSnapshot 构建全量快照。
@@ -136,18 +136,18 @@ func (s *Server) handleAPIGet(w http.ResponseWriter, r *http.Request, route stri
 
 // LiveView 是轻量实时视图（2s 刷新）。
 type LiveView struct {
-	Now      int64 `json:"now"`
-	RateUp   float64 `json:"rate_up"`
-	RateDown float64 `json:"rate_down"`
+	Now      int64      `json:"now"`
+	RateUp   float64    `json:"rate_up"`
+	RateDown float64    `json:"rate_down"`
 	Rules    []LiveRule `json:"rules"`
 }
 
 type LiveRule struct {
-	ID        int64  `json:"id"`
+	ID        int64   `json:"id"`
 	RateUp    float64 `json:"rate_up"`
 	RateDown  float64 `json:"rate_down"`
-	ActiveIPs int    `json:"active_ip_count"`
-	Status    string `json:"status"`
+	ActiveIPs int     `json:"active_ip_count"`
+	Status    string  `json:"status"`
 }
 
 func (s *Server) buildLive() LiveView {
@@ -258,9 +258,9 @@ type queryRows struct {
 
 // DailyRow 是每日流量行。
 type DailyRow struct {
-	Day   string `json:"day"`
-	Up    int64  `json:"up"`
-	Down  int64  `json:"down"`
+	Day  string `json:"day"`
+	Up   int64  `json:"up"`
+	Down int64  `json:"down"`
 }
 
 // ---- POST ----

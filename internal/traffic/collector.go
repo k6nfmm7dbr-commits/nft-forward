@@ -34,11 +34,11 @@ type Rate struct {
 
 // Status 是采集器快照。
 type Status struct {
-	Error    string
-	LastOK   int64
-	Rates    map[int64]Rate
-	ConnTCP  map[int64]int
-	ConnUDP  map[int64]int
+	Error   string
+	LastOK  int64
+	Rates   map[int64]Rate
+	ConnTCP map[int64]int
+	ConnUDP map[int64]int
 }
 
 // Collector 采集 nft named counter 并写库。

@@ -52,15 +52,15 @@ func defaultConf() map[string]any {
 type Config struct {
 	raw map[string]any
 
-	DB         string
-	NftConf    string
-	SysctlConf string
-	Listen     string
-	Port       int
-	Token      string
-	Interval   int
-	TZ         string
-	SSHGuard   int // 冲突检查需避开的 SSH 端口
+	DB           string
+	NftConf      string
+	SysctlConf   string
+	Listen       string
+	Port         int
+	Token        string
+	Interval     int
+	TZ           string
+	SSHGuard     int // 冲突检查需避开的 SSH 端口
 	SecureCookie bool
 }
 

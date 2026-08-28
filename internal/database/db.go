@@ -18,6 +18,7 @@ import (
 // 方向定义（与 SBX 习惯一致）：
 //   - upload / rx  = 客户端 → 转发服务器 → 目标
 //   - download / tx = 目标 → 转发服务器 → 客户端
+//
 // rules.deleted 是软删除标记：删除转发规则时不物理删除，保留历史流量可审计。
 const Schema = `
 CREATE TABLE IF NOT EXISTS meta (

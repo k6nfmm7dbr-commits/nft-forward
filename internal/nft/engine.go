@@ -11,15 +11,17 @@
 //   - table inet nff_filter  FORWARD 计数 + 配额阻断 + IP allow set
 //
 // 为什么计数放在 FORWARD 而不是 NAT 链：
-//   NAT 链（PREROUTING/POSTROUTING）主要负责连接 NAT 决策，不能依赖其 counter
-//   统计完整持续数据流；完整的上传/下载字节必须在 FORWARD（filter）路径、
-//   用 conntrack 归属到规则后统计。
+//
+//	NAT 链（PREROUTING/POSTROUTING）主要负责连接 NAT 决策，不能依赖其 counter
+//	统计完整持续数据流；完整的上传/下载字节必须在 FORWARD（filter）路径、
+//	用 conntrack 归属到规则后统计。
 //
 // 为什么用 `ct original proto-dst <listen_port>` 归属规则：
-//   多条规则可以指向同一个目标地址:端口（如 20000→X:8844、30000→X:8844）。
-//   若用「目标地址+端口」匹配会把两条规则的流量混在一起。必须用连接进入时的
-//   原始目标端口（监听端口，即 conntrack original tuple 的 proto-dst）来稳定归属。
-//   冲突校验保证「协议+监听端口」唯一，因此该组合无歧义。
+//
+//	多条规则可以指向同一个目标地址:端口（如 20000→X:8844、30000→X:8844）。
+//	若用「目标地址+端口」匹配会把两条规则的流量混在一起。必须用连接进入时的
+//	原始目标端口（监听端口，即 conntrack original tuple 的 proto-dst）来稳定归属。
+//	冲突校验保证「协议+监听端口」唯一，因此该组合无歧义。
 //
 // 方向定义（与 SBX 习惯一致）：
 //   - upload / rx  = ct direction original（客户端 → 转发服务器 → 目标）

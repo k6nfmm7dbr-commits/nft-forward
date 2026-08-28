@@ -113,7 +113,7 @@ func TestGenDisabledExcluded(t *testing.T) {
 
 func TestGenQuotaBlocked(t *testing.T) {
 	script := GenScript(&GenInput{
-		Rules: []*forward.Rule{rule(1, "tcp", 20000, "1.2.3.4", 443, true)},
+		Rules:  []*forward.Rule{rule(1, "tcp", 20000, "1.2.3.4", 443, true)},
 		States: map[int64]*RuleState{1: {QuotaExceeded: true}},
 	})
 	if !strings.Contains(script, "ct mark 1 drop") {
