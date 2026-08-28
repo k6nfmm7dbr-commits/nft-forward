@@ -230,6 +230,11 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 // ---- 静态资源 ----
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, route string) {
+	// healthz 无需认证（监控探针）。
+	if route == "/healthz" {
+		s.sendJSON(w, r, http.StatusOK, M{"ok": true})
+		return
+	}
 	if !s.authorized(r) {
 		s.serveAsset(w, "login.html", "text/html; charset=utf-8")
 		return
@@ -237,12 +242,12 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, route stri
 	switch route {
 	case "/", "/index.html":
 		s.serveAsset(w, "index.html", "text/html; charset=utf-8")
+	case "/login":
+		s.serveAsset(w, "login.html", "text/html; charset=utf-8")
 	case "/app.js":
 		s.serveAsset(w, "app.js", "application/javascript; charset=utf-8")
 	case "/style.css":
 		s.serveAsset(w, "style.css", "text/css; charset=utf-8")
-	case "/healthz":
-		s.sendJSON(w, r, http.StatusOK, M{"ok": true})
 	default:
 		s.sendJSON(w, r, http.StatusNotFound, M{"error": "not found"})
 	}

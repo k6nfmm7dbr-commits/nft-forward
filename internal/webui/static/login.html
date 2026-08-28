@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>登录 · NFT Forward</title>
+<style>
+  :root{
+    --bg:#0b0d10;--surface:#14171c;--surface-2:#1a1e24;--line:rgba(255,255,255,.07);
+    --line-2:rgba(255,255,255,.12);--text:#e7eaf0;--text-2:#aab1bd;--text-3:#6b7382;
+    --accent:#5b8cff;--accent-soft:rgba(91,140,255,.12);--bad:#ef7582;--r-md:12px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:var(--bg);color:var(--text);min-height:100dvh;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    font-size:14px;display:grid;place-items:center;padding:20px;
+  }
+  .card{width:100%;max-width:340px;background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:28px 24px}
+  .brand{display:flex;align-items:center;gap:10px;margin-bottom:6px}
+  .logo{display:grid;place-items:center;width:38px;height:38px;border-radius:10px;background:var(--accent);color:#fff;font-weight:800;font-size:18px}
+  .brand-txt strong{display:block;font-size:15px}
+  .brand-txt small{color:var(--text-3);font-size:11px}
+  .sub{color:var(--text-2);font-size:12.5px;margin:14px 0 18px;line-height:1.6}
+  label{display:block;font-size:12px;color:var(--text-3);margin-bottom:6px}
+  input[type=password]{
+    width:100%;padding:11px 12px;background:var(--surface-2);border:1px solid var(--line-2);
+    border-radius:10px;color:var(--text);font-size:14px;letter-spacing:.04em;outline:none;
+  }
+  input[type=password]:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  button{
+    width:100%;margin-top:16px;padding:12px;background:var(--accent);border:0;border-radius:10px;
+    color:#fff;font-size:14px;font-weight:600;cursor:pointer;
+  }
+  button:disabled{opacity:.6;cursor:not-allowed}
+  .err{color:var(--bad);font-size:12.5px;margin-top:12px;min-height:16px;text-align:center}
+  .foot{color:var(--text-3);font-size:11px;margin-top:18px;text-align:center}
+</style>
+</head>
+<body>
+  <form class="card" id="login-form" autocomplete="off">
+    <div class="brand">
+      <span class="logo">⇄</span>
+      <div class="brand-txt">
+        <strong>NFT Forward</strong>
+        <small>端口转发 · 流量监控</small>
+      </div>
+    </div>
+    <p class="sub">请输入面板令牌以访问控制台。</p>
+    <label for="token">令牌</label>
+    <input type="password" id="token" name="token" placeholder="输入令牌" autofocus>
+    <button type="submit" id="submit">登录</button>
+    <div class="err" id="err"></div>
+    <div class="foot">令牌位于服务器 /etc/nft-forward/panel.json</div>
+  </form>
+<script>
+  (function(){
+    var form=document.getElementById('login-form'),inp=document.getElementById('token'),
+        btn=document.getElementById('submit'),err=document.getElementById('err');
+    form.addEventListener('submit',function(e){
+      e.preventDefault();
+      err.textContent='';
+      btn.disabled=true;btn.textContent='登录中…';
+      fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({token:inp.value.trim()})
+      }).then(function(r){return r.json().catch(function(){return{}}).then(function(d){return{ok:r.ok,d:d};});})
+        .then(function(x){
+          if(x.ok){location.replace('/');return;}
+          err.textContent=(x.d&&x.d.error)||'令牌错误';
+          btn.disabled=false;btn.textContent='登录';
+        })
+        .catch(function(){
+          err.textContent='网络错误，请重试';
+          btn.disabled=false;btn.textContent='登录';
+        });
+    });
+  })();
+</script>
+</body>
+</html>
