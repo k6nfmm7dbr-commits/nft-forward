@@ -67,7 +67,7 @@ func lastActive(ip string, lastSeen, lastTraffic time.Time) time.Time {
 // Reconcile 执行一轮严格原子 admission。
 //
 // active 是「已建立并判活在线」的 IP；candidates 是「发起握手但尚未建立」的 IP。
-// maxIPs<=0 表示不限制。
+// maxIPs<=0 表示不限制。idle/udpIdle 分别是 TCP/UDP 的 Observed GC 窗口。
 //
 //   - 已持有 slot 优先保留；
 //   - active 优先于 candidate；
@@ -76,7 +76,7 @@ func lastActive(ip string, lastSeen, lastTraffic time.Time) time.Time {
 //   - 超出上限 → Rejected，绝不进 allow set。
 //
 // 返回 allowSet（所有 slot，含 provisional）与是否有新拒绝。
-func (st *NodeIPState) Reconcile(active, candidates map[string]IPActivity, maxIPs int, now time.Time, idle, rejectedTTL, provisionalTTL time.Duration) (allowSet map[string]bool, hasRejected bool) {
+func (st *NodeIPState) Reconcile(active, candidates map[string]IPActivity, maxIPs int, now time.Time, idle, udpIdle, rejectedTTL, provisionalTTL time.Duration) (allowSet map[string]bool, hasRejected bool) {
 	st.MaxIPs = maxIPs
 
 	type want struct {
@@ -192,6 +192,7 @@ func (st *NodeIPState) Reconcile(active, candidates map[string]IPActivity, maxIP
 	}
 
 	// 7) Observed GC：无 slot、无拒绝、久未活跃的观察项清理。
+	//    UDP 会话用较长的 udpIdle 窗口（UDP 无连接状态，收敛更慢）。
 	for ip, o := range st.Observed {
 		if _, ok := st.Slots[ip]; ok {
 			continue
@@ -199,7 +200,11 @@ func (st *NodeIPState) Reconcile(active, candidates map[string]IPActivity, maxIP
 		if _, ok := st.Rejected[ip]; ok {
 			continue
 		}
-		if now.Sub(lastActive(ip, o.LastSeen, o.LastTraffic)) > idle {
+		window := idle
+		if o.UDPSessions > 0 && udpIdle > window {
+			window = udpIdle
+		}
+		if now.Sub(lastActive(ip, o.LastSeen, o.LastTraffic)) > window {
 			delete(st.Observed, ip)
 		}
 	}

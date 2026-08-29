@@ -1,5 +1,5 @@
 // Package traffic 负责流量采集：读取 nft named counter、单调差分、
-// reset/epoch 检测、写入 SQLite（totals / daily / samples）。
+// reset/epoch 检测、写入 SQLite（totals / daily）。
 //
 // 方向定义（与 SBX 习惯一致）：
 //   - upload / rx  = 客户端 → 转发服务器 → 目标（ct direction original）
@@ -14,7 +14,6 @@ package traffic
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -34,11 +33,9 @@ type Rate struct {
 
 // Status 是采集器快照。
 type Status struct {
-	Error   string
-	LastOK  int64
-	Rates   map[int64]Rate
-	ConnTCP map[int64]int
-	ConnUDP map[int64]int
+	Error  string
+	LastOK int64
+	Rates  map[int64]Rate
 }
 
 // Collector 采集 nft named counter 并写库。
@@ -156,6 +153,9 @@ func parseCounterName(name string) (ruleID int64, dir int, ok bool) {
 }
 
 func parseInt64(s string) (int64, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty int")
+	}
 	var v int64
 	for _, ch := range s {
 		if ch < '0' || ch > '9' {
@@ -220,7 +220,7 @@ func (c *Collector) Tick(ctx context.Context) error {
 		}
 	}
 
-	// 写库：totals / daily / samples（一个事务）。
+	// 写库：totals / daily（一个事务）。
 	if err := c.commit(ctx, day, nowSec, deltas, baselines); err != nil {
 		c.mu.Lock()
 		c.lastError = err.Error()
@@ -316,5 +316,3 @@ func (c *Collector) commit(ctx context.Context, day string, nowSec int64, deltas
 	}
 	return tx.Commit()
 }
-
-var _ = sql.ErrNoRows

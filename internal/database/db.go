@@ -63,16 +63,6 @@ CREATE TABLE IF NOT EXISTS traffic_totals (
     upload_bytes   INTEGER NOT NULL DEFAULT 0,
     download_bytes INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS samples (
-    ts          INTEGER NOT NULL,
-    rule_id     INTEGER NOT NULL,
-    rx          INTEGER NOT NULL DEFAULT 0,
-    tx          INTEGER NOT NULL DEFAULT 0,
-    duration_ms INTEGER NOT NULL DEFAULT 0,
-    valid       INTEGER NOT NULL DEFAULT 1,
-    PRIMARY KEY (ts, rule_id)
-);
-CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
 `
 
 // DB 包装 *sql.DB。单写者，连接数限制为 1 以规避 SQLITE_BUSY。

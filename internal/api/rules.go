@@ -1,11 +1,10 @@
 package api
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
-	"time"
 
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/forward"
 )
@@ -16,25 +15,9 @@ func decodeRuleReq(r *http.Request, v any) error {
 	if err != nil {
 		return err
 	}
-	dec := json.NewDecoder(newReader(body))
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	return dec.Decode(v)
-}
-
-func newReader(b []byte) io.Reader { return &byteReader{b: b} }
-
-type byteReader struct {
-	b []byte
-	i int
-}
-
-func (r *byteReader) Read(p []byte) (int, error) {
-	if r.i >= len(r.b) {
-		return 0, io.EOF
-	}
-	n := copy(p, r.b[r.i:])
-	r.i += n
-	return n, nil
 }
 
 // guardPorts 返回转发规则不能占用的保留端口。
@@ -281,9 +264,3 @@ func (s *Server) resetQuota(w http.ResponseWriter, r *http.Request, id int64) {
 func (s *Server) publishSnapshot() {
 	s.PublishSSE("snapshot", s.buildFullSnapshot())
 }
-
-// Lifetime 暴露累计流量读取（配额重置用）。
-func (s *Server) lifetimeUnused() {}
-
-var _ = context.Background
-var _ = time.Now

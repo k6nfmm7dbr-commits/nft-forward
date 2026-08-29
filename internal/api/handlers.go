@@ -22,6 +22,8 @@ type RuleView struct {
 	TodayUp   int64                  `json:"today_up"`
 	TodayDown int64                  `json:"today_down"`
 	ActiveIPs int                    `json:"active_ip_count"`
+	ConnTCP   int                    `json:"conn_tcp"`
+	ConnUDP   int                    `json:"conn_udp"`
 	Quota     *policy.RuleQuotaState `json:"quota,omitempty"`
 	IPs       *policy.RuleIPSnapshot `json:"ips,omitempty"`
 }
@@ -62,6 +64,8 @@ func (s *Server) buildFullSnapshot() FullSnapshot {
 		v.TodayUp, v.TodayDown = s.dailyFor(ctx, r.ID, today)
 		if ps, ok := polStates[r.ID]; ok {
 			v.ActiveIPs = ps.IPs.GrantedCount
+			v.ConnTCP = ps.ConnTCP
+			v.ConnUDP = ps.ConnUDP
 			q := ps.Quota
 			v.Quota = &q
 			ip := ps.IPs
@@ -73,6 +77,8 @@ func (s *Server) buildFullSnapshot() FullSnapshot {
 		snap.TodayDown += v.TodayDown
 		snap.Rate.Upload += v.Rate.Upload
 		snap.Rate.Download += v.Rate.Download
+		snap.ConnTCP += v.ConnTCP
+		snap.ConnUDP += v.ConnUDP
 		snap.Rules = append(snap.Rules, v)
 	}
 	return snap
@@ -139,6 +145,8 @@ type LiveView struct {
 	Now      int64      `json:"now"`
 	RateUp   float64    `json:"rate_up"`
 	RateDown float64    `json:"rate_down"`
+	ConnTCP  int        `json:"conn_tcp"`
+	ConnUDP  int        `json:"conn_udp"`
 	Rules    []LiveRule `json:"rules"`
 }
 
@@ -147,6 +155,8 @@ type LiveRule struct {
 	RateUp    float64 `json:"rate_up"`
 	RateDown  float64 `json:"rate_down"`
 	ActiveIPs int     `json:"active_ip_count"`
+	ConnTCP   int     `json:"conn_tcp"`
+	ConnUDP   int     `json:"conn_udp"`
 	Status    string  `json:"status"`
 }
 
@@ -164,9 +174,13 @@ func (s *Server) buildLive() LiveView {
 		}
 		if ps, ok := polStates[r.ID]; ok {
 			lr.ActiveIPs = ps.IPs.GrantedCount
+			lr.ConnTCP = ps.ConnTCP
+			lr.ConnUDP = ps.ConnUDP
 		}
 		lv.RateUp += lr.RateUp
 		lv.RateDown += lr.RateDown
+		lv.ConnTCP += lr.ConnTCP
+		lv.ConnUDP += lr.ConnUDP
 		lv.Rules = append(lv.Rules, lr)
 	}
 	return lv
@@ -222,6 +236,8 @@ func (s *Server) ruleView(ctx context.Context, id int64) (*RuleView, error) {
 	v.TotalUp, v.TotalDown = s.totals(ctx, id)
 	if ps, ok := polStates[id]; ok {
 		v.ActiveIPs = ps.IPs.GrantedCount
+		v.ConnTCP = ps.ConnTCP
+		v.ConnUDP = ps.ConnUDP
 		q := ps.Quota
 		v.Quota = &q
 		ip := ps.IPs

@@ -41,6 +41,20 @@ if [ ! -f "${CONF_DIR}/panel.json" ]; then
   "${INSTALL_DIR}/${BIN}" config-ensure-token >/dev/null 2>&1 || true
 fi
 
+# 开启 IP 转发（转发功能的前提；写入独立 sysctl 文件，不修改 /etc/sysctl.conf）
+SYSCTL_FILE=/etc/sysctl.d/90-nft-forward.conf
+cat > "$SYSCTL_FILE" <<'EOF'
+# 由 nft-forward 安装脚本写入。删除本文件即可撤销。
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
+if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ]; then
+  echo "IP 转发已开启（$SYSCTL_FILE）"
+else
+  echo "警告: IP 转发未开启，转发将不工作。请检查 $SYSCTL_FILE"
+fi
+
 # systemd 服务
 if command -v systemctl >/dev/null 2>&1; then
   cat > /etc/systemd/system/nft-forward.service <<EOF

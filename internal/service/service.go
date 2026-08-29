@@ -65,9 +65,10 @@ func Serve() int {
 	defer collectCancel()
 	go runCollector(collectCtx, collect, time.Duration(cfg.Interval)*time.Second)
 
-	// 策略周期 reconcile（一致性自愈 + 配额事件兜底）。
-	// 用较高频率（500ms）缩短「连接已建立但 slot 未授予」的竞态窗口，
-	// 让新 IP 的连接能尽快被放行。
+	// 策略周期 reconcile（一致性自愈 + 配额事件兜底 + IP 准入）。
+	// 500ms 是为了缩短「连接已建立但 slot 未授予」的竞态窗口。
+	// 注意：reconcile 现在只在结构变化时重写 nft 链，稳定期只做元素增量，
+	// 因此高频运行不会清零流量 counter。
 	polCtx, polCancel := context.WithCancel(ctx)
 	defer polCancel()
 	go runPolicy(polCtx, pol, 500*time.Millisecond)
@@ -117,9 +118,11 @@ func runCollector(ctx context.Context, c *traffic.Collector, interval time.Durat
 	}
 }
 
+// runPolicy 周期 reconcile。interval 允许亚秒（IP 准入需要尽快授予 slot，
+// 否则新 IP 的连接会在 allow set 更新前被 drop）。
 func runPolicy(ctx context.Context, p *policy.Service, interval time.Duration) {
-	if interval < time.Second {
-		interval = time.Second
+	if interval < 100*time.Millisecond {
+		interval = 100 * time.Millisecond
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

@@ -18,7 +18,7 @@ const (
 )
 
 func recon(st *NodeIPState, active, cand map[string]IPActivity, max int, now time.Time) (map[string]bool, bool) {
-	return st.Reconcile(active, cand, max, now, hour, ttl, prov)
+	return st.Reconcile(active, cand, max, now, hour, 2*hour, ttl, prov)
 }
 
 // limit=1：A 允许，B 拒绝。

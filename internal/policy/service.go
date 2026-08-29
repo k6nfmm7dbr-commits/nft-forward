@@ -10,6 +10,7 @@ import (
 	"context"
 	"database/sql"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,9 +56,11 @@ type RuleQuotaState struct {
 
 // RuleState 合并单条规则的配额与 IP 状态（供 API / SSE / 状态徽标）。
 type RuleState struct {
-	RuleID int64
-	Quota  RuleQuotaState
-	IPs    RuleIPSnapshot
+	RuleID  int64
+	Quota   RuleQuotaState
+	IPs     RuleIPSnapshot
+	ConnTCP int // 当前 TCP 连接数（已授权 IP 之和）
+	ConnUDP int // 当前 UDP 会话数（已授权 IP 之和）
 }
 
 // flowState 跟踪单条流的字节（判活用）。
@@ -80,6 +83,7 @@ type Service struct {
 	provisionalTTL time.Duration
 	now            func() time.Time
 	nftApply       func(ctx context.Context, runner nft.Runner, path, script string) error
+	nftReadState   func(ctx context.Context, runner nft.Runner) (*nft.State, error)
 	conntrack      func(path string) connection.Result
 
 	runMu sync.Mutex
@@ -90,6 +94,10 @@ type Service struct {
 	states   map[int64]*RuleState
 	ready    bool
 	lastErr  string
+
+	// lastStructSig 是最近成功应用的结构签名。
+	// 结构未变时只做元素增量同步，绝不重写链 —— 这是 counter 不被清零的保证。
+	lastStructSig string
 }
 
 // New 构造策略服务。
@@ -109,6 +117,7 @@ func New(db *sql.DB, store *forward.Store, runner nft.Runner, nftConf, ctPath st
 		provisionalTTL: defaultProvisionalTTL,
 		now:            time.Now,
 		nftApply:       nft.Apply,
+		nftReadState:   nft.ReadState,
 		conntrack:      connection.ReadConntrack,
 		ipStates:       map[int64]*NodeIPState{},
 		flows:          map[string]*flowState{},
@@ -120,6 +129,11 @@ func New(db *sql.DB, store *forward.Store, runner nft.Runner, nftConf, ctPath st
 func (s *Service) SetClock(fn func() time.Time) { s.now = fn }
 func (s *Service) SetNFTApply(fn func(ctx context.Context, r nft.Runner, p, script string) error) {
 	s.nftApply = fn
+}
+
+// SetNFTReadState 注入 nft 状态读取（测试用）。
+func (s *Service) SetNFTReadState(fn func(ctx context.Context, r nft.Runner) (*nft.State, error)) {
+	s.nftReadState = fn
 }
 func (s *Service) SetConntrack(fn func(path string) connection.Result) { s.conntrack = fn }
 func (s *Service) SetIPIdle(d time.Duration)                           { s.ipIdle = d }
@@ -180,7 +194,12 @@ func (s *Service) lifetimeBytes(ctx context.Context, ruleID int64) (int64, error
 }
 
 // buildActiveCandidates 从 conntrack 流里拆出某规则的 active（判活）与 candidate。
-// flows 按字节增量判活：字节变化=有流量；字节不变但在 idle 内=仍在线；超窗=死连接剔除。
+//
+// 判活规则（按协议区分，因为 UDP 没有连接状态）：
+//   - TCP ESTABLISHED：字节有增量=活跃；字节不变但在 ipIdle 内=仍在线（半开）；
+//     超窗无流量=死连接，剔除。conntrack 里流消失则立即离线。
+//   - TCP SYN_SENT/SYN_RECV：candidate（握手中，尚未建立）。
+//   - UDP：无状态，只能按 udpIdle 空闲窗口判活（无流量超窗即离线）。
 func (s *Service) buildActiveCandidates(ruleID int64, flows []connection.Flow, listenPort int, now time.Time) (map[string]IPActivity, map[string]IPActivity) {
 	active := map[string]IPActivity{}
 	candidates := map[string]IPActivity{}
@@ -188,29 +207,19 @@ func (s *Service) buildActiveCandidates(ruleID int64, flows []connection.Flow, l
 		if f.OrigDstPort != listenPort {
 			continue
 		}
-		switch f.State {
-		case "SYN_SENT", "SYN_RECV":
+		switch {
+		case f.Proto == "tcp" && (f.State == "SYN_SENT" || f.State == "SYN_RECV"):
 			a := candidates[f.SrcIP]
 			a.IP = f.SrcIP
-			if f.Proto == "tcp" {
-				a.TCPSessions++
-			}
+			a.TCPSessions++
 			candidates[f.SrcIP] = a
-		case "ESTABLISHED":
-			fkey := strconv.FormatInt(ruleID, 10) + "\x00" + f.SrcIP + ":" + strconv.Itoa(f.SrcPort)
-			traffic := false
-			prev := s.flows[fkey]
-			if prev == nil {
-				s.flows[fkey] = &flowState{Bytes: f.Bytes, LastSeen: now}
-				traffic = true
-			} else if f.Bytes != prev.Bytes {
-				s.flows[fkey] = &flowState{Bytes: f.Bytes, LastSeen: now}
-				traffic = true
-			} else if now.Sub(prev.LastSeen) <= s.ipIdle {
-				// 静默但在窗口内 → 仍在线
-			} else {
-				// 超窗无流量 → 死连接，不计入在线
-				delete(s.flows, fkey)
+		case f.Proto == "tcp" && f.State == "ESTABLISHED", f.Proto == "udp":
+			idle := s.ipIdle
+			if f.Proto == "udp" {
+				idle = s.udpIdle
+			}
+			traffic, alive := s.touchFlow(ruleID, f, now, idle)
+			if !alive {
 				continue
 			}
 			a := active[f.SrcIP]
@@ -227,6 +236,26 @@ func (s *Service) buildActiveCandidates(ruleID int64, flows []connection.Flow, l
 		}
 	}
 	return active, candidates
+}
+
+// touchFlow 更新单条流的字节水位，返回「本轮是否有流量」与「是否仍判活」。
+func (s *Service) touchFlow(ruleID int64, f connection.Flow, now time.Time, idle time.Duration) (traffic, alive bool) {
+	fkey := strconv.FormatInt(ruleID, 10) + "\x00" + f.Proto + "\x00" + f.SrcIP + ":" + strconv.Itoa(f.SrcPort)
+	prev := s.flows[fkey]
+	switch {
+	case prev == nil:
+		s.flows[fkey] = &flowState{Bytes: f.Bytes, LastSeen: now}
+		return true, true
+	case f.Bytes != prev.Bytes:
+		// 字节变化即活跃（可能因四元组复用而变小，故用 != 而非 >）。
+		s.flows[fkey] = &flowState{Bytes: f.Bytes, LastSeen: now}
+		return true, true
+	case now.Sub(prev.LastSeen) <= idle:
+		return false, true // 静默但在窗口内
+	default:
+		delete(s.flows, fkey) // 超窗无流量 → 死连接
+		return false, false
+	}
 }
 
 // Reconcile 执行一轮：观测 → slot 准入 → 配额判定 → nft 强制 → 落库状态。
@@ -251,8 +280,16 @@ func (s *Service) reconcile(ctx context.Context) error {
 	cr := s.conntrack(s.ctPath)
 	now := s.now()
 
+	// conntrack 读取不完整时进入 fail-safe：沿用上一轮 slot，不释放、不新授、
+	// 不改动 nft。宁可短暂放行也不误踢在线用户（SBX 的教训）。
+	if cr.Partial || (cr.Err != nil && !cr.Available) {
+		s.setErr("conntrack 读取不完整，本轮跳过准入（fail-safe）")
+		return nil
+	}
+
 	nftStates := map[int64]*nft.RuleState{}
 	newStates := map[int64]*RuleState{}
+	quotaBlocked := make([]int64, 0, len(enabled))
 
 	for _, r := range enabled {
 		rs := &RuleState{RuleID: r.ID}
@@ -274,6 +311,7 @@ func (s *Service) reconcile(ctx context.Context) error {
 			if r.QuotaLimitBytes > 0 && used >= r.QuotaLimitBytes {
 				rs.Quota.State = "exceeded"
 				quotaExceeded = true
+				quotaBlocked = append(quotaBlocked, r.ID)
 			}
 		}
 
@@ -294,9 +332,10 @@ func (s *Service) reconcile(ctx context.Context) error {
 		if r.IPLimitEnabled {
 			maxIPs = r.IPLimitMax
 		}
-		allowSet, _ := ipState.Reconcile(active, candidates, maxIPs, now, s.ipIdle, s.rejectedTTL, s.provisionalTTL)
+		allowSet, _ := ipState.Reconcile(active, candidates, maxIPs, now, s.ipIdle, s.udpIdle, s.rejectedTTL, s.provisionalTTL)
 
 		rs.IPs = s.snapshotIPs(r.ID, ipState)
+		rs.ConnTCP, rs.ConnUDP = countSessions(ipState)
 
 		nftStates[r.ID] = &nft.RuleState{
 			QuotaExceeded:  quotaExceeded,
@@ -319,12 +358,12 @@ func (s *Service) reconcile(ctx context.Context) error {
 		if !found {
 			delete(s.ipStates, id)
 			delete(s.states, id)
+			s.dropFlowsOf(id)
 		}
 	}
 
-	// 生成并事务化应用 nft。
-	script := nft.GenScript(&nft.GenInput{Rules: enabled, States: nftStates})
-	if err := s.nftApply(ctx, s.runner, s.nftConf, script); err != nil {
+	gi := &nft.GenInput{Rules: enabled, States: nftStates}
+	if err := s.applyNFT(ctx, gi, quotaBlocked); err != nil {
 		s.setErr("nft 应用失败: " + err.Error())
 		return err
 	}
@@ -335,6 +374,124 @@ func (s *Service) reconcile(ctx context.Context) error {
 	s.lastErr = ""
 	s.mu.Unlock()
 	return nil
+}
+
+// applyNFT 是 nft 同步的核心：结构变化才重写链，否则只做元素增量。
+//
+// 这是流量统计正确性的关键：named counter 是表级对象，重写结构（哪怕只是
+// flush chain）本身不清零 counter，但 **重建表** 会。因此：
+//   - 结构签名未变 → 只 `add/delete element`，完全不碰表、链、counter；
+//   - 结构签名变化 → 幂等 add 表/counter/set + flush chain 重建规则，
+//     已存在的 counter 保留累计值。
+func (s *Service) applyNFT(ctx context.Context, gi *nft.GenInput, quotaBlocked []int64) error {
+	cur, err := s.nftReadState(ctx, s.runner)
+	if err != nil {
+		return err
+	}
+
+	sig := nft.StructSig(gi)
+	structMissing := !cur.FilterTableExists
+	if !structMissing {
+		// counter / allow set 被外部删掉时也必须重建。
+		for _, want := range wantedObjects(gi) {
+			if !contains(cur.Counters, want.counter) && want.counter != "" {
+				structMissing = true
+				break
+			}
+			if want.setV4 != "" && !contains(cur.Sets, want.setV4) {
+				structMissing = true
+				break
+			}
+		}
+	}
+
+	if sig != s.lastStructSig || structMissing {
+		script := nft.GenStructScript(gi, cur.Existing())
+		if err := s.nftApply(ctx, s.runner, s.nftConf, script); err != nil {
+			return err
+		}
+		s.lastStructSig = sig
+		// 结构重建后 set 元素被清空（qblock/allow 都是新表），重新读一次现状
+		// 以便下面的增量以真实状态为基准。
+		if cur, err = s.nftReadState(ctx, s.runner); err != nil {
+			return err
+		}
+	}
+
+	// 元素增量：配额阻断 + 每规则 allow set。
+	diffs := []nft.ElementDiff{nft.QuotaBlockDiff(cur.QuotaBlocked, quotaBlocked)}
+	for _, r := range gi.Rules {
+		if r.Deleted || !r.Enabled {
+			continue
+		}
+		st := gi.States[r.ID]
+		if st == nil || !st.IPLimitEnabled {
+			continue
+		}
+		diffs = append(diffs,
+			nft.AllowDiff(r.ID, false, cur.ElementsOf(nft.AllowSetV4(r.ID)), st.AllowV4),
+			nft.AllowDiff(r.ID, true, cur.ElementsOf(nft.AllowSetV6(r.ID)), st.AllowV6),
+		)
+	}
+	// 无变化时脚本为空 → 完全不调用 nft。
+	elemScript := nft.GenElementScript(diffs)
+	if elemScript == "" {
+		return nil
+	}
+	return s.nftApply(ctx, s.runner, s.nftConf+".elem", elemScript)
+}
+
+type wantedObj struct {
+	counter string
+	setV4   string
+}
+
+func wantedObjects(gi *nft.GenInput) []wantedObj {
+	var out []wantedObj
+	for _, r := range gi.Rules {
+		if r.Deleted || !r.Enabled {
+			continue
+		}
+		w := wantedObj{counter: nft.CounterUp(r.ID)}
+		if st := gi.States[r.ID]; st != nil && st.IPLimitEnabled {
+			w.setV4 = nft.AllowSetV4(r.ID)
+		}
+		out = append(out, w)
+	}
+	return out
+}
+
+func contains(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// dropFlowsOf 清理某规则的流跟踪状态（规则删除后避免内存泄漏）。
+func (s *Service) dropFlowsOf(ruleID int64) {
+	prefix := strconv.FormatInt(ruleID, 10) + "\x00"
+	for k := range s.flows {
+		if strings.HasPrefix(k, prefix) {
+			delete(s.flows, k)
+		}
+	}
+}
+
+// countSessions 统计某规则当前的 TCP 连接数与 UDP 会话数（仅已授权 IP）。
+func countSessions(st *NodeIPState) (tcp, udp int) {
+	for ip, slot := range st.Slots {
+		if slot.Provisional {
+			continue
+		}
+		if o, ok := st.Observed[ip]; ok {
+			tcp += o.TCPSessions
+			udp += o.UDPSessions
+		}
+	}
+	return tcp, udp
 }
 
 func (s *Service) snapshotIPs(ruleID int64, st *NodeIPState) RuleIPSnapshot {

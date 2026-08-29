@@ -76,8 +76,8 @@ function ruleCard(r) {
     '<div class="node-stats">' +
       '<div class="node-stat"><span>累计流量</span><b>' + fmtBytes((r.total_up || 0) + (r.total_down || 0)) + '</b></div>' +
       '<div class="node-stat"><span>流量配额</span><b>' + quotaTxt + '</b></div>' +
-      '<div class="node-stat"><span>TCP 连接</span><b data-rc="' + r.id + '" data-k="tcp">—</b></div>' +
-      '<div class="node-stat"><span>UDP 会话</span><b data-rc="' + r.id + '" data-k="udp">—</b></div>' +
+      '<div class="node-stat"><span>TCP 连接</span><b data-rc="' + r.id + '" data-k="tcp">' + (r.conn_tcp || 0) + '</b></div>' +
+      '<div class="node-stat"><span>UDP 会话</span><b data-rc="' + r.id + '" data-k="udp">' + (r.conn_udp || 0) + '</b></div>' +
     '</div>' +
     '<button class="ip-strip" data-ips="' + r.id + '">' +
       '<span class="ip-strip-label">在线 IP</span>' +
@@ -105,16 +105,17 @@ function renderSummary() {
   setText('hero-down', fmtRate(s.rate && s.rate.tx || 0));
   setText('kpi-today', fmtBytes((s.today_up || 0) + (s.today_down || 0)));
   setText('kpi-total', fmtBytes((s.total_up || 0) + (s.total_down || 0)));
+  setText('kpi-tcp', String(s.conn_tcp || 0));
+  setText('kpi-udp', String(s.conn_udp || 0));
 }
 
 /* ---------- 实时（速率轮询 + SSE 结构更新） ---------- */
 function renderLiveRate(v) {
-  var statusTxt = document.getElementById('status-txt');
   var pulse = document.getElementById('pulse');
   setText('status-txt', '实时监控中');
   pulse.className = 'pulse';
-  setText('kpi-tcp', '—'); // live 不含全局连接数，保留占位
-  setText('kpi-udp', '—');
+  setText('kpi-tcp', String(v.conn_tcp || 0));
+  setText('kpi-udp', String(v.conn_udp || 0));
   setText('hero-rate', fmtRate((v.rate_up || 0) + (v.rate_down || 0)));
   setText('hero-up', fmtRate(v.rate_up || 0));
   setText('hero-down', fmtRate(v.rate_down || 0));
@@ -129,6 +130,10 @@ function renderLiveRate(v) {
       st.className = 'status-pill ' + m[1];
       st.textContent = m[0];
     }
+    var tcpEl = document.querySelector('[data-rc="' + r.id + '"][data-k="tcp"]');
+    if (tcpEl) tcpEl.textContent = String(r.conn_tcp || 0);
+    var udpEl = document.querySelector('[data-rc="' + r.id + '"][data-k="udp"]');
+    if (udpEl) udpEl.textContent = String(r.conn_udp || 0);
     var ipc = document.querySelector('[data-ipcount="' + r.id + '"]');
     if (ipc && r.active_ip_count != null) {
       // active_ip_count 不带 max，仅在结构快照里有 max；这里仅更新数字部分

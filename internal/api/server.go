@@ -284,10 +284,12 @@ func (s *Server) PublishSSE(event string, payload any) {
 	}
 }
 
-// snapshotStructKey 计算快照的结构哈希（清零速率，只比较规则结构 / 在线 IP / 配额）。
-// 速率每个采集周期都在变，但不应触发 SSE 重播；结构性变化（IP 上下线、配额、规则）才推送。
+// snapshotStructKey 计算快照的结构哈希（清零时间与速率，只比较规则结构 / 在线 IP / 配额）。
+// 速率和采集时间每个周期都在变，但不应触发 SSE 重播；只有结构性变化
+// （IP 上下线、配额状态、规则增删改）才推送。
 func (s *Server) snapshotStructKey() string {
 	snap := s.buildFullSnapshot()
+	snap.Now = 0
 	snap.Rate = traffic.Rate{}
 	for i := range snap.Rules {
 		snap.Rules[i].Rate = traffic.Rate{}
@@ -317,8 +319,6 @@ func (s *Server) PublishSnapshotTick() {
 	s.PublishSSE("snapshot", s.buildFullSnapshot())
 }
 
-var _ = struct{}{}
-
 // handleEvents 是 SSE 端点：首包完整 snapshot，之后按变化推送。
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if !s.authorized(r) {
@@ -329,6 +329,12 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		s.sendJSON(w, r, http.StatusInternalServerError, M{"error": "streaming unsupported"})
 		return
+	}
+	// 清除 write deadline：http.Server.WriteTimeout 会在 60s 后切断 SSE 长连接
+	// （SBX 踩过同一个坑）。ResponseController 是 Go 1.20+ 的标准做法。
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+		slog.Debug("清除 SSE write deadline 失败", "err", err)
 	}
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")

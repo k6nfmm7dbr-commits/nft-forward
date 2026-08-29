@@ -15,6 +15,7 @@ BE_IP=${SUBNET}.100
 CLIENTS="nff-client1:${SUBNET}.11 nff-client2:${SUBNET}.12 nff-client3:${SUBNET}.13"
 
 cleanup() {
+  pkill -f nff-backend.py 2>/dev/null
   for c in nff-client1 nff-client2 nff-client3; do
     ip netns del "$c" 2>/dev/null
   done
@@ -55,9 +56,35 @@ setup() {
   ip netns exec "$BE_NS" ip link set nff-be-veth up
   ip netns exec "$BE_NS" ip link set lo up
   ip netns exec "$BE_NS" ip route add default via "$HOST_IP"
-  # backend HTTP server
-  ip netns exec "$BE_NS" sh -c 'echo BACKEND_OK > /tmp/index.html; (cd /tmp && nohup python3 -m http.server 80 --bind '"${BE_IP}"' >/tmp/be.log 2>&1 &)'
-  sleep 1
+  # backend HTTP server（10 MiB 响应，用于流量计数校验）
+  cat > /tmp/nff-backend.py <<'PY'
+import http.server, socketserver
+SIZE = 10 * 1024 * 1024
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        if self.path == "/small":
+            body = b"BACKEND_OK\n"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(SIZE))
+        self.end_headers()
+        chunk = b"x" * (1024 * 1024)
+        for _ in range(SIZE // len(chunk)):
+            self.wfile.write(chunk)
+    def log_message(self, *a):
+        pass
+socketserver.TCPServer.allow_reuse_address = True
+socketserver.ThreadingTCPServer.allow_reuse_address = True
+socketserver.ThreadingTCPServer(("0.0.0.0", 80), H).serve_forever()
+PY
+  # setsid 脱离控制终端，否则 ip netns exec 的 shell 退出会杀掉后台进程
+  ip netns exec "$BE_NS" setsid python3 /tmp/nff-backend.py >/tmp/nff-backend.log 2>&1 &
+  sleep 2
   # clients
   add_client nff-client1 "${SUBNET}.11" nff-c1-veth
   add_client nff-client2 "${SUBNET}.12" nff-c2-veth
