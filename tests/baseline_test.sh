@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# baseline_test.sh — v0.2.0 基线收口防回归。
+# baseline_test.sh — v0.3.0 基线收口防回归。
 #
-# 这些是本次重构的硬约束，任何一条被打破都说明出现了功能退化：
+# 这些是重构的硬约束，任何一条被打破都说明出现了功能退化：
 #   A. 版本一致性：install.sh APP_VERSION == Go Version == README
-#   B. 「转发规则监听地址」彻底消失（Go 业务代码 / 前端 / API 响应 / nft 脚本）
-#      —— 但 Web 面板自身的 bind 地址（listen）必须保留
+#   B. 转发规则「可配置的监听地址」彻底消失（Go 业务代码 / 前端输入 / API 写入 / nft 脚本）
+#      —— v0.3 起前端展示只读的 listen_addr（恒 0.0.0.0，fib daddr type local 语义），
+#         但用户不能配置它；Web 面板自身的 bind 地址（listen）必须保留
 #   C. nft 安全边界：绝不 flush ruleset / 绝不 delete table / 只管理 nff_*
 #   D. DNAT 必须带 fib daddr type local（不劫持 transit 流量）
 #   E. 域名目标：DB 存原始域名、双栈分表、不做 NAT64/46
@@ -22,11 +23,11 @@ echo "== baseline_test =="
 APP_VER=$(grep -m1 '^APP_VERSION=' "$ROOT/install.sh" | sed -E 's/^APP_VERSION="?([^"]+)"?.*/\1/')
 GO_VER=$(grep '^const Version' "$ROOT/internal/version/version.go" | sed 's/.*"\(.*\)".*/\1/')
 README_VER=$(grep -m1 -oE 'v[0-9]+\.[0-9]+\.[0-9]+' "$ROOT/README.md" | tr -d 'v')
-ck "install.sh APP_VERSION == 0.2.0" "0.2.0" "$APP_VER"
-ck "Go Version == 0.2.0" "0.2.0" "$GO_VER"
-ck "README 版本 == 0.2.0" "0.2.0" "$README_VER"
+ck "install.sh APP_VERSION == 0.3.0" "0.3.0" "$APP_VER"
+ck "Go Version == 0.3.0" "0.3.0" "$GO_VER"
+ck "README 版本 == 0.3.0" "0.3.0" "$README_VER"
 
-# ---- B. 转发规则监听地址彻底删除 ----
+# ---- B. 转发规则「可配置监听地址」彻底删除 ----
 GOSRC=$(find "$ROOT/internal" "$ROOT/cmd" -name '*.go' ! -name '*_test.go')
 # Go 结构体字段 / JSON tag / 变量名：只允许 api/rules.go 里那个「接受但忽略」的
 # 兼容字段，以及 database/forward 里对 legacy 列的注释与显式占位处理。
@@ -36,7 +37,8 @@ for f in $GOSRC; do
     # api/rules.go: 唯一允许出现的兼容字段（接受并忽略）
     # database/db.go + forward/store.go: 老库 legacy 列的显式占位处理
     # config/config.go: 废弃配置键清理清单（legacyKeys）
-    */internal/api/rules.go|*/internal/database/db.go|*/internal/forward/store.go|*/internal/config/config.go) continue ;;
+    # api/handlers.go: RuleView.ListenAddr 只读展示字段（恒 0.0.0.0）
+    */internal/api/rules.go|*/internal/database/db.go|*/internal/forward/store.go|*/internal/config/config.go|*/internal/api/handlers.go) continue ;;
   esac
   if grep -qE 'ListenAddress|listen_address|listenAddress' "$f"; then
     # 注释里提到「已删除监听地址」是允许的；剥注释后仍出现才算违规
@@ -59,10 +61,13 @@ if sed -n '/func (s \*Server) updateRule/,/^}/p' "$ROOT/internal/api/rules.go" \
   | grep -qE 'in\.ListenAddress'; then rc=1; else rc=0; fi
 ck "updateRule 不把 listen_address 写入更新" 0 "$rc"
 
-# 前端：不得有监听地址输入框
+# 前端：不得有「可配置」的监听地址输入框；只允许只读展示 listen_addr（恒 0.0.0.0）
 FE="$ROOT/internal/webui/static"
-if grep -rqiE 'listen[_-]?addr|监听地址' "$FE"; then rc=1; else rc=0; fi
-ck "前端无监听地址字段" 0 "$rc"
+# 检查是否含监听地址相关字段（只读展示 pol-listen-ip / listen_addr / listenAddr / 监听 IP 是允许的）
+bad=$(grep -rniE 'listen[_-]?addr|监听地址' "$FE" | grep -viE 'pol-listen-ip|listen_addr|listenAddr|监听 IP')
+if [ -n "$bad" ]; then rc=1; else rc=0; fi
+ck "前端无可配置监听地址字段" 0 "$rc"
+grep -q 'pol-listen-ip' "$FE/index.html"; ck "前端展示只读监听 IP" 0 $?
 grep -q '监听端口' "$FE/index.html"; ck "前端保留监听端口字段" 0 $?
 grep -q '留空则随机' "$FE/index.html"; ck "监听端口支持留空随机（有提示）" 0 $?
 

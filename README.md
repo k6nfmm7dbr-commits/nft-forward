@@ -5,7 +5,7 @@
 ## 当前版本
 
 ```text
-v0.2.0
+v0.3.0
 ```
 
 ## 定位
@@ -107,7 +107,7 @@ go test ./...        # 单元测试
 go test -race ./...  # 竞态检测（需 CGO/gcc）
 
 bash tests/installer_flow_test.sh   # 安装/升级流程（提取 install.sh 真实实现）
-bash tests/baseline_test.sh         # v0.2.0 基线收口防回归
+bash tests/baseline_test.sh         # v0.3.0 基线收口防回归
 ```
 
 真实环境端到端验证（需 root + nftables，会创建 network namespace）：
