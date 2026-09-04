@@ -2,19 +2,18 @@
 # 验证 IP 限制 max=2：两个 IP 同时在线时，第三个必须被拒绝。
 # 关键：三个客户端必须同时保持 ESTABLISHED，否则先前连接关闭会释放 slot。
 set -u
-TOKEN=$(jq -r .token /etc/nft-forward/panel.json)
 API="http://127.0.0.1:8090"
 PORT=29800
 
 rid=$(curl -s -X POST "$API/api/rules" \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" \
   -d "{\"name\":\"ip-limit\",\"enabled\":true,\"protocol\":\"tcp\",\"listen_port\":${PORT},\"target_address\":\"10.203.0.100\",\"target_port\":80}" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
 echo "规则 ID = $rid"
 [ -z "$rid" ] && { echo "创建失败"; exit 1; }
 
 curl -s -X PUT "$API/api/rules/$rid/policy" \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" \
   -d '{"ip_limit_enabled":true,"ip_limit_max":2}' >/dev/null
 echo "已启用 IP 限制 max=2"
 sleep 2
@@ -47,7 +46,7 @@ hold nff-client2 c2
 sleep 6
 
 show() {
-  curl -s "$API/api/rules/$rid/ips" -H "Authorization: Bearer $TOKEN" | python3 -c '
+  curl -s "$API/api/rules/$rid/ips" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 print("  已授权:", [e["ip"] for e in d.get("ips", [])])
@@ -57,7 +56,7 @@ print("  已拒绝:", [e["ip"] for e in d.get("rejected", [])])
 
 echo "=== 名额占用状态（应 2 个已授权）==="
 show
-granted=$(curl -s "$API/api/rules/$rid/ips" -H "Authorization: Bearer $TOKEN" \
+granted=$(curl -s "$API/api/rules/$rid/ips" \
   | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("ips",[])))')
 echo "  granted=$granted"
 
@@ -89,5 +88,5 @@ fi
 echo "--- 清理 ---"
 pkill -f "10.203.0.1', ${PORT}" 2>/dev/null
 rm -f /tmp/hold_c1 /tmp/hold_c2
-curl -s -X DELETE "$API/api/rules/$rid" -H "Authorization: Bearer $TOKEN" >/dev/null
+curl -s -X DELETE "$API/api/rules/$rid" >/dev/null
 exit $rc

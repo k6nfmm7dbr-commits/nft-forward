@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # 验证：10MiB 经转发后，DB 记录的流量误差应 < 1%（此前几乎全丢）
 set -u
-TOKEN=$(jq -r .token /etc/nft-forward/panel.json)
 API="http://127.0.0.1:8090"
 
 rid=$(curl -s -X POST "$API/api/rules" \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" \
   -d '{"name":"traffic-test","enabled":true,"protocol":"tcp","listen_port":29500,"target_address":"10.203.0.100","target_port":80}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
 echo "规则 ID = $rid"
@@ -59,5 +58,5 @@ PY
 rc=$?
 
 echo "--- 清理测试规则 ---"
-curl -s -X DELETE "$API/api/rules/$rid" -H "Authorization: Bearer $TOKEN" >/dev/null
+curl -s -X DELETE "$API/api/rules/$rid" >/dev/null
 exit $rc

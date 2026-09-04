@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # 验证 SSE 长连接不再被 WriteTimeout(60s) 切断
-TOKEN=$(jq -r .token /etc/nft-forward/panel.json)
 OUT=/tmp/sse_check.out
 start=$(date +%s)
-timeout 95 curl -sN "http://127.0.0.1:8090/api/events" -H "Authorization: Bearer $TOKEN" -o "$OUT"
+timeout 95 curl -sN "http://127.0.0.1:8090/api/events" -o "$OUT"
 end=$(date +%s)
 alive=$((end - start))
 pings=$(grep -c ping "$OUT" 2>/dev/null || echo 0)

@@ -2,14 +2,10 @@
 //
 // 默认值 + /etc/nft-forward/panel.json 覆盖。写回一律走 fsx 原子写
 // （临时文件 → fsync → chmod 0600 → rename → fsync 目录）。
-//
-// fail-closed 原则（与 SBX 一致）：配置文件存在但损坏时，LoadStrict 直接报错，
-// **绝不**用默认值覆盖 —— 否则会重新生成 token 让用户彻底登录不进面板。
+// Token 已在 v0.3 移除，面板不再需要认证令牌。
 package config
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -46,7 +42,6 @@ func defaultConf() map[string]any {
 		"sysctl_conf": filepath.Join("/etc/sysctl.d", "90-nft-forward.conf"),
 		"listen":      "0.0.0.0",
 		"port":        json.Number("8090"),
-		"token":       "",
 		"interval":    json.Number("2"),
 		"dns_refresh": json.Number("60"),
 		"tz":          "Asia/Shanghai",
@@ -58,20 +53,19 @@ func defaultConf() map[string]any {
 //
 // 注意：Listen 是 **Web 面板自身的 bind 地址**（Web Server 配置），
 // 与「转发规则监听地址」无关 —— 后者已彻底移除。
+// 注意：Token 已移除（v0.3），面板不再需要认证令牌。
 type Config struct {
 	raw map[string]any
 
-	DB           string
-	NftConf      string
-	SysctlConf   string
-	Listen       string // 面板 HTTP 服务 bind 地址
-	Port         int    // 面板端口
-	Token        string
-	Interval     int // 流量采集间隔（秒）
-	DNSRefresh   int // 域名目标 DNS 刷新周期（秒）
-	TZ           string
-	SSHGuard     int // 冲突检查需避开的 SSH 端口
-	SecureCookie bool
+	DB         string
+	NftConf    string
+	SysctlConf string
+	Listen     string // 面板 HTTP 服务 bind 地址
+	Port       int    // 面板端口
+	Interval   int    // 流量采集间隔（秒）
+	DNSRefresh int    // 域名目标 DNS 刷新周期（秒）
+	TZ         string
+	SSHGuard   int // 冲突检查需避开的 SSH 端口
 	// ExtraGuards 是额外保留端口（guard_ports: {"port": "说明"}）。
 	ExtraGuards map[int]string
 }
@@ -168,7 +162,6 @@ func (c *Config) normalize() {
 	c.SysctlConf = c.Str("sysctl_conf")
 	c.Listen = c.Str("listen")
 	c.Port = int(c.Int("port"))
-	c.Token = strings.TrimSpace(c.Str("token"))
 	c.Interval = int(c.Int("interval"))
 	if c.Interval < 1 {
 		c.Interval = 1
@@ -179,7 +172,6 @@ func (c *Config) normalize() {
 	}
 	c.TZ = c.Str("tz")
 	c.SSHGuard = int(c.Int("ssh_port"))
-	c.SecureCookie = c.Bool("secure_cookie")
 	c.ExtraGuards = c.guardPorts()
 }
 
@@ -264,7 +256,8 @@ func (c *Config) Int(key string) int64 {
 //
 // listen_address 从未作为面板配置存在；这里列出的是历史上可能被写入的
 // 转发相关键。删除它们只是清理，不改变任何行为。
-var legacyKeys = []string{"rule_listen_address", "default_listen_address"}
+// token 是 v0.3 移除的认证令牌（面板不再需要），迁移时一并摘除。
+var legacyKeys = []string{"rule_listen_address", "default_listen_address", "token"}
 
 // Migrate 清理废弃配置键（读取 → 改 → 原子写回）。
 // 返回被删除的键。配置损坏时 fail-closed，不写回。
@@ -312,52 +305,6 @@ func Set(key, value string) error {
 	}
 	c.raw[key] = v
 	return c.write()
-}
-
-// EnsureToken 保证 token 非空；为空则生成高熵随机令牌并写回。
-func EnsureToken() (string, error) {
-	c, err := LoadStrict()
-	if err != nil {
-		return "", fmt.Errorf("拒绝生成访问令牌: %w", err)
-	}
-	if c.Token != "" {
-		return c.Token, nil
-	}
-	tok, err := RandomToken()
-	if err != nil {
-		return "", err
-	}
-	c.raw["token"] = tok
-	if err := c.write(); err != nil {
-		return "", err
-	}
-	return tok, nil
-}
-
-// ResetToken 强制生成新令牌并写回（用于「重置面板令牌」）。
-func ResetToken() (string, error) {
-	c, err := LoadStrict()
-	if err != nil {
-		return "", fmt.Errorf("拒绝重置访问令牌: %w", err)
-	}
-	tok, err := RandomToken()
-	if err != nil {
-		return "", err
-	}
-	c.raw["token"] = tok
-	if err := c.write(); err != nil {
-		return "", err
-	}
-	return tok, nil
-}
-
-// RandomToken 生成 32 位十六进制高熵令牌（128 bit）。
-func RandomToken() (string, error) {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
 }
 
 // GuardPorts 返回转发规则不允许占用的保留端口表。

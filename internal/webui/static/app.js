@@ -19,7 +19,6 @@ function api(path, params) {
   var u = new URL(path, location.origin);
   if (params) Object.keys(params).forEach(function (k) { u.searchParams.set(k, params[k]); });
   var req = fetch(u, { cache: 'no-store' }).then(function (r) {
-    if (r.status === 401) { location.replace('/login'); throw new Error('未登录'); }
     if (!r.ok) throw new Error('请求失败 ' + r.status);
     return r.json();
   }).finally(function () { delete inflight[key]; });
@@ -27,7 +26,7 @@ function api(path, params) {
   return req;
 }
 
-// mutate 统一处理写请求：401 跳登录，业务错误抛出服务端文案。
+// mutate 统一处理写请求：业务错误抛出服务端文案。
 function mutate(method, path, body) {
   var opts = { method: method, cache: 'no-store', headers: {} };
   if (body !== undefined) {
@@ -35,7 +34,6 @@ function mutate(method, path, body) {
     opts.body = JSON.stringify(body);
   }
   return fetch(path, opts).then(function (r) {
-    if (r.status === 401) { location.replace('/login'); throw new Error('未登录'); }
     return r.json().then(function (d) {
       if (!r.ok) throw new Error((d && d.error) || ('请求失败 ' + r.status));
       return d;
@@ -153,13 +151,14 @@ function ruleCard(r) {
   var ips = r.ips || {};
   var ipVal = ips.limited ? ((ips.granted_count || 0) + ' / ' + ips.max_ips) : String(ips.granted_count || 0);
   var target = r.target_text || hostPort(r.target_address, r.target_port);
+  var listenAddr = r.listen_addr || '0.0.0.0';
   return '<div class="node-card">' +
     '<div class="node-top">' +
       '<div class="node-title">' +
         '<div class="node-name">' + esc(r.name) + '</div>' +
         '<div class="node-meta-line">' +
           '<span class="chip">' + esc(protoLabel(r.protocol)) + '</span>' +
-          '<span class="port">监听端口 ' + esc(r.listen_port) + '</span>' +
+          '<span class="port">监听 ' + esc(listenAddr) + ':' + esc(r.listen_port) + '</span>' +
         '</div>' +
       '</div>' +
       '<div class="node-rate">' +
@@ -437,6 +436,7 @@ function showPolicy(id) {
   document.getElementById('pol-name').value = r.name || '';
   document.getElementById('pol-proto').value = r.protocol || 'tcp+udp';
   document.getElementById('pol-listen-port').value = r.listen_port || '';
+  document.getElementById('pol-listen-ip').value = r.listen_addr || '0.0.0.0';
   document.getElementById('pol-target').value = r.target_address || '';
   document.getElementById('pol-target-port').value = r.target_port || '';
   setSwitch('pol-enable', r.enabled);

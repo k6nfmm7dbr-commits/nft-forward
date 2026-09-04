@@ -155,7 +155,7 @@
     <section class="sect">
       <div class="field">
         <label for="new-name">名称</label>
-        <input type="text" id="new-name" placeholder="香港CN2" autocomplete="off" maxlength="64">
+        <input type="text" id="new-name" placeholder="" autocomplete="off" maxlength="64">
       </div>
       <div class="field">
         <label for="new-proto">协议</label>
@@ -175,7 +175,7 @@
       </div>
       <div class="field">
         <label for="new-target-port">目标端口</label>
-        <input type="number" id="new-target-port" placeholder="443" min="1" max="65535" inputmode="numeric">
+        <input type="number" id="new-target-port" placeholder="" min="1" max="65535" inputmode="numeric">
       </div>
     </section>
     <div class="err hidden" id="new-error"></div>
@@ -217,6 +217,10 @@
       <div class="field">
         <label for="pol-listen-port">监听端口</label>
         <input type="number" id="pol-listen-port" min="1" max="65535" inputmode="numeric">
+      </div>
+      <div class="field">
+        <label for="pol-listen-ip">监听 IP</label>
+        <input type="text" id="pol-listen-ip" value="0.0.0.0" disabled>
       </div>
       <div class="field">
         <label for="pol-target">目标地址</label>

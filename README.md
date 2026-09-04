@@ -27,7 +27,7 @@ SQLite     = 永久统计与配置持久化
 - **在线 IP 限制**：Slot Manager（observed/candidate/active/granted/rejected），基于 conntrack 生命周期判活。
 - **流量配额**：超出阻断该规则转发，提高/重置即恢复，历史统计不丢。
 - **实时面板**：SSE 推送 + 局部 DOM 更新，原生 HTML/CSS/JS，无框架、无构建链。
-- **安全**：只管理 `nff_*` 自有 nft 表，绝不 `flush ruleset`；随机高熵 token + HttpOnly Cookie + 登录失败节流。
+- **安全**：只管理 `nff_*` 自有 nft 表，绝不 `flush ruleset`。面板默认仅本机监听（`0.0.0.0:8090`），无认证。
 
 ## 安装
 
@@ -35,13 +35,13 @@ SQLite     = 永久统计与配置持久化
 bash <(curl -fsSL https://raw.githubusercontent.com/k6nfmm7dbr-commits/nft-forward/main/install.sh)
 ```
 
-安装完成后运行 `nff` 打开管理菜单。面板默认监听 `0.0.0.0:8090`，访问令牌在 `/etc/nft-forward/panel.json`（权限 0600）。
+安装完成后运行 `nff` 打开管理菜单。面板默认监听 `0.0.0.0:8090`，无访问令牌（仅本机监听场景）。
 
 常用命令：
 
 ```bash
 nff                  # 管理菜单（面板信息 / 设置 / 服务 / 自检 / 更新 / 卸载）
-nff --update         # 在线升级（保留转发规则、流量历史与令牌）
+nff --update         # 在线升级（保留转发规则与流量历史）
 nff --selftest       # 自检
 nff --clear-firewall # 只移除自有 nft 表
 nff --uninstall      # 卸载
@@ -50,7 +50,7 @@ nff --uninstall      # 卸载
 ## 用法
 
 - **Web 面板**：新增/编辑/启停/删除转发规则、配额、IP 限制。添加规则只需填：名称、协议、监听端口（可留空随机）、目标地址、目标端口。
-- **SSH 菜单**：服务状态/启停/日志/令牌/自检/更新。规则 CRUD 统一走 Web 面板，避免两套写路径。
+- **SSH 菜单**：服务状态/启停/日志/自检/更新。规则 CRUD 统一走 Web 面板，避免两套写路径。
 
 ## 数据模型
 
@@ -82,7 +82,7 @@ nff --uninstall      # 卸载
 - 程序只管理 `nff_nat4` / `nff_nat6` / `nff_filter` 三个自有表，只删除 `nff_` 前缀的对象。
 - 绝不执行 `nft flush ruleset`，绝不清空 INPUT/OUTPUT/FORWARD，绝不修改默认 policy，绝不触碰 Docker / firewalld / 用户自有表。
 - 所有 nft 变更先 `nft -c -f` 干跑检查，通过后才 `nft -f` 应用；失败不写入成功状态。
-- 配置写入是原子的（tmp → fsync → chmod 0600 → rename → fsync 目录）；配置损坏时 fail-closed，绝不用默认值覆盖（否则会重新生成 token 让用户登录不进面板）。
+- 配置写入是原子的（tmp → fsync → chmod 0600 → rename → fsync 目录）；配置损坏时 fail-closed，绝不用默认值覆盖。
 - 升级保留 `traffic.db` / `panel.json`；数据库迁移只 `ADD COLUMN`，不 DROP、不重建表。
 - 卸载只删自有表与自有文件，数据目录需显式确认才删。
 

@@ -8,12 +8,12 @@
 #   · 只创建/删除 nff_nat4 / nff_nat6 / nff_filter 三张自有表
 #   · 绝不执行 nft flush ruleset，绝不清空 INPUT/OUTPUT/FORWARD，绝不改默认 policy
 #   · 绝不触碰 Docker / firewalld / 用户自有防火墙规则
-#   · 升级保留 traffic.db / panel.json（规则、流量历史、面板令牌全部不动）
+#   · 升级保留 traffic.db / panel.json（规则、流量历史全部不动）
 # =============================================================================
 set -Eeuo pipefail
 
 APP_NAME="NFT Forward"
-APP_VERSION="0.2.0"
+APP_VERSION="0.3.0"
 REPO="k6nfmm7dbr-commits/nft-forward"
 RAW_URL="${NFF_RAW_URL:-https://raw.githubusercontent.com/${REPO}/main/install.sh}"
 # 二进制走 dist 分支（rolling latest，与 Git Tag 无关）。raw 对同一路径总返回
@@ -328,7 +328,7 @@ install_core() {
 # >>> prepare-dirs
 # prepare_dirs 创建数据目录。
 #
-# panel.json 含面板访问令牌、traffic.db 含流量与规则数据：首次创建用
+# panel.json 含面板配置、traffic.db 含流量与规则数据：首次创建用
 # install -m 0600 预建（不受 umask 影响），已存在的旧文件若权限过宽
 # （历史安装/手工操作）统一收紧，避免出现「短暂 0644 暴露 token」的窗口。
 prepare_dirs() {
@@ -345,10 +345,8 @@ prepare_dirs() {
 # <<< prepare-dirs
 
 ensure_panel_conf() {
-  # 令牌由 Go 侧生成（crypto/rand，128bit）并原子写回；已存在则原样保留。
-  # 绝不在这里重新生成 —— 那会让用户突然登录不进面板。
-  "$CORE_BIN" config-ensure-token >/dev/null 2>&1 \
-    || die "面板令牌生成失败（$PANEL_CONF 可能损坏，请检查后重试）"
+  # v0.3 起面板已无令牌机制，panel.json 只是字段表（listen/port/tz/...）。
+  # 兼容性：如果老配置里残留 token 键，下一次写入会被替换覆盖；无需主动删。
   chmod 600 "$PANEL_CONF"
 }
 
@@ -489,12 +487,9 @@ panel_url() {
 }
 
 show_panel_info() {
-  local tok
-  tok=$(panel_get token)
   printf '%s面板信息%s\n' "$C_B" "$C_RESET"
   printf '  地址: %s%s%s\n' "$C_CYAN" "$(panel_url)" "$C_RESET"
-  printf '  令牌: %s%s%s\n' "$C_CYAN" "${tok:-未生成}" "$C_RESET"
-  printf '  %s令牌保存在 %s（权限 0600）%s\n' "$C_DIM" "$PANEL_CONF" "$C_RESET"
+  printf '  %s配置文件: %s（权限 0600）%s\n' "$C_DIM" "$PANEL_CONF" "$C_RESET"
 }
 
 # ---------------------------------------------------------------- 在线升级
@@ -517,7 +512,7 @@ ver_ge() {  # ver_ge A B → A >= B ?（点分版本比较）
 
 # >>> do-update
 # do_update 从 RAW_URL 拉最新脚本 → 语法校验 → 替换本体 → 由新脚本 --apply-update
-# 更新二进制并重启。全程保留 traffic.db / panel.json（规则、流量历史、令牌不动）。
+# 更新二进制并重启。全程保留 traffic.db / panel.json（规则、流量历史不动）。
 do_update() {
   local force="${1:-}"
   banner
@@ -670,7 +665,7 @@ uninstall_all() {
   fi
   rm -f "$CORE_BIN" "$CMD_PATH" "$SYSCTL_FILE" "$ROOT/etc/sysctl.d/99-nft-forward-conntrack.conf"
 
-  printf '\n是否同时删除数据目录 %s（含流量历史与面板令牌）？(yes/N): ' "$APP_DIR"
+  printf '\n是否同时删除数据目录 %s（含流量历史）？(yes/N): ' "$APP_DIR"
   local ans2=""
   read -r ans2 || true
   if [[ "$ans2" == "yes" ]]; then
@@ -722,8 +717,7 @@ menu_panel() {
       "$(panel_get port)" "$(panel_get listen)" "$(panel_get interval)"
     echo "  1) 修改面板端口"
     echo "  2) 切换监听范围（全部 / 仅本机）"
-    echo "  3) 重置面板令牌"
-    echo "  4) 自检"
+    echo "  3) 自检"
     echo "  0) 返回"
     echo
     printf '请选择: '
@@ -744,9 +738,6 @@ menu_panel() {
            panel_set listen "127.0.0.1" && ok "已切换为仅本机访问"
          fi
          svc_do restart nft-forward || true; pause ;;
-      3) hr; "$CORE_BIN" config-set token "" >/dev/null && "$CORE_BIN" config-ensure-token \
-           && svc_do restart nft-forward && show_panel_info || err "重置失败"
-         hr; pause ;;
       4) hr; "$CORE_BIN" selftest || true; hr; pause ;;
       0|"") return 0 ;;
       *) warn "无效选择" ;;
@@ -762,7 +753,7 @@ main_menu() {
       "$C_DIM" "$APP_VERSION" "$C_RESET"
     printf '  地址: %s%s%s\n\n' "$C_CYAN" "$(panel_url)" "$C_RESET"
     printf '  %s转发规则的增删改查请在 Web 面板操作%s\n\n' "$C_DIM" "$C_RESET"
-    echo "  1) 面板信息（地址 / 令牌）"
+    echo "  1) 面板信息（地址）"
     echo "  2) 面板设置"
     echo "  3) 服务管理"
     echo "  4) 自检"

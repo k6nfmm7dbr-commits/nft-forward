@@ -302,6 +302,7 @@ select, input[type="number"], input[type="password"], input[type="text"] {
   -webkit-appearance: none;
   appearance: none;
 }
+#rule-select { width: auto; max-width: 220px; }
 select:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(102,140,255,.10); }
 select { padding-right: 31px; background-image: linear-gradient(45deg,transparent 50%,var(--text-3) 50%),linear-gradient(135deg,var(--text-3) 50%,transparent 50%); background-position: calc(100% - 16px) 53%,calc(100% - 11px) 53%; background-repeat: no-repeat; background-size: 5px 5px; }
 #node-select { width: auto; max-width: 220px; }

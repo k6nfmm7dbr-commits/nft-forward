@@ -4,7 +4,6 @@
 //
 //	nft-forward serve                启动面板服务
 //	nft-forward selftest             自检（SQLite/nft/ip_forward/conntrack 等）
-//	nft-forward config-ensure-token  确保面板令牌存在
 //	nft-forward config-get <key>     读取配置
 //	nft-forward config-set <k> <v>   写入配置
 //	nft-forward config-migrate       清理废弃配置键
@@ -35,13 +34,6 @@ func main() {
 		os.Exit(selfTest())
 	case "clear", "--clear-firewall":
 		os.Exit(runClear())
-	case "config-ensure-token":
-		tok, err := config.EnsureToken()
-		if err != nil {
-			fmt.Println("生成令牌失败:", err)
-			os.Exit(1)
-		}
-		fmt.Println("面板令牌已就绪（长度", len(tok), "）")
 	case "config-get":
 		if len(args) < 2 {
 			fmt.Println("用法: nft-forward config-get <key>")
@@ -76,7 +68,7 @@ func main() {
 		menu()
 	default:
 		fmt.Println("未知命令:", args[0])
-		fmt.Println("可用: serve / selftest / config-ensure-token / config-get / config-set / config-migrate / clear / version")
+		fmt.Println("可用: serve / selftest / config-get / config-set / config-migrate / clear / version")
 		os.Exit(1)
 	}
 }

@@ -3,7 +3,7 @@ package version
 
 // Version 是程序版本号，必须与安装器 APP_VERSION 一致。
 // 构建时可用 -ldflags -X 覆盖。
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 // Name 是程序显示名。
 const Name = "NFT Forward"

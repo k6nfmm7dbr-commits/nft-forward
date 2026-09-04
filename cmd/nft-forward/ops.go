@@ -23,15 +23,6 @@ func runCmd(name string, args ...string) {
 	_ = cmd.Run()
 }
 
-func resetToken() error {
-	tok, err := config.ResetToken()
-	if err != nil {
-		return err
-	}
-	fmt.Println("已重置面板令牌（长度", len(tok), "）。请用新令牌登录。")
-	return nil
-}
-
 // runUpdate 把在线升级交给安装器脚本执行。
 //
 // 升级逻辑（下载校验、原子替换、失败回滚）全部在 install.sh 里，Go 侧只做
@@ -156,9 +147,8 @@ func menu() {
 		fmt.Println("  4. 重启服务")
 		fmt.Println("  5. 查看日志")
 		fmt.Println("  6. 查看面板地址")
-		fmt.Println("  7. 重置面板令牌")
-		fmt.Println("  8. 检查更新")
-		fmt.Println("  9. 自检")
+		fmt.Println("  7. 检查更新")
+		fmt.Println("  8. 自检")
 		fmt.Println("  a. 清理自有表")
 		fmt.Println("  0. 退出")
 		fmt.Println("━━━━━━━━━━━━━━━━━━━━")
@@ -183,14 +173,9 @@ func menu() {
 				host = c.Listen
 			}
 			fmt.Printf("面板地址: http://%s:%d/\n", host, c.Port)
-			fmt.Printf("令牌文件: %s\n", config.ConfPath())
 		case "7":
-			if err := resetToken(); err != nil {
-				fmt.Println("重置失败:", err)
-			}
-		case "8":
 			runUpdate()
-		case "9":
+		case "8":
 			selfTest()
 		case "a", "A":
 			fmt.Print("确认只删除 nff_* 自有表？(yes/N): ")
