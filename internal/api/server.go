@@ -37,6 +37,10 @@ type Server struct {
 	rules   *rulesvc.Service
 	collect *traffic.Collector
 
+	// hostIP 是本机对外 IP（启动时探测一次），仅供展示「监听 IP」字段。
+	// 不是 nft 数据面配置——规则本身仍由 fib daddr type local 作用于所有本机地址。
+	hostIP string
+
 	// SSE 订阅。
 	subsMu sync.Mutex
 	subs   map[chan []byte]struct{}
@@ -66,6 +70,7 @@ func New(cfg *config.Config, db *database.DB, store *forward.Store, pol *policy.
 		policy:     pol,
 		rules:      rules,
 		collect:    collect,
+		hostIP:     detectHostIP(),
 		subs:       map[chan []byte]struct{}{},
 		deprecated: map[string]time.Time{},
 		started:    time.Now(),
@@ -165,6 +170,15 @@ func (s *Server) logDeprecated(field string) {
 // authorized v0.3 起 token 已移除，面板仅本机监听无需认证，永远放行。
 func (s *Server) authorized(r *http.Request) bool {
 	return true
+}
+
+// listenAddr 返回给前端展示用的「监听 IP」。
+// 启动时探测到的本机对外 IP，失败时回退 "0.0.0.0"。
+func (s *Server) listenAddr() string {
+	if s.hostIP == "" {
+		return "0.0.0.0"
+	}
+	return s.hostIP
 }
 
 // ---- 静态资源 ----
@@ -323,4 +337,28 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+// detectHostIP 探测本机对外 IP（仅供展示「监听 IP」字段用）。
+//
+// 实现：开一个 UDP socket "连接" 1.1.1.1:80（不发任何数据），内核会选出去
+// 那一侧的本地 IP，再关闭 socket。零网络流量、可在受限网络下失败（返回空串）。
+//
+// 注意：探测结果并不决定 nft 规则行为——规则本身由 fib daddr type local
+// 作用于所有本机地址。这里只是给面板一个「客户端该连哪个 IP」的人话展示。
+func detectHostIP() string {
+	conn, err := net.Dial("udp", "1.1.1.1:80")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	local, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return ""
+	}
+	ip := local.IP
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.String()
 }

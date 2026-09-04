@@ -18,13 +18,14 @@ import (
 //
 // 内嵌 forward.Rule 后自动获得 target_address / listen_port / resolve_* 等字段；
 // 转发规则已无监听地址字段，因此响应里不会出现 listen_address。
-// ListenAddr 为展示用字段：所有规则均由 fib daddr type local 限定，
-// 实际监听本机所有本地地址，展示为 0.0.0.0。
+// ListenAddr 为展示用字段：探测到的本机对外 IP（启动期一次），
+// 失败时回退 "0.0.0.0"。它不影响 nft 规则——规则本身由 fib daddr type local
+// 作用于所有本机地址。
 type RuleView struct {
 	forward.Rule
 	Status     string                 `json:"status"` // normal/disabled/quota_exceeded/ip_limited/dns_failed
 	TargetTxt  string                 `json:"target_text"`
-	ListenAddr string                 `json:"listen_addr"` // 展示用：0.0.0.0
+	ListenAddr string                 `json:"listen_addr"` // 展示用：本机对外 IP
 	Rate       traffic.Rate           `json:"rate"`
 	TotalUp    int64                  `json:"total_up"`
 	TotalDown  int64                  `json:"total_down"`
@@ -67,7 +68,7 @@ func (s *Server) buildFullSnapshot() FullSnapshot {
 		v := RuleView{Rule: *r}
 		v.Status = ruleStatus(r, polStates[r.ID])
 		v.TargetTxt = forward.FormatHostPort(r.TargetAddress, r.TargetPort)
-		v.ListenAddr = "0.0.0.0"
+		v.ListenAddr = s.listenAddr()
 		if rate, ok := collectStatus.Rates[r.ID]; ok {
 			v.Rate = rate
 		}
@@ -366,7 +367,7 @@ func (s *Server) ruleView(ctx context.Context, id int64) (*RuleView, error) {
 	polStates := s.policy.States()
 	v.Status = ruleStatus(r, polStates[id])
 	v.TargetTxt = forward.FormatHostPort(r.TargetAddress, r.TargetPort)
-	v.ListenAddr = "0.0.0.0"
+	v.ListenAddr = s.listenAddr()
 	if rate, ok := s.collect.Snapshot().Rates[id]; ok {
 		v.Rate = rate
 	}

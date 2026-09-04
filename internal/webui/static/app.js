@@ -152,6 +152,7 @@ function ruleCard(r) {
   var ipVal = ips.limited ? ((ips.granted_count || 0) + ' / ' + ips.max_ips) : String(ips.granted_count || 0);
   var target = r.target_text || hostPort(r.target_address, r.target_port);
   var listenAddr = r.listen_addr || '0.0.0.0';
+  // 后端若探测到对外 IP（91.110.232.102 等），listen_addr 字段会带它；否则回退 0.0.0.0。
   return '<div class="node-card">' +
     '<div class="node-top">' +
       '<div class="node-title">' +
