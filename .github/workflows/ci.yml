@@ -5,43 +5,136 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      # actions/checkout@v4（pin 完整 commit SHA，防供应链替换）
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      # actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version: "1.23"
+
       - name: gofmt
         run: |
           out="$(gofmt -l .)"
           if [ -n "$out" ]; then echo "::error::gofmt 未通过: $out"; exit 1; fi
+
       - name: go vet
         run: go vet ./...
+
       - name: go test
         run: go test ./...
+
       - name: go test -race
         run: go test -race ./...
 
-  build:
-    runs-on: ubuntu-latest
+      - name: shellcheck（安装器 / 脚本静态检查）
+        run: |
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq shellcheck >/dev/null
+          shellcheck -S warning install.sh
+          shellcheck -S warning -e SC2034 scripts/*.sh tests/*.sh
+
+      - name: 安装/升级流程测试（提取 install.sh 真实实现）
+        run: bash tests/installer_flow_test.sh
+
+      - name: v0.2.0 基线收口测试（监听地址移除 / nft 安全边界 / 统一变更入口）
+        run: bash tests/baseline_test.sh
+
+  # 二进制分发：main 全部测试通过后，把全架构产物发布到 dist 分支（rolling latest）。
+  # dist 是普通分支，不是 Tag —— 安装器固定从 raw .../dist/<artifact> 下载。
+  # 仅当本次提交实际影响产物/安装器时才重建发布（纯 docs 跳过）。
+  publish-dist:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     needs: test
-    strategy:
-      matrix:
-        goarch: [amd64, arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      # actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 2
+
+      # actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version: "1.23"
-      - name: build
-        env:
-          GOOS: linux
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
-        run: go build -o nft-forward-linux-${{ matrix.goarch }} ./cmd/nft-forward
-      - uses: actions/upload-artifact@v4
-        with:
-          name: nft-forward-linux-${{ matrix.goarch }}
-          path: nft-forward-linux-${{ matrix.goarch }}
+
+      - name: 判断是否影响产物/安装器（纯 docs 跳过）
+        id: changed
+        run: |
+          if git diff --quiet HEAD~1 HEAD -- cmd internal go.mod go.sum \
+              scripts install.sh; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "无产物相关变更，跳过发布"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 构建全架构二进制
+        if: steps.changed.outputs.skip != 'true'
+        run: ./scripts/build-release.sh dist
+
+      - name: SHA256SUMS 自检 + 版本三方一致性（APP_VERSION/Go/二进制）
+        if: steps.changed.outputs.skip != 'true'
+        run: bash scripts/artifact_check.sh dist
+
+      - name: 分发清单一致性（产物与 scripts/dist-manifest.txt 完全一致）
+        if: steps.changed.outputs.skip != 'true'
+        run: |
+          ls dist | sort > /tmp/actual.txt
+          sort scripts/dist-manifest.txt > /tmp/expected.txt
+          diff /tmp/expected.txt /tmp/actual.txt || {
+            echo "::error::dist 产物与清单不一致"; exit 1;
+          }
+
+      - name: 发布到 dist 分支（force-push，仅产物文件）
+        if: steps.changed.outputs.skip != 'true'
+        run: |
+          git config user.name "nff-dist-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git fetch origin dist || true   # 首次运行时 dist 分支尚不存在，属正常
+          git checkout --orphan dist-new
+          # 只清空索引、不动工作区（不能用 git rm -rf .，那会把刚构建的产物删掉）。
+          # 必须用 read-tree --empty：`git rm -r --cached .` 在「工作区文件与 HEAD
+          # 内容都不同」时会报错退出，一旦被 `|| true` 吞掉，整个源码树会留在索引里，
+          # dist 分支会被推成上百个文件。
+          git read-tree --empty
+          if [ -n "$(git ls-files)" ]; then
+            echo "::error::索引未清空，拒绝发布 dist"; git ls-files | head -20; exit 1
+          fi
+          # 产物必须位于分支根（安装器请求 raw .../dist/<file>，不带子目录）
+          VER="$(grep -m1 '^const Version' internal/version/version.go | sed 's/.*"\(.*\)".*/\1/')"
+          cp dist/nft-forward-linux-* dist/SHA256SUMS .
+          git add -f nft-forward-linux-* SHA256SUMS
+          git add scripts/dist-manifest.txt
+          # 发布前断言：dist 分支只能含产物 + 清单，不得夹带源码
+          tracked="$(git ls-files | sort)"
+          expected="$(printf '%s\n' SHA256SUMS scripts/dist-manifest.txt \
+            $(cd dist && ls nft-forward-linux-*) | sort)"
+          if [ "$tracked" != "$expected" ]; then
+            echo "::error::dist 分支内容不符合预期"
+            diff <(echo "$expected") <(echo "$tracked") || true
+            exit 1
+          fi
+          git commit -qm "dist: rebuild from ${GITHUB_SHA::7} (v$VER)"
+          git push -f origin dist-new:dist
+
+      - name: 验证 raw 分发地址真实可用
+        if: steps.changed.outputs.skip != 'true'
+        run: |
+          sleep 10
+          for f in nft-forward-linux-amd64 nft-forward-linux-arm64 SHA256SUMS; do
+            code=$(curl -sIL -o /dev/null -w '%{http_code}' \
+              "https://raw.githubusercontent.com/${{ github.repository }}/dist/$f")
+            [ "$code" = "200" ] || { echo "::error::分发地址不可用: $f -> HTTP $code"; exit 1; }
+            echo "  [OK] $f -> 200"
+          done

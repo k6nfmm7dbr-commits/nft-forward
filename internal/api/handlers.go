@@ -8,14 +8,20 @@ import (
 	"time"
 
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/forward"
+	"github.com/k6nfmm7dbr-commits/nft-forward/internal/nft"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/policy"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/traffic"
+	"github.com/k6nfmm7dbr-commits/nft-forward/internal/version"
 )
 
 // RuleView 是规则的完整视图（供列表/详情）。
+//
+// 内嵌 forward.Rule 后自动获得 target_address / listen_port / resolve_* 等字段；
+// 转发规则已无监听地址字段，因此响应里不会出现 listen_address。
 type RuleView struct {
 	forward.Rule
-	Status    string                 `json:"status"` // normal/disabled/quota_exceeded/ip_limited/error
+	Status    string                 `json:"status"` // normal/disabled/quota_exceeded/ip_limited/dns_failed
+	TargetTxt string                 `json:"target_text"`
 	Rate      traffic.Rate           `json:"rate"`
 	TotalUp   int64                  `json:"total_up"`
 	TotalDown int64                  `json:"total_down"`
@@ -57,6 +63,7 @@ func (s *Server) buildFullSnapshot() FullSnapshot {
 	for _, r := range rules {
 		v := RuleView{Rule: *r}
 		v.Status = ruleStatus(r, polStates[r.ID])
+		v.TargetTxt = forward.FormatHostPort(r.TargetAddress, r.TargetPort)
 		if rate, ok := collectStatus.Rates[r.ID]; ok {
 			v.Rate = rate
 		}
@@ -88,6 +95,10 @@ func ruleStatus(r *forward.Rule, ps *policy.RuleState) string {
 	if !r.Enabled {
 		return "disabled"
 	}
+	// 域名解析彻底失败（连历史地址都没有）→ 规则当前无数据面，必须显式暴露。
+	if r.IsDomainTarget() && !r.Resolvable() {
+		return "dns_failed"
+	}
 	if ps == nil {
 		return "normal"
 	}
@@ -96,6 +107,10 @@ func ruleStatus(r *forward.Rule, ps *policy.RuleState) string {
 	}
 	if r.IPLimitEnabled && len(ps.IPs.Rejected) > 0 {
 		return "ip_limited"
+	}
+	// DNS 临时失败但仍在用上次有效地址：转发正常，单独标记以便 UI 提示。
+	if r.IsDomainTarget() && r.ResolveStatus == forward.ResolveStale {
+		return "dns_stale"
 	}
 	return "normal"
 }
@@ -115,6 +130,116 @@ func (s *Server) dailyFor(ctx context.Context, ruleID int64, day string) (int64,
 	return up, down
 }
 
+// ---- 健康检查 ----
+
+// HealthView 是 /api/health 的响应。刻意不含 token、监听地址、文件路径等
+// 敏感配置，只反映各子系统的存活与最近成功时间。
+type HealthView struct {
+	OK        bool   `json:"ok"`
+	Version   string `json:"version"`
+	UptimeSec int64  `json:"uptime_sec"`
+
+	DBOK    bool   `json:"db_ok"`
+	DBError string `json:"db_error,omitempty"`
+
+	NftOK    bool   `json:"nft_ok"`
+	NftError string `json:"nft_error,omitempty"`
+
+	CollectorLastOK int64  `json:"collector_last_ok,omitempty"`
+	CollectorError  string `json:"collector_error,omitempty"`
+
+	PolicyReady        bool   `json:"policy_ready"`
+	PolicyLastOK       int64  `json:"policy_last_ok,omitempty"`
+	PolicyError        string `json:"policy_error,omitempty"`
+	NftLastApplyOK     int64  `json:"nft_last_apply_ok,omitempty"`
+	NftLastApplyError  string `json:"nft_last_apply_error,omitempty"`
+	ConntrackOK        bool   `json:"conntrack_ok"`
+	ConntrackNote      string `json:"conntrack_note,omitempty"`
+	DNSLastOK          int64  `json:"dns_last_ok,omitempty"`
+	DNSError           string `json:"dns_error,omitempty"`
+	DNSDomainRules     int    `json:"dns_domain_rules"`
+	DNSUnresolvedRules int    `json:"dns_unresolved_rules"`
+
+	Rules        int `json:"rules"`
+	RulesEnabled int `json:"rules_enabled"`
+}
+
+// DNSHealth 由 service 层注入（DNS worker 的最近状态）。
+type DNSHealth struct {
+	LastOK int64
+	Err    string
+}
+
+// SetDNSHealth 更新 DNS worker 健康状态。
+func (s *Server) SetDNSHealth(h DNSHealth) {
+	s.dnsMu.Lock()
+	s.dnsHealth = h
+	s.dnsMu.Unlock()
+}
+
+func (s *Server) buildHealth() HealthView {
+	ctx := context.Background()
+	hv := HealthView{
+		Version:   version.Version,
+		UptimeSec: int64(time.Since(s.started).Seconds()),
+	}
+	// SQLite：一次极轻量查询确认可读写。
+	if err := s.db.PingContext(ctx); err != nil {
+		hv.DBError = err.Error()
+	} else if _, err := s.db.ExecContext(ctx,
+		"INSERT INTO meta(k,v) VALUES('health_probe',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+		strconv.FormatInt(time.Now().Unix(), 10)); err != nil {
+		hv.DBError = err.Error()
+	} else {
+		hv.DBOK = true
+	}
+
+	// nft 命令可用性（只读探测，不改任何规则）。
+	if _, _, stderr, err := (nft.ExecRunner{}).Run(ctx, "nft", "list", "tables"); err != nil {
+		hv.NftError = err.Error()
+	} else if strings.TrimSpace(stderr) != "" {
+		hv.NftError = strings.TrimSpace(stderr)
+	} else {
+		hv.NftOK = true
+	}
+
+	cs := s.collect.Snapshot()
+	hv.CollectorLastOK = cs.LastOK
+	hv.CollectorError = cs.Error
+
+	ph := s.policy.HealthSnapshot()
+	hv.PolicyReady = ph.Ready
+	hv.PolicyLastOK = ph.LastReconcileOK
+	hv.PolicyError = ph.LastError
+	hv.NftLastApplyOK = ph.LastApplyOK
+	hv.NftLastApplyError = ph.LastApplyError
+	hv.ConntrackOK = ph.ConntrackOK
+	hv.ConntrackNote = ph.ConntrackNote
+
+	s.dnsMu.Lock()
+	hv.DNSLastOK = s.dnsHealth.LastOK
+	hv.DNSError = s.dnsHealth.Err
+	s.dnsMu.Unlock()
+
+	rules, err := s.store.ListActive(ctx)
+	if err == nil {
+		hv.Rules = len(rules)
+		for _, r := range rules {
+			if r.Enabled {
+				hv.RulesEnabled++
+			}
+			if r.IsDomainTarget() {
+				hv.DNSDomainRules++
+				if !r.Resolvable() {
+					hv.DNSUnresolvedRules++
+				}
+			}
+		}
+	}
+	hv.OK = hv.DBOK && hv.NftOK && hv.PolicyReady && hv.NftLastApplyError == ""
+	return hv
+}
+
 // ---- GET ----
 
 func (s *Server) handleAPIGet(w http.ResponseWriter, r *http.Request, route string) {
@@ -125,6 +250,8 @@ func (s *Server) handleAPIGet(w http.ResponseWriter, r *http.Request, route stri
 	switch {
 	case route == "/api/healthz":
 		s.sendJSON(w, r, http.StatusOK, M{"ok": true})
+	case route == "/api/health":
+		s.sendJSON(w, r, http.StatusOK, s.buildHealth())
 	case route == "/api/events":
 		s.handleEvents(w, r)
 	case route == "/api/summary":
@@ -155,6 +282,8 @@ type LiveRule struct {
 	RateUp    float64 `json:"rate_up"`
 	RateDown  float64 `json:"rate_down"`
 	ActiveIPs int     `json:"active_ip_count"`
+	MaxIPs    int     `json:"max_ips"`
+	Limited   bool    `json:"ip_limited"`
 	ConnTCP   int     `json:"conn_tcp"`
 	ConnUDP   int     `json:"conn_udp"`
 	Status    string  `json:"status"`
@@ -174,6 +303,8 @@ func (s *Server) buildLive() LiveView {
 		}
 		if ps, ok := polStates[r.ID]; ok {
 			lr.ActiveIPs = ps.IPs.GrantedCount
+			lr.MaxIPs = ps.IPs.MaxIPs
+			lr.Limited = ps.IPs.Limited
 			lr.ConnTCP = ps.ConnTCP
 			lr.ConnUDP = ps.ConnUDP
 		}
@@ -230,10 +361,16 @@ func (s *Server) ruleView(ctx context.Context, id int64) (*RuleView, error) {
 	v := RuleView{Rule: *r}
 	polStates := s.policy.States()
 	v.Status = ruleStatus(r, polStates[id])
+	v.TargetTxt = forward.FormatHostPort(r.TargetAddress, r.TargetPort)
 	if rate, ok := s.collect.Snapshot().Rates[id]; ok {
 		v.Rate = rate
 	}
 	v.TotalUp, v.TotalDown = s.totals(ctx, id)
+	today := ""
+	if cs := s.collect.Snapshot(); cs.LastOK > 0 {
+		today = time.Unix(cs.LastOK, 0).In(s.collect.Location()).Format("2006-01-02")
+	}
+	v.TodayUp, v.TodayDown = s.dailyFor(ctx, id, today)
 	if ps, ok := polStates[id]; ok {
 		v.ActiveIPs = ps.IPs.GrantedCount
 		v.ConnTCP = ps.ConnTCP

@@ -21,11 +21,21 @@
 //	  3) flush + add rules 放在同一个 `nft -f` 脚本里 —— nft 单脚本是原子
 //	     事务，因此不存在「规则短暂缺失」的丢包窗口。
 //
+//	域名规则的 DNS 目标变化走的也是这条路径：只重写链规则，counter 不动。
+//
 // ★ 为什么结构与元素分离：
 //
 //	allow set 的元素（在线 IP）变化频繁，若为此重建链规则，会周期性出现
 //	空 allow set 窗口，把已授权 IP 的 established 流量误 drop。
-//	因此元素变化只走 `nft add/delete element` 增量操作，绝不触碰链。
+//	因此元素变化只走 `nft add/delete element`，绝不触碰链。
+//
+// ★ 为什么每条 DNAT 规则都带 `fib daddr type local`：
+//
+//	规则不再有「监听地址」——用户只配监听端口。若直接写
+//	`tcp dport 5000 dnat to ...`，那么当这台服务器同时承担路由/网关职责时，
+//	**仅仅经过**本机（目的地址是别人）的同端口流量也会被 DNAT 劫持。
+//	`fib daddr type local` 让规则只匹配「目的地址属于本机」的包，
+//	等价于「监听本机所有本地地址」，同时不误伤 transit 流量。
 //
 // 为什么计数放在 FORWARD 而不是 NAT 链：
 //
@@ -109,52 +119,74 @@ func (g *GenInput) stateOf(id int64) *RuleState {
 	return g.States[id]
 }
 
-// enabledSplit 返回启用规则按地址族分组（已按 ID 排序，保证脚本稳定）。
-func (g *GenInput) enabledSplit() (v4, v6 []*forward.Rule) {
+// dnatTarget 是一条要写入某地址族数据面的 DNAT 意图。
+type dnatTarget struct {
+	rule *forward.Rule
+	addr string // 目标地址（IPv4 或 IPv6 字面量，已由上层解析/校验）
+}
+
+// families 返回按地址族分组的 DNAT 意图（已按规则 ID 排序，脚本稳定可比较）。
+//
+// 关键语义：
+//   - IPv4 目标（字面量或域名的 A 记录）→ 只进 nff_nat4；
+//   - IPv6 目标（字面量或域名的 AAAA 记录）→ 只进 nff_nat6；
+//   - 域名同时有 A + AAAA → 同一规则同时出现在两张表（同监听端口，各自族内闭环）；
+//   - 绝不交叉（不做 NAT64 / NAT46）；
+//   - 域名解析尚无任何有效地址 → 该规则本轮不产生 DNAT 规则，
+//     但它的 counter / allow set / 配额状态一律保留。
+func (g *GenInput) families() (v4, v6 []dnatTarget) {
 	for _, r := range g.Rules {
-		if r.Deleted || !r.Enabled {
+		if r == nil || r.Deleted || !r.Enabled {
 			continue
 		}
-		if isV4Addr(r.TargetAddress) {
-			v4 = append(v4, r)
-		} else {
-			v6 = append(v6, r)
+		if a := r.DialV4(); a != "" {
+			v4 = append(v4, dnatTarget{rule: r, addr: a})
+		}
+		if a := r.DialV6(); a != "" {
+			v6 = append(v6, dnatTarget{rule: r, addr: a})
 		}
 	}
-	sort.Slice(v4, func(i, j int) bool { return v4[i].ID < v4[j].ID })
-	sort.Slice(v6, func(i, j int) bool { return v6[i].ID < v6[j].ID })
+	sort.Slice(v4, func(i, j int) bool { return v4[i].rule.ID < v4[j].rule.ID })
+	sort.Slice(v6, func(i, j int) bool { return v6[i].rule.ID < v6[j].rule.ID })
 	return v4, v6
 }
 
-func isV4Addr(addr string) bool {
-	addr = strings.TrimSpace(addr)
-	if addr == "" || addr == "0.0.0.0" {
-		return true
+// enabledRules 返回所有启用且未删除的规则（filter 表的 counter/链以此为准）。
+//
+// 注意：即使域名当前解析失败（无 DialV4/DialV6），规则依然在此列表里 ——
+// counter 必须继续存在，否则「DNS 故障」会连带清掉流量统计。
+func (g *GenInput) enabledRules() []*forward.Rule {
+	var out []*forward.Rule
+	for _, r := range g.Rules {
+		if r == nil || r.Deleted || !r.Enabled {
+			continue
+		}
+		out = append(out, r)
 	}
-	return !strings.Contains(addr, ":")
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
 // ---- 结构签名 ----
 
 // StructSig 返回「结构」的稳定签名。只有它变化时才需要重写链规则。
 //
-// 签名故意 **不含** allow set 元素与配额超限状态：
+// 包含：规则 ID / 协议 / 监听端口 / 当前数据面目标地址（含 DNS 解析结果）/
+// 目标端口 / 是否启用 IP 限制。
+//
+// 故意 **不含** allow set 元素与配额超限状态：
 //   - allow set 元素走增量 element 操作；
 //   - 配额超限走 qblock set 元素。
 //
 // 这样在稳定运行期（仅在线 IP 增减、配额用量变化）完全不会触碰链和 counter。
+// DNS 解析结果变化会改变签名 → 触发链重写（counter 保留）。
 func StructSig(g *GenInput) string {
-	v4, v6 := g.enabledSplit()
 	var b strings.Builder
-	for _, group := range [][]*forward.Rule{v4, v6} {
-		for _, r := range group {
-			st := g.stateOf(r.ID)
-			ipLimit := st != nil && st.IPLimitEnabled
-			fmt.Fprintf(&b, "%d|%s|%s|%d|%s|%d|%t;",
-				r.ID, r.Protocol, strings.TrimSpace(r.ListenAddress), r.ListenPort,
-				strings.TrimSpace(r.TargetAddress), r.TargetPort, ipLimit)
-		}
-		b.WriteString("#")
+	for _, r := range g.enabledRules() {
+		st := g.stateOf(r.ID)
+		ipLimit := st != nil && st.IPLimitEnabled
+		fmt.Fprintf(&b, "%d|%s|%d|%s|%s|%d|%t;",
+			r.ID, r.Protocol, r.ListenPort, r.DialV4(), r.DialV6(), r.TargetPort, ipLimit)
 	}
 	return b.String()
 }
@@ -175,23 +207,24 @@ type Existing struct {
 // 关键：**不使用 `delete table`**。counter 与 set 作为表级对象被保留，
 // 只有链内规则被 flush 重建；整个脚本是单个 nft 原子事务，无中间态。
 func GenStructScript(g *GenInput, ex *Existing) string {
-	v4, v6 := g.enabledSplit()
-	all := append(append([]*forward.Rule{}, v4...), v6...)
+	v4, v6 := g.families()
 
 	var b strings.Builder
 	b.WriteString("#!/usr/sbin/nft -f\n")
 	b.WriteString("# 由 nft-forward 自动生成。只管理 nff_* 前缀的自有表，从不清空系统规则集。\n")
 	b.WriteString("# 表从不整体销毁重建：counter 是表级对象，这里只清空链再重建链内规则，\n")
-	b.WriteString("# 因此流量累计字节得以保留。\n\n")
+	b.WriteString("# 因此流量累计字节得以保留（域名 DNS 目标变化走的也是这条路径）。\n")
+	b.WriteString("# 每条 DNAT 都带 fib daddr type local：只匹配目的地址属于本机的包，\n")
+	b.WriteString("# 绝不劫持仅路由经过本机的 transit 流量。\n\n")
 
 	b.WriteString(genNATStruct("ip", TableNAT4, v4))
 	b.WriteString(genNATStruct("ip6", TableNAT6, v6))
-	b.WriteString(genFilterStruct(g, all, ex))
+	b.WriteString(genFilterStruct(g, ex))
 	return b.String()
 }
 
 // genNATStruct 生成一个族的 NAT 表结构（幂等 add + flush chain + 规则）。
-func genNATStruct(family, table string, rules []*forward.Rule) string {
+func genNATStruct(family, table string, targets []dnatTarget) string {
 	var b strings.Builder
 	marks := MarksSet(table)
 	pre := ChainPrerouting(table)
@@ -210,23 +243,30 @@ func genNATStruct(family, table string, rules []*forward.Rule) string {
 	fmt.Fprintf(&b, "flush set %s %s %s\n", family, table, marks)
 
 	// 3) 重建内容。
-	if len(rules) > 0 {
-		ids := make([]string, 0, len(rules))
-		for _, r := range rules {
-			ids = append(ids, strconv.FormatInt(r.ID, 10))
+	if len(targets) > 0 {
+		ids := make([]string, 0, len(targets))
+		seen := map[int64]bool{}
+		for _, t := range targets {
+			if seen[t.rule.ID] {
+				continue
+			}
+			seen[t.rule.ID] = true
+			ids = append(ids, strconv.FormatInt(t.rule.ID, 10))
 		}
 		fmt.Fprintf(&b, "add element %s %s %s { %s }\n", family, table, marks, strings.Join(ids, ", "))
 
-		for _, r := range rules {
-			target := fmt.Sprintf("%s:%d", r.TargetAddress, r.TargetPort)
-			if strings.Contains(r.TargetAddress, ":") {
-				// IPv6 目标需方括号包裹。
-				target = fmt.Sprintf("[%s]:%d", r.TargetAddress, r.TargetPort)
+		for _, t := range targets {
+			r := t.rule
+			target := fmt.Sprintf("%s:%d", t.addr, r.TargetPort)
+			if strings.Contains(t.addr, ":") {
+				target = fmt.Sprintf("[%s]:%d", t.addr, r.TargetPort) // IPv6 需方括号
 			}
-			addrMatch := listenAddrMatch(family, r.ListenAddress)
 			for _, p := range ruleProtos(r) {
-				fmt.Fprintf(&b, "add rule %s %s %s %s dport %d%s ct mark set %d dnat to %s\n",
-					family, table, pre, p, r.ListenPort, addrMatch, r.ID, target)
+				// fib daddr type local 必须在最前：先确认「发给本机」，
+				// 再看端口，最后打 ct mark 并 DNAT。
+				fmt.Fprintf(&b,
+					"add rule %s %s %s fib daddr type local %s dport %d ct mark set %d dnat to %s\n",
+					family, table, pre, p, r.ListenPort, r.ID, target)
 			}
 		}
 		// 只对本程序 DNAT 过的连接做 masquerade。
@@ -237,9 +277,10 @@ func genNATStruct(family, table string, rules []*forward.Rule) string {
 }
 
 // genFilterStruct 生成 filter 表结构：counter/set 幂等声明 + flush chain + 规则。
-func genFilterStruct(g *GenInput, all []*forward.Rule, ex *Existing) string {
+func genFilterStruct(g *GenInput, ex *Existing) string {
 	var b strings.Builder
 	fwd := ChainForward()
+	all := g.enabledRules()
 
 	// 1) 幂等声明。counter 已存在时保留累计值，这是流量不丢的关键。
 	fmt.Fprintf(&b, "table inet %s {\n", TableFilter)
@@ -333,16 +374,4 @@ func ruleProtos(r *forward.Rule) []string {
 		out = append(out, "udp")
 	}
 	return out
-}
-
-// listenAddrMatch 若监听地址是具体地址（非通配），生成目的地址匹配以限制 DNAT 范围。
-func listenAddrMatch(family, listenAddr string) string {
-	la := strings.TrimSpace(listenAddr)
-	if la == "" || la == "0.0.0.0" || la == "::" {
-		return ""
-	}
-	if family == "ip" {
-		return " ip daddr " + la
-	}
-	return " ip6 daddr " + la
 }

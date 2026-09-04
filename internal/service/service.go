@@ -1,4 +1,4 @@
-// Package service 编排 nft-forward 的运行：配置、DB、采集、策略、API。
+// Package service 编排 nft-forward 的运行：配置、DB、采集、策略、DNS、API。
 package service
 
 import (
@@ -17,6 +17,8 @@ import (
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/forward"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/nft"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/policy"
+	"github.com/k6nfmm7dbr-commits/nft-forward/internal/resolve"
+	"github.com/k6nfmm7dbr-commits/nft-forward/internal/rulesvc"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/traffic"
 )
 
@@ -41,7 +43,15 @@ func Serve() int {
 	pol := policy.New(db.DB, store, runner, cfg.NftConf, "")
 	collect := traffic.NewCollector(db, runner, cfg.TZ)
 
-	srv, hs := api.New(cfg, db, store, pol, collect)
+	// 统一规则变更服务：Web API 与后台 DNS worker 共用它，
+	// 因此不存在「两套 nft 修改逻辑」。
+	resolver := resolve.NewSystemResolver(5 * time.Second)
+	rules := rulesvc.New(store, pol, resolver,
+		func() forward.GuardPorts { return forward.GuardPorts(cfg.GuardPorts()) })
+
+	srv, hs := api.New(cfg, db, store, pol, rules, collect)
+	// SSE 广播依赖 srv，构造后回填。
+	rules.SetNotifier(func() { srv.PublishSnapshotNow() })
 
 	addr := net.JoinHostPort(cfg.Listen, fmt.Sprint(cfg.Port))
 	ln, lerr := net.Listen("tcp", addr)
@@ -67,13 +77,18 @@ func Serve() int {
 
 	// 策略周期 reconcile（一致性自愈 + 配额事件兜底 + IP 准入）。
 	// 500ms 是为了缩短「连接已建立但 slot 未授予」的竞态窗口。
-	// 注意：reconcile 现在只在结构变化时重写 nft 链，稳定期只做元素增量，
+	// reconcile 只在结构变化时重写 nft 链，稳定期只做元素增量，
 	// 因此高频运行不会清零流量 counter。
 	polCtx, polCancel := context.WithCancel(ctx)
 	defer polCancel()
 	go runPolicy(polCtx, pol, 500*time.Millisecond)
 
-	// SSE 快照推送由 API 在状态变化时主动 Publish；这里定期兜底广播。
+	// 域名目标 DNS reconcile。
+	dnsCtx, dnsCancel := context.WithCancel(ctx)
+	defer dnsCancel()
+	go runDNS(dnsCtx, rules, srv, time.Duration(cfg.DNSRefresh)*time.Second)
+
+	// SSE 快照推送由变更服务在状态变化时主动 Publish；这里定期兜底广播。
 	go runSnapshotPublisher(ctx, srv, 2*time.Second)
 
 	slog.Info("面板已启动 http://" + addr)
@@ -90,6 +105,7 @@ func Serve() int {
 		}
 	}
 
+	dnsCancel()
 	polCancel()
 	collectCancel()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -138,7 +154,40 @@ func runPolicy(ctx context.Context, p *policy.Service, interval time.Duration) {
 	}
 }
 
-// runSnapshotPublisher 周期性向 SSE 订阅者广播快照（兜底，变化推送由 API 主动触发）。
+// runDNS 周期刷新域名目标。
+//
+// 首轮立即执行一次（服务重启后尽快恢复/校正解析结果），之后按配置周期运行。
+// 单轮失败只记录，不影响已生效的转发（last-known-good 由 resolve 层保证）。
+func runDNS(ctx context.Context, rules *rulesvc.Service, srv *api.Server, interval time.Duration) {
+	if interval < 10*time.Second {
+		interval = 10 * time.Second
+	}
+	run := func() {
+		changed, err := rules.RefreshDNS(ctx)
+		if err != nil {
+			slog.Warn("DNS 刷新失败", "err", err)
+			srv.SetDNSHealth(api.DNSHealth{Err: err.Error()})
+			return
+		}
+		if changed > 0 {
+			slog.Info("域名目标已更新", "rules", changed)
+		}
+		srv.SetDNSHealth(api.DNSHealth{LastOK: time.Now().Unix()})
+	}
+	run()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
+}
+
+// runSnapshotPublisher 周期性向 SSE 订阅者广播快照（兜底，变化推送由变更服务触发）。
 func runSnapshotPublisher(ctx context.Context, srv *api.Server, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

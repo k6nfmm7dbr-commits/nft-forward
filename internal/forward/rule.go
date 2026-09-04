@@ -1,13 +1,16 @@
 // Package forward 定义转发规则模型、校验与冲突检查。
 //
 // 数据模型要求稳定且不复用的 ID，软删除（deleted 标记），历史流量不因删除丢失。
-// 冲突检查：两条规则协议集合相交 + 相同监听端口 即冲突（DNAT 按端口匹配，
-// 与监听地址无关；0.0.0.0:X 会覆盖任何具体地址的 :X）。
+//
+// 监听语义（v0.2 起）：规则**没有监听地址**概念。用户只配置监听端口，
+// 规则自动作用于「目的地址属于本机」的数据包（nft 侧用 fib daddr type local
+// 限定），因此不会误劫持仅路由经过本机的 transit 流量。
+//
+// 冲突判定：协议集合相交 + 相同监听端口 即冲突（DNAT 只按端口匹配）。
 package forward
 
 import (
 	"fmt"
-	"net"
 	"strings"
 	"time"
 )
@@ -19,13 +22,34 @@ const (
 	ProtoTCPUDP = "tcp+udp"
 )
 
+// 解析状态常量（域名规则运行时状态）。
+const (
+	// ResolveNA 表示无需解析（目标是 IP 字面量）。
+	ResolveNA = ""
+	// ResolveOK 表示最近一次解析成功。
+	ResolveOK = "ok"
+	// ResolveStale 表示最近一次解析失败，正在沿用上次有效地址。
+	ResolveStale = "stale"
+	// ResolveFailed 表示解析失败且没有可用的历史地址。
+	ResolveFailed = "failed"
+)
+
+// maxNameLen 是规则名称长度上限（字符数，按 rune 计）。
+const maxNameLen = 64
+
 // Rule 是一条转发规则。
+//
+// 用户配置字段：Name / Enabled / Protocol / ListenPort / TargetAddress /
+// TargetPort，以及 Quota、IPLimit 策略字段。
+//
+// 运行时解析结果（Resolved*）由后台 DNS reconcile 维护，用户不直接配置，
+// API 只读暴露。它与用户配置严格分离：TargetAddress 永远保存用户填写的原始
+// 值（域名保持域名，绝不被解析结果覆盖）。
 type Rule struct {
 	ID            int64  `json:"id"`
 	Name          string `json:"name"`
 	Enabled       bool   `json:"enabled"`
 	Protocol      string `json:"protocol"` // tcp / udp / tcp+udp
-	ListenAddress string `json:"listen_address"`
 	ListenPort    int    `json:"listen_port"`
 	TargetAddress string `json:"target_address"`
 	TargetPort    int    `json:"target_port"`
@@ -40,7 +64,20 @@ type Rule struct {
 	QuotaResetBaseline int64 `json:"quota_reset_baseline,omitempty"`
 	IPLimitEnabled     bool  `json:"ip_limit_enabled"`
 	IPLimitMax         int   `json:"ip_limit_max"`
+
+	// 运行时 DNS 解析结果（只读；IP 目标时为空）。
+	ResolvedV4    string `json:"resolved_ipv4,omitempty"`
+	ResolvedV6    string `json:"resolved_ipv6,omitempty"`
+	ResolvedAt    int64  `json:"resolved_at,omitempty"`
+	ResolveStatus string `json:"resolve_status,omitempty"`
+	ResolveError  string `json:"resolve_error,omitempty"`
 }
+
+// TargetKind 返回目标地址形态。
+func (r *Rule) TargetKind() TargetKind { return KindOf(r.TargetAddress) }
+
+// IsDomainTarget 报告目标是否为域名。
+func (r *Rule) IsDomainTarget() bool { return r.TargetKind() == TargetDomain }
 
 // HasTCP 报告规则是否承载 TCP。
 func (r *Rule) HasTCP() bool {
@@ -52,6 +89,38 @@ func (r *Rule) HasUDP() bool {
 	return r.Protocol == ProtoUDP || r.Protocol == ProtoTCPUDP
 }
 
+// DialV4 返回本规则当前应写入 IPv4 数据面的目标地址（无则空串）。
+//
+// IP 目标：字面量本身决定数据面；域名目标：使用最近一次有效解析结果。
+// 绝不做 NAT64/NAT46 —— IPv4 数据面只会指向 IPv4 目标。
+func (r *Rule) DialV4() string {
+	switch r.TargetKind() {
+	case TargetIPv4:
+		return strings.TrimSpace(r.TargetAddress)
+	case TargetDomain:
+		return strings.TrimSpace(r.ResolvedV4)
+	default:
+		return ""
+	}
+}
+
+// DialV6 返回本规则当前应写入 IPv6 数据面的目标地址（无则空串）。
+func (r *Rule) DialV6() string {
+	switch r.TargetKind() {
+	case TargetIPv6:
+		return strings.TrimSpace(r.TargetAddress)
+	case TargetDomain:
+		return strings.TrimSpace(r.ResolvedV6)
+	default:
+		return ""
+	}
+}
+
+// Resolvable 报告规则当前是否有可用的数据面目标。
+// 域名解析全部失败（且无历史地址）时为 false —— 此时不生成任何 DNAT 规则，
+// 但规则本身与其 counter / 配额 / IP 限制状态一律保留。
+func (r *Rule) Resolvable() bool { return r.DialV4() != "" || r.DialV6() != "" }
+
 // ValidProtocol 报告协议串是否合法。
 func ValidProtocol(p string) bool {
 	switch p {
@@ -61,60 +130,57 @@ func ValidProtocol(p string) bool {
 	return false
 }
 
-// isAny 报告监听地址是否为「任意地址」（空串、0.0.0.0、::）。
-func isAny(addr string) bool {
-	addr = strings.TrimSpace(addr)
-	if addr == "" {
-		return true
+// NormalizeName 去除首尾空白并校验名称长度。
+func NormalizeName(raw string) (string, error) {
+	n := strings.TrimSpace(raw)
+	if n == "" {
+		return "", fmt.Errorf("规则名称不能为空")
 	}
-	ip := net.ParseIP(addr)
-	return ip != nil && ip.IsUnspecified()
+	if len([]rune(n)) > maxNameLen {
+		return "", fmt.Errorf("规则名称过长（最多 %d 个字符）", maxNameLen)
+	}
+	if strings.ContainsAny(n, "\r\n\t") {
+		return "", fmt.Errorf("规则名称不能包含换行或制表符")
+	}
+	return n, nil
 }
 
-// isIPv4 报告地址是否为 IPv4。
-func isIPv4(addr string) bool {
-	addr = strings.TrimSpace(addr)
-	if addr == "" || addr == "0.0.0.0" {
-		return true // 默认按 IPv4 任意地址
-	}
-	ip := net.ParseIP(addr)
-	return ip != nil && ip.To4() != nil
-}
+// ValidPort 报告端口是否在合法区间。
+func ValidPort(p int) bool { return p >= 1 && p <= 65535 }
 
-// Validate 校验规则自身字段合法性（不含冲突检查）。
-func Validate(r *Rule) error {
-	if strings.TrimSpace(r.Name) == "" {
-		return fmt.Errorf("规则名称不能为空")
+// Normalize 就地规范化用户可配置字段，供 Validate 之前调用。
+//
+// 注意：不处理 ListenPort==0（自动分配）——那是 PortAllocator 的职责，
+// 必须在 Validate 之前完成分配。
+func Normalize(r *Rule) error {
+	name, err := NormalizeName(r.Name)
+	if err != nil {
+		return err
 	}
+	r.Name = name
+	r.Protocol = strings.ToLower(strings.TrimSpace(r.Protocol))
 	if !ValidProtocol(r.Protocol) {
 		return fmt.Errorf("协议非法: %q（应为 tcp/udp/tcp+udp）", r.Protocol)
 	}
-	if r.ListenPort < 1 || r.ListenPort > 65535 {
+	target, _, err := NormalizeTarget(r.TargetAddress)
+	if err != nil {
+		return err
+	}
+	r.TargetAddress = target
+	return nil
+}
+
+// Validate 校验规则自身字段合法性（不含冲突检查、不含 DNS 解析）。
+func Validate(r *Rule) error {
+	if err := Normalize(r); err != nil {
+		return err
+	}
+	if !ValidPort(r.ListenPort) {
 		return fmt.Errorf("监听端口必须在 1-65535: %d", r.ListenPort)
 	}
-	if r.TargetPort < 1 || r.TargetPort > 65535 {
+	if !ValidPort(r.TargetPort) {
 		return fmt.Errorf("目标端口必须在 1-65535: %d", r.TargetPort)
 	}
-	// 地址合法性。
-	la := strings.TrimSpace(r.ListenAddress)
-	if la == "" {
-		la = "0.0.0.0" // 默认任意地址
-	}
-	if !isAny(la) && net.ParseIP(la) == nil {
-		return fmt.Errorf("监听地址非法: %q", r.ListenAddress)
-	}
-	ta := strings.TrimSpace(r.TargetAddress)
-	if ta == "" {
-		return fmt.Errorf("目标地址不能为空")
-	}
-	if ip := net.ParseIP(ta); ip == nil || ip.IsUnspecified() {
-		return fmt.Errorf("目标地址非法: %q", r.TargetAddress)
-	}
-	// 地址族必须一致（IPv4→IPv4 / IPv6→IPv6），禁止 NAT64/46。
-	if isIPv4(la) != isIPv4(ta) {
-		return fmt.Errorf("监听地址与目标地址的地址族必须一致（IPv4→IPv4 / IPv6→IPv6）")
-	}
-	// 策略数值。
 	if r.QuotaEnabled && r.QuotaLimitBytes <= 0 {
 		return fmt.Errorf("流量额度必须 > 0")
 	}
@@ -125,12 +191,10 @@ func Validate(r *Rule) error {
 }
 
 // ConflictsWith 报告本规则是否与另一条规则在「协议+监听端口」上冲突。
-// DNAT 按端口匹配，地址不影响冲突判定。
 func (r *Rule) ConflictsWith(other *Rule) bool {
 	if r.ListenPort != other.ListenPort {
 		return false
 	}
-	// 协议集合相交才冲突。
 	if r.HasTCP() && other.HasTCP() {
 		return true
 	}
@@ -143,28 +207,44 @@ func (r *Rule) ConflictsWith(other *Rule) bool {
 // GuardPorts 是转发规则不允许占用的保留端口（面板、SSH 等）。
 type GuardPorts map[int]string
 
-// CheckConflicts 校验新规则不与已有规则冲突，且不占用保留端口。
-// existing 只应包含未删除的规则。selfID 用于编辑时排除自身。
+// CheckPort 只做端口层面的检查（保留端口 + 与既有规则冲突），不校验其它字段。
+// existing 只应包含未删除的规则；同 ID 视为自身并跳过。
+func CheckPort(r *Rule, existing []*Rule, guard GuardPorts) error {
+	if label, ok := guard[r.ListenPort]; ok {
+		return fmt.Errorf("监听端口 %d 已被%s占用，请改用其它端口", r.ListenPort, label)
+	}
+	for _, o := range existing {
+		if o == nil || o.Deleted || o.ID == r.ID {
+			continue
+		}
+		if r.ConflictsWith(o) {
+			return fmt.Errorf("与规则「%s」使用了相同的 %s 监听端口 %d",
+				o.Name, protoLabel(r, o), r.ListenPort)
+		}
+	}
+	return nil
+}
+
+// protoLabel 给出两条规则重叠的协议文案（用于友好错误提示）。
+func protoLabel(a, b *Rule) string {
+	tcp := a.HasTCP() && b.HasTCP()
+	udp := a.HasUDP() && b.HasUDP()
+	switch {
+	case tcp && udp:
+		return "TCP/UDP"
+	case udp:
+		return "UDP"
+	default:
+		return "TCP"
+	}
+}
+
+// CheckConflicts 校验新规则字段合法且不与已有规则冲突、不占用保留端口。
 func CheckConflicts(r *Rule, existing []*Rule, guard GuardPorts) error {
 	if err := Validate(r); err != nil {
 		return err
 	}
-	if label, ok := guard[r.ListenPort]; ok {
-		return fmt.Errorf("监听端口 %d 已被 %s 占用，不能用作转发", r.ListenPort, label)
-	}
-	for _, o := range existing {
-		if o.Deleted {
-			continue
-		}
-		if o.ID == r.ID {
-			continue // 编辑自身，跳过
-		}
-		if r.ConflictsWith(o) {
-			return fmt.Errorf("与规则「%s」(#%d %s :%d) 冲突：相同协议不能使用相同监听端口",
-				o.Name, o.ID, o.Protocol, o.ListenPort)
-		}
-	}
-	return nil
+	return CheckPort(r, existing, guard)
 }
 
 // Now 返回当前 Unix 秒。

@@ -1,5 +1,10 @@
 // Package config 负责 nft-forward 配置加载。
-// 默认值 + /etc/nft-forward/panel.json 覆盖；LoadStrict fail-closed。
+//
+// 默认值 + /etc/nft-forward/panel.json 覆盖。写回一律走 fsx 原子写
+// （临时文件 → fsync → chmod 0600 → rename → fsync 目录）。
+//
+// fail-closed 原则（与 SBX 一致）：配置文件存在但损坏时，LoadStrict 直接报错，
+// **绝不**用默认值覆盖 —— 否则会重新生成 token 让用户彻底登录不进面板。
 package config
 
 import (
@@ -43,25 +48,32 @@ func defaultConf() map[string]any {
 		"port":        json.Number("8090"),
 		"token":       "",
 		"interval":    json.Number("2"),
+		"dns_refresh": json.Number("60"),
 		"tz":          "Asia/Shanghai",
 		"ssh_port":    json.Number("22"), // 冲突检查时避开
 	}
 }
 
 // Config 是合并后的运行配置。
+//
+// 注意：Listen 是 **Web 面板自身的 bind 地址**（Web Server 配置），
+// 与「转发规则监听地址」无关 —— 后者已彻底移除。
 type Config struct {
 	raw map[string]any
 
 	DB           string
 	NftConf      string
 	SysctlConf   string
-	Listen       string
-	Port         int
+	Listen       string // 面板 HTTP 服务 bind 地址
+	Port         int    // 面板端口
 	Token        string
-	Interval     int
+	Interval     int // 流量采集间隔（秒）
+	DNSRefresh   int // 域名目标 DNS 刷新周期（秒）
 	TZ           string
 	SSHGuard     int // 冲突检查需避开的 SSH 端口
 	SecureCookie bool
+	// ExtraGuards 是额外保留端口（guard_ports: {"port": "说明"}）。
+	ExtraGuards map[int]string
 }
 
 // Load 宽松读取（只读场景）。
@@ -138,6 +150,9 @@ func (c *Config) Validate() error {
 	if c.Interval < 1 || c.Interval > 86400 {
 		return fmt.Errorf("interval 非法: %d", c.Interval)
 	}
+	if c.DNSRefresh < 10 || c.DNSRefresh > 3600 {
+		return fmt.Errorf("dns_refresh 必须在 10-3600 秒: %d", c.DNSRefresh)
+	}
 	if c.DB == "" {
 		return fmt.Errorf("db 路径不能为空")
 	}
@@ -158,11 +173,38 @@ func (c *Config) normalize() {
 	if c.Interval < 1 {
 		c.Interval = 1
 	}
+	c.DNSRefresh = int(c.Int("dns_refresh"))
+	if c.DNSRefresh == 0 {
+		c.DNSRefresh = 60
+	}
 	c.TZ = c.Str("tz")
 	c.SSHGuard = int(c.Int("ssh_port"))
 	c.SecureCookie = c.Bool("secure_cookie")
+	c.ExtraGuards = c.guardPorts()
 }
 
+// guardPorts 解析 guard_ports 配置：{"9000": "自定义服务"}。
+func (c *Config) guardPorts() map[int]string {
+	out := map[int]string{}
+	m, ok := c.raw["guard_ports"].(map[string]any)
+	if !ok {
+		return out
+	}
+	for k, v := range m {
+		p, err := strconv.Atoi(strings.TrimSpace(k))
+		if err != nil || p < 1 || p > 65535 {
+			continue
+		}
+		label := "保留端口"
+		if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+			label = s
+		}
+		out[p] = label
+	}
+	return out
+}
+
+// Bool 读取布尔配置项。
 func (c *Config) Bool(key string) bool {
 	switch t := c.raw[key].(type) {
 	case bool:
@@ -175,6 +217,7 @@ func (c *Config) Bool(key string) bool {
 	}
 }
 
+// Str 读取字符串配置项。
 func (c *Config) Str(key string) string {
 	v := c.raw[key]
 	switch t := v.(type) {
@@ -186,14 +229,15 @@ func (c *Config) Str(key string) string {
 		return t.String()
 	case bool:
 		if t {
-			return "True"
+			return "true"
 		}
-		return "False"
+		return "false"
 	default:
 		return fmt.Sprint(t)
 	}
 }
 
+// Int 读取整数配置项。
 func (c *Config) Int(key string) int64 {
 	switch t := c.raw[key].(type) {
 	case nil:
@@ -216,6 +260,45 @@ func (c *Config) Int(key string) int64 {
 	return 0
 }
 
+// legacyKeys 是已废弃的配置键（读到即在迁移时删除）。
+//
+// listen_address 从未作为面板配置存在；这里列出的是历史上可能被写入的
+// 转发相关键。删除它们只是清理，不改变任何行为。
+var legacyKeys = []string{"rule_listen_address", "default_listen_address"}
+
+// Migrate 清理废弃配置键（读取 → 改 → 原子写回）。
+// 返回被删除的键。配置损坏时 fail-closed，不写回。
+func Migrate() ([]string, error) {
+	c, err := LoadStrict()
+	if err != nil {
+		return nil, fmt.Errorf("拒绝迁移配置: %w", err)
+	}
+	var dropped []string
+	for _, k := range legacyKeys {
+		if _, ok := c.raw[k]; ok {
+			delete(c.raw, k)
+			dropped = append(dropped, k)
+		}
+	}
+	if len(dropped) == 0 {
+		return nil, nil
+	}
+	if err := c.write(); err != nil {
+		return nil, err
+	}
+	return dropped, nil
+}
+
+// write 原子写回当前配置（0600，含 token）。
+func (c *Config) write() error {
+	data, err := fsx.MarshalIndent(c.raw)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return fsx.WriteFileAtomic(ConfPath(), data, 0o600)
+}
+
 // Set 写回单个配置项并原子落盘。
 func Set(key, value string) error {
 	c, err := LoadStrict()
@@ -228,12 +311,7 @@ func Set(key, value string) error {
 		v = json.Number(strconv.FormatInt(i, 10))
 	}
 	c.raw[key] = v
-	data, err := fsx.MarshalIndent(c.raw)
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	return fsx.WriteFileAtomic(ConfPath(), data, 0o600)
+	return c.write()
 }
 
 // EnsureToken 保证 token 非空；为空则生成高熵随机令牌并写回。
@@ -245,21 +323,63 @@ func EnsureToken() (string, error) {
 	if c.Token != "" {
 		return c.Token, nil
 	}
+	tok, err := RandomToken()
+	if err != nil {
+		return "", err
+	}
+	c.raw["token"] = tok
+	if err := c.write(); err != nil {
+		return "", err
+	}
+	return tok, nil
+}
+
+// ResetToken 强制生成新令牌并写回（用于「重置面板令牌」）。
+func ResetToken() (string, error) {
+	c, err := LoadStrict()
+	if err != nil {
+		return "", fmt.Errorf("拒绝重置访问令牌: %w", err)
+	}
+	tok, err := RandomToken()
+	if err != nil {
+		return "", err
+	}
+	c.raw["token"] = tok
+	if err := c.write(); err != nil {
+		return "", err
+	}
+	return tok, nil
+}
+
+// RandomToken 生成 32 位十六进制高熵令牌（128 bit）。
+func RandomToken() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	tok := hex.EncodeToString(b)
-	c.raw["token"] = tok
-	data, err := fsx.MarshalIndent(c.raw)
-	if err != nil {
-		return "", err
+	return hex.EncodeToString(b), nil
+}
+
+// GuardPorts 返回转发规则不允许占用的保留端口表。
+//
+// 集中在 config 里的原因：规则变更服务（rulesvc）与 API 层都需要同一份表，
+// 两处各写一遍必然漂移。
+//
+// 内容：面板端口 + SSH 端口 + 用户在 guard_ports 里额外声明的端口。
+func (c *Config) GuardPorts() map[int]string {
+	g := map[int]string{}
+	if c.Port > 0 {
+		g[c.Port] = "面板"
 	}
-	data = append(data, '\n')
-	if err := fsx.WriteFileAtomic(ConfPath(), data, 0o600); err != nil {
-		return "", err
+	if c.SSHGuard > 0 {
+		g[c.SSHGuard] = "系统保护端口（SSH）"
 	}
-	return tok, nil
+	for p, label := range c.ExtraGuards {
+		if _, taken := g[p]; !taken {
+			g[p] = label
+		}
+	}
+	return g
 }
 
 // Raw 暴露合并后的原始映射。

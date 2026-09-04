@@ -7,7 +7,7 @@ PORT=29900
 
 rid=$(curl -s -X POST "$API/api/rules" \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d "{\"name\":\"quota\",\"enabled\":true,\"protocol\":\"tcp\",\"listen_address\":\"0.0.0.0\",\"listen_port\":${PORT},\"target_address\":\"10.203.0.100\",\"target_port\":80}" \
+  -d "{\"name\":\"quota\",\"enabled\":true,\"protocol\":\"tcp\",\"listen_port\":${PORT},\"target_address\":\"10.203.0.100\",\"target_port\":80}" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
 echo "规则 ID = $rid"
 [ -z "$rid" ] && exit 1

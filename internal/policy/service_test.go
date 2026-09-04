@@ -85,7 +85,7 @@ func TestRepeatedReconcileDoesNotRebuildStructure(t *testing.T) {
 	svc, store := newTestService(t, rec, state)
 	addRule(t, store, &forward.Rule{
 		Name: "r1", Enabled: true, Protocol: "tcp",
-		ListenAddress: "0.0.0.0", ListenPort: 20000,
+		ListenPort:    20000,
 		TargetAddress: "10.0.0.2", TargetPort: 80,
 	})
 
@@ -112,7 +112,7 @@ func TestStructChangeTriggersRebuild(t *testing.T) {
 	svc, store := newTestService(t, rec, state)
 	id := addRule(t, store, &forward.Rule{
 		Name: "r1", Enabled: true, Protocol: "tcp",
-		ListenAddress: "0.0.0.0", ListenPort: 20000,
+		ListenPort:    20000,
 		TargetAddress: "10.0.0.2", TargetPort: 80,
 	})
 	ctx := context.Background()
@@ -147,7 +147,7 @@ func TestQuotaFlipUsesElementsOnly(t *testing.T) {
 	svc, store := newTestService(t, rec, state)
 	id := addRule(t, store, &forward.Rule{
 		Name: "r1", Enabled: true, Protocol: "tcp",
-		ListenAddress: "0.0.0.0", ListenPort: 20000,
+		ListenPort:    20000,
 		TargetAddress: "10.0.0.2", TargetPort: 80,
 		QuotaEnabled: true, QuotaLimitBytes: 1000,
 	})
@@ -190,7 +190,7 @@ func TestIPChangeUsesElementsOnly(t *testing.T) {
 	svc, store := newTestService(t, rec, state)
 	id := addRule(t, store, &forward.Rule{
 		Name: "r1", Enabled: true, Protocol: "tcp",
-		ListenAddress: "0.0.0.0", ListenPort: 20000,
+		ListenPort:    20000,
 		TargetAddress: "10.0.0.2", TargetPort: 80,
 		IPLimitEnabled: true, IPLimitMax: 3,
 	})
@@ -235,7 +235,7 @@ func TestPartialConntrackFailSafe(t *testing.T) {
 	svc, store := newTestService(t, rec, state)
 	id := addRule(t, store, &forward.Rule{
 		Name: "r1", Enabled: true, Protocol: "tcp",
-		ListenAddress: "0.0.0.0", ListenPort: 20000,
+		ListenPort:    20000,
 		TargetAddress: "10.0.0.2", TargetPort: 80,
 		IPLimitEnabled: true, IPLimitMax: 2,
 	})
@@ -277,7 +277,7 @@ func TestUDPUsesLongerIdleWindow(t *testing.T) {
 	svc, store := newTestService(t, rec, state)
 	id := addRule(t, store, &forward.Rule{
 		Name: "r1", Enabled: true, Protocol: "udp",
-		ListenAddress: "0.0.0.0", ListenPort: 20000,
+		ListenPort:    20000,
 		TargetAddress: "10.0.0.2", TargetPort: 80,
 	})
 	state.Counters = []string{nft.CounterUp(id), nft.CounterDown(id)}
@@ -326,7 +326,7 @@ func TestConnCountsReported(t *testing.T) {
 	svc, store := newTestService(t, rec, state)
 	id := addRule(t, store, &forward.Rule{
 		Name: "r1", Enabled: true, Protocol: "tcp+udp",
-		ListenAddress: "0.0.0.0", ListenPort: 20000,
+		ListenPort:    20000,
 		TargetAddress: "10.0.0.2", TargetPort: 80,
 	})
 	state.Counters = []string{nft.CounterUp(id), nft.CounterDown(id)}
@@ -359,7 +359,7 @@ func TestDeletedRuleFlowsCleaned(t *testing.T) {
 	svc, store := newTestService(t, rec, state)
 	id := addRule(t, store, &forward.Rule{
 		Name: "r1", Enabled: true, Protocol: "tcp",
-		ListenAddress: "0.0.0.0", ListenPort: 20000,
+		ListenPort:    20000,
 		TargetAddress: "10.0.0.2", TargetPort: 80,
 	})
 	state.Counters = []string{nft.CounterUp(id), nft.CounterDown(id)}

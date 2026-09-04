@@ -57,7 +57,7 @@ func newIPState() *NodeIPState {
 	}
 }
 
-func lastActive(ip string, lastSeen, lastTraffic time.Time) time.Time {
+func lastActive(lastSeen, lastTraffic time.Time) time.Time {
 	if lastTraffic.After(lastSeen) {
 		return lastTraffic
 	}
@@ -124,16 +124,35 @@ func (st *NodeIPState) Reconcile(active, candidates map[string]IPActivity, maxIP
 		}
 	}
 
-	// 4) 排序：已有 slot > active > FirstSeen > IP（确定性）。
+	// 4) 排序（优先级从高到低）：
+	//      ① 已建立且已持有正式 slot —— 在用的真实客户端，绝不能被挤掉
+	//      ② 已建立（active）—— 完成过握手，比只发 SYN 的可信
+	//      ③ 已持有 provisional slot 的候选
+	//      ④ 其余候选
+	//    再按 FirstSeen、IP 兜底保证确定性。
+	//
+	// 为什么 active 必须排在「持有 provisional slot 的候选」之前：
+	// 只发 SYN 的陌生 IP 会先拿到 provisional slot，若「持有 slot」优先级最高，
+	// 它就能在名额满时把真正 ESTABLISHED 的客户端推进 Rejected；每
+	// provisionalTTL 内重发一次 SYN 即可持续拒服。max_ips=1 时最明显。
+	rank := func(w want) int {
+		slot, has := st.Slots[w.ip]
+		switch {
+		case has && !slot.Provisional && w.active:
+			return 0
+		case w.active:
+			return 1
+		case has && slot.Provisional:
+			return 2
+		default:
+			return 3
+		}
+	}
 	sort.Slice(all, func(i, j int) bool {
 		a, b := all[i], all[j]
-		_, aHas := st.Slots[a.ip]
-		_, bHas := st.Slots[b.ip]
-		if aHas != bHas {
-			return aHas
-		}
-		if a.active != b.active {
-			return a.active
+		ra, rb := rank(a), rank(b)
+		if ra != rb {
+			return ra < rb
 		}
 		fa, fb := st.Observed[a.ip].FirstSeen, st.Observed[b.ip].FirstSeen
 		if !fa.Equal(fb) {
@@ -168,7 +187,21 @@ func (st *NodeIPState) Reconcile(active, candidates map[string]IPActivity, maxIP
 			}
 			continue
 		}
-		if maxIPs <= 0 || len(st.Slots) < maxIPs {
+		hasRoom := maxIPs <= 0 || len(st.Slots) < maxIPs
+		// 名额已满但本 IP 已完成握手 → 抢占一个 provisional slot。
+		// provisional 只是「让 SYN 能过 nft」的临时预留，不代表在用连接；
+		// 真实客户端的优先级必须高于它，否则只发 SYN 的陌生 IP 能占死名额
+		// （纯 SYN 扫描长期占用正式名额，真实客户端永远连不上）。
+		// 被抢占者进 Rejected（其 SYN 本轮起被拦，下轮可重新竞争）。
+		if !hasRoom && w.active {
+			if victim := oldestProvisional(st); victim != "" {
+				delete(st.Slots, victim)
+				st.Rejected[victim] = now
+				hasRejected = true
+				hasRoom = true
+			}
+		}
+		if hasRoom {
 			slot := &IPSlot{IP: w.ip, GrantedAt: now, LastSeen: now, TCP: a.TCPSessions > 0, UDP: a.UDPSessions > 0}
 			if w.active {
 				if a.Traffic {
@@ -204,12 +237,30 @@ func (st *NodeIPState) Reconcile(active, candidates map[string]IPActivity, maxIP
 		if o.UDPSessions > 0 && udpIdle > window {
 			window = udpIdle
 		}
-		if now.Sub(lastActive(ip, o.LastSeen, o.LastTraffic)) > window {
+		if now.Sub(lastActive(o.LastSeen, o.LastTraffic)) > window {
 			delete(st.Observed, ip)
 		}
 	}
 
 	return allowSet, hasRejected
+}
+
+// oldestProvisional 返回最早授予的 provisional slot 的 IP（无则空串）。
+// 用于「真实客户端抢占仅 SYN 候选占用的名额」，按 CandidateAt 最早、
+// 同刻按 IP 升序，保证确定性。
+func oldestProvisional(st *NodeIPState) string {
+	best := ""
+	var bestAt time.Time
+	for ip, slot := range st.Slots {
+		if !slot.Provisional {
+			continue
+		}
+		if best == "" || slot.CandidateAt.Before(bestAt) ||
+			(slot.CandidateAt.Equal(bestAt) && ip < best) {
+			best, bestAt = ip, slot.CandidateAt
+		}
+	}
+	return best
 }
 
 func (st *NodeIPState) touchObserved(ip string, a IPActivity, now time.Time) {
