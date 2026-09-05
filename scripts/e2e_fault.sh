@@ -363,10 +363,13 @@ if [ -n "$RULE_PORT" ]; then
 fi
 ck "拒绝后端口配置未被改动" "$before_port" "$("$CORE_BIN" config-get port)"
 
-# 成功路径：换到一个空闲端口，验证服务、认证、令牌与入口路径。
-OLD_TOKEN=$("$CORE_BIN" config-get token)
-OLD_ENTRY=$("$CORE_BIN" config-get entry_path)
-NEWP=$(python3 -c '
+# 成功路径需要 systemd 单元（change_panel_port 要 restart 服务）。
+# CI runner 上服务是直接 `nft-forward serve &` 起的、没有单元文件，
+# 此时 restart 必然失败 —— 那是环境限制，不是产品缺陷，显式跳过并说明。
+if systemctl cat nft-forward >/dev/null 2>&1; then
+  OLD_TOKEN=$("$CORE_BIN" config-get token)
+  OLD_ENTRY=$("$CORE_BIN" config-get entry_path)
+  NEWP=$(python3 -c '
 import random, socket
 for _ in range(200):
     p = random.randint(10000, 65535)
@@ -376,26 +379,30 @@ for _ in range(200):
     except OSError:
         s.close()
 ')
-if [ -n "$NEWP" ]; then
-  if bash "$SELF_DIR/../install.sh" --set-panel-port "$NEWP" >/tmp/nff-portchg.log 2>&1; then
-    P=$((P + 1)); echo "  [PASS] 改端口到 $NEWP 成功"
+  if [ -z "$NEWP" ]; then
+    echo "  [SKIP] 未找到空闲端口，跳过改端口事务验收"
   else
-    F=$((F + 1)); echo "  [FAIL] 改端口失败:"; sed 's/^/      /' /tmp/nff-portchg.log | tail -8
+    if bash "$SELF_DIR/../install.sh" --set-panel-port "$NEWP" >/tmp/nff-portchg.log 2>&1; then
+      P=$((P + 1)); echo "  [PASS] 改端口到 $NEWP 成功"
+    else
+      F=$((F + 1)); echo "  [FAIL] 改端口失败:"; sed 's/^/      /' /tmp/nff-portchg.log | tail -8
+    fi
+    ck "端口已变更" "$NEWP" "$("$CORE_BIN" config-get port)"
+    ck "令牌不变" "$OLD_TOKEN" "$("$CORE_BIN" config-get token)"
+    ck "入口路径不变" "$OLD_ENTRY" "$("$CORE_BIN" config-get entry_path)"
+    ck "新端口 healthz 可用" "200" \
+      "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${NEWP}/healthz")"
+    ck "新端口认证可用" "200" \
+      "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $OLD_TOKEN" \
+         "http://127.0.0.1:${NEWP}/${OLD_ENTRY}/api/healthz")"
+    # 换回原端口
+    bash "$SELF_DIR/../install.sh" --set-panel-port "$before_port" >/dev/null 2>&1 || true
+    ck "已换回原端口" "$before_port" "$("$CORE_BIN" config-get port)"
+    nff_api_init || exit 2
   fi
-  ck "端口已变更" "$NEWP" "$("$CORE_BIN" config-get port)"
-  ck "令牌不变" "$OLD_TOKEN" "$("$CORE_BIN" config-get token)"
-  ck "入口路径不变" "$OLD_ENTRY" "$("$CORE_BIN" config-get entry_path)"
-  ck "新端口 healthz 可用" "200" \
-    "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${NEWP}/healthz")"
-  ck "新端口认证可用" "200" \
-    "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $OLD_TOKEN" \
-       "http://127.0.0.1:${NEWP}/${OLD_ENTRY}/api/healthz")"
-  # 换回原端口
-  bash "$SELF_DIR/../install.sh" --set-panel-port "$before_port" >/dev/null 2>&1 || true
-  ck "已换回原端口" "$before_port" "$("$CORE_BIN" config-get port)"
-  nff_api_init || exit 2
 else
-  echo "  [SKIP] 未找到空闲端口，跳过改端口验收"
+  echo "  [SKIP] 改端口事务（本机无 nft-forward systemd 单元，restart 无从执行）"
+  echo "         拒绝路径已在上面完整验证；事务与回滚在有 systemd 的主机上验收"
 fi
 
 echo
