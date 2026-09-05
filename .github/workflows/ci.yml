@@ -77,19 +77,49 @@ jobs:
           # 首次初始化：随机五位数端口 + 令牌 + 入口路径
           sudo /usr/local/bin/nft-forward config-ensure-all
           sudo bash scripts/e2e_netns.sh setup
+
+          # ── CI runner 专用的转发环境准备（产品脚本绝不做这件事）──
+          # GitHub Hosted Runner 预装 Docker，Docker 会把 iptables FORWARD 链
+          # 的默认 policy 设成 DROP。netns 客户端 → 转发主机 → backend 的包走
+          # FORWARD 路径，会被这条系统级 policy 丢掉，表现为「转发不通」——
+          # 这是 runner 环境限制，不是产品缺陷。
+          # 这里只为测试网段插入 ACCEPT，并且**只在 CI 里做**：真机上 nft-forward
+          # 承诺绝不触碰用户的系统链。
+          sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+          sudo sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null || true
+          echo "--- iptables FORWARD policy（准备前）---"
+          sudo iptables -S FORWARD | head -5 || true
+          sudo iptables -I FORWARD 1 -s 10.203.0.0/24 -j ACCEPT
+          sudo iptables -I FORWARD 1 -d 10.203.0.0/24 -j ACCEPT
+          echo "--- iptables FORWARD（准备后）---"
+          sudo iptables -S FORWARD | head -5 || true
+
           # 后台起服务（CI 没有 systemd 用户会话，直接跑 serve）
           sudo sh -c 'NFT_FORWARD_CONF=/etc/nft-forward/panel.json \
             /usr/local/bin/nft-forward serve > /tmp/nff-serve.log 2>&1 &'
+          PORT=$(sudo /usr/local/bin/nft-forward config-get port)
           for _ in $(seq 1 20); do
-            PORT=$(sudo /usr/local/bin/nft-forward config-get port)
             if curl -fsS -m 2 "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then break; fi
             sleep 1
           done
+
+          # 转发链路自检：确认 netns 客户端能直连 backend。
+          # 若这一步就不通，说明 runner 网络环境不支持，后续断言无意义 ——
+          # 此时明确失败并打印诊断，绝不静默跳过。
+          sudo ip netns exec nff-client1 curl -fsS -m 10 http://10.203.0.100/small \
+            || { echo "::error::runner 上 netns 客户端无法直连 backend"; \
+                 sudo ip netns exec nff-client1 ip route; sudo iptables -S FORWARD; exit 1; }
+
           sudo bash scripts/e2e_fault.sh || { sudo tail -50 /tmp/nff-serve.log; exit 1; }
-          sudo bash scripts/e2e_full.sh  || { sudo tail -50 /tmp/nff-serve.log; exit 1; }
+          sudo bash scripts/e2e_full.sh  || { sudo tail -50 /tmp/nff-serve.log; \
+                 sudo nft list ruleset | head -60; exit 1; }
+          sudo bash scripts/verify_quota_realtime.sh || { sudo tail -30 /tmp/nff-serve.log; exit 1; }
+
           sudo bash scripts/e2e_netns.sh clean
           sudo pkill -f 'nft-forward serve' || true
           sudo /usr/local/bin/nft-forward clear || true
+          sudo iptables -D FORWARD -s 10.203.0.0/24 -j ACCEPT || true
+          sudo iptables -D FORWARD -d 10.203.0.0/24 -j ACCEPT || true
 
   # 二进制分发：main 全部测试通过后，把全架构产物发布到 dist 分支（rolling latest）。
   # dist 是普通分支，不是 Tag —— 安装器固定从 raw .../dist/<artifact> 下载。
