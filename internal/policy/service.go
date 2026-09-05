@@ -150,8 +150,12 @@ type Service struct {
 	ipStates map[int64]*NodeIPState
 	flows    map[string]*flowState // "ruleID\x00proto\x00ip:sport" -> 流状态
 	states   map[int64]*RuleState
-	ready    bool
-	lastErr  string
+	// quotaTotals 是最近一轮算出的**实时累计总量**（未扣配额重置基线），
+	// 键为规则 ID。配额重置要用同一口径取基线，否则重置瞬间「未落库的那部分」
+	// 会立刻重新计入已用（详见 Lifetime 的注释）。
+	quotaTotals map[int64]int64
+	ready       bool
+	lastErr     string
 
 	lastApplyOK     int64
 	lastApplyErr    string
@@ -195,6 +199,7 @@ func New(db *sql.DB, store *forward.Store, runner nft.Runner, nftConf, ctPath st
 		ipStates:       map[int64]*NodeIPState{},
 		flows:          map[string]*flowState{},
 		states:         map[int64]*RuleState{},
+		quotaTotals:    map[int64]int64{},
 	}
 }
 
@@ -280,8 +285,29 @@ func (s *Service) StateOf(ruleID int64) *RuleState {
 }
 
 // Lifetime 返回某规则累计流量（上传+下载），供配额重置。
+//
+// ★ 优先返回**与配额判定同口径**的实时总量（已落库 + 未落库增量）。
+//
+// 为什么必须同口径：配额重置的语义是「把已用归零」，实现方式是
+// `QuotaResetBaseline = 当时的累计总量`，之后 `used = 总量 - baseline`。
+// 如果 baseline 只取 SQLite 里的数字，而 used 用的是实时口径，那么重置瞬间
+// 尚未落库的那部分字节（最多一个采集周期，高带宽下可能几十 MB）会立刻
+// 重新算成「已用」—— 用户点了重置却看到用量不为 0，甚至立刻又被阻断。
+//
+// 首轮 reconcile 之前没有实时数据，此时退回纯 SQLite 读取。
 func (s *Service) Lifetime(ctx context.Context, ruleID int64) (int64, error) {
+	if v, ok := s.realtimeTotal(ruleID); ok {
+		return v, nil
+	}
 	return s.lifetimeBytes(ctx, ruleID)
+}
+
+// realtimeTotal 返回最近一轮 sync 计算出的实时累计总量（未扣重置基线）。
+func (s *Service) realtimeTotal(ruleID int64) (int64, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	v, ok := s.quotaTotals[ruleID]
+	return v, ok
 }
 
 // lifetimeBytes 读某规则的累计流量（上传+下载）。
@@ -400,17 +426,19 @@ func (s *Service) sync(ctx context.Context, rules []*forward.Rule) error {
 
 	nftStates := map[int64]*nft.RuleState{}
 	newStates := map[int64]*RuleState{}
+	newQuotaTotals := make(map[int64]int64, len(enabled))
 	quotaBlocked := make([]int64, 0, len(enabled))
 
 	for _, r := range enabled {
 		rs := &RuleState{RuleID: r.ID}
 
 		// ---- 配额（A 层：不依赖 conntrack）----
-		used, qerr := s.quotaUsed(r, live, counterBytes, fallbackTotals)
+		total, used, qerr := s.quotaUsed(r, live, counterBytes, fallbackTotals)
 		if qerr != nil {
 			s.setErr(qerr.Error())
 			return qerr
 		}
+		newQuotaTotals[r.ID] = total
 		rs.Quota = RuleQuotaState{RuleID: r.ID, Enabled: r.QuotaEnabled,
 			LimitBytes: r.QuotaLimitBytes, UsedBytes: used, State: "unlimited"}
 		quotaExceeded := false
@@ -488,6 +516,7 @@ func (s *Service) sync(ctx context.Context, rules []*forward.Rule) error {
 	nowSec := now.Unix()
 	s.mu.Lock()
 	s.states = newStates
+	s.quotaTotals = newQuotaTotals
 	s.ready = true
 	s.lastApplyErr = ""
 	s.lastApplyOK = nowSec
@@ -504,25 +533,27 @@ func (s *Service) sync(ctx context.Context, rules []*forward.Rule) error {
 
 // quotaUsed 计算某规则的**实时**已用流量。
 //
-//	used = (已落库累计 + 未落库增量) - 配额重置基线
+//	total = 已落库累计 + 未落库增量
+//	used  = total - 配额重置基线
 //
 // 未落库增量来自「本轮 nft counter 读数 - collector 已落库的 counter 基线」，
 // 因此高带宽下不会因为 SQLite 刷盘间隔（默认 2s）而严重超额。
 // collector 尚未完成首轮采集（live.Ready==false）时退回 SQLite 口径，
 // 用调用方一次性批量读出的 fallbackTotals（不做 per-rule 查询）。
+//
+// 同时返回 total：配额重置需要用同一口径取基线（见 Lifetime）。
 func (s *Service) quotaUsed(r *forward.Rule, live traffic.LiveDelta,
-	counterBytes map[string]int64, fallbackTotals map[int64]int64) (int64, error) {
-	var total int64
+	counterBytes map[string]int64, fallbackTotals map[int64]int64) (total, used int64, err error) {
 	if live.Ready {
 		total = live.Used(r.ID, counterBytes)
 	} else {
 		total = fallbackTotals[r.ID]
 	}
-	used := total - r.QuotaResetBaseline
+	used = total - r.QuotaResetBaseline
 	if used < 0 {
 		used = 0
 	}
-	return used, nil
+	return total, used, nil
 }
 
 // allLifetimeBytes 一次读出所有规则的累计流量（upload+download）。

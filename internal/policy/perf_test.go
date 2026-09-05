@@ -329,3 +329,96 @@ func counterNames(id int64) (string, string) {
 	return "nff_filter_up_" + strconv.FormatInt(id, 10),
 		"nff_filter_down_" + strconv.FormatInt(id, 10)
 }
+
+// ★ 配额重置必须与配额判定同口径（v0.3.2）。
+//
+// 重置的实现是 QuotaResetBaseline = 当时的累计总量，之后 used = 总量 - baseline。
+// 若 baseline 只取 SQLite 里的数字、而 used 用实时口径，重置瞬间「尚未落库的
+// 那部分字节」会立刻重新算成已用 —— 用户点了重置却看到用量不为 0，
+// 高带宽下甚至会立刻又被阻断。
+func TestLifetimeUsesRealtimeTotal(t *testing.T) {
+	svc, store, fake := newTestService(t)
+	id := addRule(t, store, &forward.Rule{
+		Name: "r1", Enabled: true, Protocol: forward.ProtoTCP,
+		ListenPort: 20000, TargetAddress: "10.0.0.2", TargetPort: 80,
+		QuotaEnabled: true, QuotaLimitBytes: 100 << 20,
+	})
+	ctx := context.Background()
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 已落库 1000；nft counter 已涨到 1000 + 50000（未落库）。
+	if _, err := svc.db.Exec(
+		"INSERT INTO traffic_totals(rule_id,upload_bytes,download_bytes) VALUES(?,?,?)",
+		id, 600, 400); err != nil {
+		t.Fatal(err)
+	}
+	up, down := counterNames(id)
+	fake.bumpCounter(up, 600+30000)
+	fake.bumpCounter(down, 400+20000)
+	svc.SetQuotaSource(func() traffic.LiveDelta {
+		return traffic.LiveDelta{
+			Ready:     true,
+			Committed: map[int64]int64{id: 1000},
+			Baseline:  map[string]int64{up: 600, down: 400},
+		}
+	})
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	st := svc.StateOf(id)
+	if st.Quota.UsedBytes != 51000 {
+		t.Fatalf("实时已用应为 1000+50000=51000，实际 %d", st.Quota.UsedBytes)
+	}
+
+	// Lifetime（重置基线来源）必须给出同样的实时总量，而不是库里的 1000。
+	life, err := svc.Lifetime(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if life != 51000 {
+		t.Fatalf("Lifetime 应返回实时总量 51000（否则重置后未落库部分会重新计入），实际 %d", life)
+	}
+
+	// 模拟重置：baseline = life，随后同一轮读数下已用必须归零。
+	r, err := store.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.QuotaResetBaseline = life
+	if err := store.Update(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.StateOf(id).Quota.UsedBytes; got != 0 {
+		t.Fatalf("重置后已用应为 0，实际 %d（未落库部分被重新计入）", got)
+	}
+	if svc.StateOf(id).Quota.State == "exceeded" {
+		t.Fatal("重置后不应仍处于超限状态")
+	}
+}
+
+// 首轮 reconcile 之前 Lifetime 退回 SQLite 口径（没有实时数据可用）。
+func TestLifetimeFallsBackBeforeFirstReconcile(t *testing.T) {
+	svc, store, _ := newTestService(t)
+	id := addRule(t, store, &forward.Rule{
+		Name: "r1", Enabled: true, Protocol: forward.ProtoTCP,
+		ListenPort: 20000, TargetAddress: "10.0.0.2", TargetPort: 80,
+	})
+	if _, err := svc.db.Exec(
+		"INSERT INTO traffic_totals(rule_id,upload_bytes,download_bytes) VALUES(?,?,?)",
+		id, 700, 300); err != nil {
+		t.Fatal(err)
+	}
+	life, err := svc.Lifetime(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if life != 1000 {
+		t.Fatalf("首轮前应返回库内累计 1000，实际 %d", life)
+	}
+}

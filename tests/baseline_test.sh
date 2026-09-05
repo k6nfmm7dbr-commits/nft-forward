@@ -330,6 +330,14 @@ grep -q '丢弃过期 DNS 解析结果' "$ROOT/internal/rulesvc/service.go"; ck 
 grep -q 'func (c \*Collector) LiveSnapshot' "$ROOT/internal/traffic/collector.go"; ck "collector 暴露实时快照" 0 $?
 grep -q 'live.Used(' "$ROOT/internal/policy/service.go"; ck "配额使用实时用量" 0 $?
 grep -q 'func (s \*Service) allLifetimeBytes' "$ROOT/internal/policy/service.go"; ck "配额兜底路径批量读库" 0 $?
+# 配额重置必须与配额判定同口径（否则重置后未落库部分会重新计入）
+grep -q 'func (s \*Service) realtimeTotal' "$ROOT/internal/policy/service.go"
+ck "配额重置取实时总量（与判定同口径）" 0 $?
+grep -q 'quotaTotals' "$ROOT/internal/policy/service.go"; ck "记录实时累计总量供重置使用" 0 $?
+# counter 低于基线时不得把当前值再加一遍（双算）
+if sed -n '/func (d LiveDelta) Used/,/^}/p' "$ROOT/internal/traffic/collector.go" \
+  | grep -qE 'used \+= c$'; then rc=1; else rc=0; fi
+ck "实时用量不因读数错位而双算" 0 "$rc"
 # 稳定期配额判定绝不 per-rule 查库
 if sed -n '/func (s \*Service) quotaUsed/,/^}/p' "$ROOT/internal/policy/service.go" | grep -q 'QueryRow'; then rc=1; else rc=0; fi
 ck "配额判定无 per-rule QueryRow" 0 "$rc"
