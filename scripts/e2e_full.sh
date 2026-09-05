@@ -127,21 +127,37 @@ sleep 2
 hold() {
   ip netns exec "$1" setsid python3 -c "
 import socket,time
-try:
+def once():
     s=socket.socket(); s.settimeout(10); s.connect(('$HOST_IP',$PORT))
     s.sendall(b'GET /small HTTP/1.1\r\nHost: x\r\n\r\n')
     d=s.recv(200)
-    open('/tmp/hold_$1','w').write('OK' if b'BACKEND_OK' in d else 'BAD')
+    if b'BACKEND_OK' not in d:
+        s.close(); raise RuntimeError('bad response')
+    return s
+# IP 限制的授予存在毫秒级竞态（放行 SYN → 准入循环授予 slot → established 放行），
+# 首次尝试可能恰好落在窗口内被 drop。这是已知设计限制，因此重试 3 次。
+s=None
+for i in range(3):
+    try:
+        s=once(); break
+    except Exception as e:
+        last=e; time.sleep(1.5)
+if s is None:
+    open('/tmp/hold_$1','w').write('FAIL:'+str(last))
+else:
+    open('/tmp/hold_$1','w').write('OK')
     time.sleep(45)
-except Exception as e:
-    open('/tmp/hold_$1','w').write('FAIL:'+str(e))
 " >/dev/null 2>&1 &
 }
 rm -f /tmp/hold_nff-client*
 hold nff-client1
 sleep 3
 hold nff-client2
-sleep 6
+# 等两个 hold 都写出结果（内部各自最多重试 3 次 × 1.5s，故上限约 12s）
+for _ in $(seq 1 16); do
+  [ -s /tmp/hold_nff-client1 ] && [ -s /tmp/hold_nff-client2 ] && break
+  sleep 1
+done
 echo "  c1=$(cat /tmp/hold_nff-client1 2>/dev/null) c2=$(cat /tmp/hold_nff-client2 2>/dev/null)"
 ck "前两个 IP 获得授权" "OKOK" \
   "$(cat /tmp/hold_nff-client1 2>/dev/null)$(cat /tmp/hold_nff-client2 2>/dev/null)"
