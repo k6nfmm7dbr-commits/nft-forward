@@ -5,7 +5,7 @@
 ## 当前版本
 
 ```text
-v0.3.1
+v0.3.2
 ```
 
 ## 定位
@@ -21,7 +21,7 @@ SQLite     = 永久统计与配置持久化
 ## 特性
 
 - **端口转发**：TCP / UDP / TCP+UDP，IPv4→IPv4、IPv6→IPv6（不做 NAT64/46）。
-- **只配监听端口**：规则没有「监听地址」概念，自动作用于本机所有本地地址；留空则由后端随机分配一个安全端口（避开保留端口与内核 ephemeral 区间）。
+- **只配监听端口**：规则没有「监听地址」这个属性 —— 既不能配置，界面与 API 里也不会出现。规则自动作用于本机所有本地地址；端口留空则由后端随机分配一个安全端口（避开保留端口与内核 ephemeral 区间）。
 - **目标支持 IPv4 / IPv6 / 域名**：域名在后台周期解析并自动跟踪变化，双栈分别落到 IPv4 / IPv6 数据面。
 - **流量统计**：上传/下载分方向，counter 挂在 **FORWARD** 链（非 NAT 链），用 `ct mark` 归属多规则同目标场景。
 - **在线 IP 限制**：Slot Manager（observed/candidate/active/granted/rejected），基于 conntrack 生命周期判活。
@@ -29,6 +29,7 @@ SQLite     = 永久统计与配置持久化
 - **实时面板**：SSE 推送 + 局部 DOM 更新，原生 HTML/CSS/JS，无框架、无构建链。
 - **Token 登录**：与 SBX 对齐的访问令牌认证（Bearer 头或 HttpOnly Cookie），常量时间比较 + 登录失败节流。
 - **低暴露面**：面板使用随机五位数端口 + 随机入口路径，未命中入口的请求统一返回极简 404。
+- **内容级 nft 自愈**：不只检查对象存在，还逐条比对规则内容（DNAT 目标/协议/端口、`ct mark`、counter 与 allow set 引用、链 hook/priority/policy），等数量篡改也能发现并修复。
 - **安全边界**：只管理 `nff_*` 自有 nft 表，绝不 `flush ruleset`，绝不触碰系统其它防火墙规则。
 
 ## 安装
@@ -61,7 +62,8 @@ nff --uninstall      # 卸载
 
 面板挂在一个**随机入口路径**下，形如 `http://IP:41287/3e4f65a8c24d2bd5b9e80147/`。
 
-- 端口在首次安装时用 `crypto/rand` 在 **10000-65535** 内随机选取，并避开已监听端口、已占用 UDP 端口、内核 ephemeral 区间、SSH 端口、`guard_ports`、已有转发端口。
+- 端口在首次安装时用 `crypto/rand` 在 **10000-65535** 内随机选取，并避开已监听端口、已占用 UDP 端口、内核 ephemeral 区间、SSH 端口、`guard_ports`、已有转发端口。读取已有转发端口失败（数据库存在但损坏/无权限）时**拒绝生成**，绝不在「不知道哪些端口正被占用」的情况下随机。
+- 之后在 `nff` → 面板设置里手工改端口，会复用同一套安全检查；通过后才写配置，随后重启 → systemd active → 本机 `/healthz` → 确认新端口真的在监听。任一步失败即写回旧端口、重启并再次验证，只有确认恢复才提示「已回滚」。Token 与入口路径全程不变。
 - 入口路径同样在首次安装生成（`crypto/rand` 12 bytes，96 bit 随机），**与令牌完全独立**，不能互相推导。
 - 访问令牌是 `crypto/rand` 16 bytes 的十六进制串（32 位），存在 `panel.json`（权限 0600）。
 
@@ -90,6 +92,8 @@ nff --uninstall      # 卸载
 
 `target_address` **永远保存用户填写的原始值** —— 域名保持域名，绝不被解析结果覆盖。
 
+规则里**没有任何监听地址字段**（`listen_address` / `listen_addr` 都不存在）。老客户端如果仍然发送 `listen_address`，服务端接受并忽略它，响应里也不会回显。
+
 `panel.json` 里与安全相关的三项（`port` / `token` / `entry_path`）**没有默认值**：缺失即视为未初始化，`serve` 会 fail-closed 拒绝启动，而不是退回某个固定值。三项都由安装期的 `config-ensure-*` 用 `crypto/rand` 生成一次，此后服务重启、在线升级、重复运行安装脚本都不会改变。
 
 ## 设计要点
@@ -101,22 +105,44 @@ nff --uninstall      # 卸载
 - **结构层**（表 / 链 / counter / set 声明）：只在结构签名变化**或期望对象缺失**时同步。用幂等 `table {...}` 声明 + `flush chain` 重建链内规则，从不销毁表，已存在的 counter 保留累计值。整个脚本是单个 `nft -f` 原子事务，没有规则缺失窗口。
 - **元素层**（allow set 成员、配额阻断集合）：在线 IP 上下线、配额状态翻转只走 `nft add/delete element`，完全不触碰表、链、counter。无变化时不调用 nft。
 
-**自愈基于完整 Desired State 比对。** 每轮 reconcile 把「当前规则集应该存在的全部自有对象」与 `nft -j list ruleset` 读回的现状做比对：三张表（`nff_nat4`/`nff_nat6`/`nff_filter`）、各自的链、`marks`/`qblock`/IPv4+IPv6 allow set、每条规则的 up **和** down counter、以及各链内的最小规则条数。任何一项缺失都触发一次幂等重建，因此人为 `nft delete table/chain/counter/set` 都能在下一轮自动恢复，且仍然只碰 `nff_*` 自有对象、绝不 `flush ruleset`、尽可能保留仍存在的 counter 数值。
+**自愈同时比对「对象存在」与「内容正确」。** 每轮 reconcile 把期望状态与 `nft -j list ruleset` 读回的现状做两层比对：
+
+- **对象层**：三张表（`nff_nat4`/`nff_nat6`/`nff_filter`）、各自的链、`marks`/`qblock`/IPv4+IPv6 allow set、每条规则的 up **和** down counter。
+- **内容层**：每条自有链内规则的 canonical signature（按序比较）与链属性（type/hook/priority/policy）。签名由 DNAT 目标地址与端口、协议、监听端口、`ct mark`（set 与 match）、mark set 引用、`ct direction`、`ct state`、named counter 引用、源地址族与 allow set 引用、verdict、`fib daddr type local`，以及任何未识别表达式共同构成。
+
+因此不仅 `nft delete table/chain/counter/set` 能自动恢复，`dnat to 1.2.3.4:443` 被改成 `dnat to 8.8.8.8:443`（规则条数一模一样）这类篡改同样会被发现并修复。counter 的 packets/bytes 实时读数**不参与签名**，所以有流量不会触发重建，累计值继续保留。修复仍然只碰 `nff_*` 自有对象、绝不 `flush ruleset`。
+
+期望签名与实际下发的 nft 文本**同源**（由同一个规则意图分别渲染），因此不存在「脚本改了、期望没改」导致的无限重建或永久漏检。
 
 **每条 DNAT 都带 `fib daddr type local`。** 规则没有监听地址，若直接写 `tcp dport 5000 dnat to ...`，那么当这台机器同时承担路由/网关职责时，仅仅经过本机（目的地址是别人）的同端口流量也会被劫持。`fib daddr type local` 让规则只匹配「目的地址属于本机」的包，等价于「监听本机所有本地地址」，同时不误伤 transit 流量。
+
+**`/healthz` 的 200 代表数据面已就绪，不只是「HTTP 活着」。** 进程启动顺序是「先绑定 HTTP → 再做首轮 nft enforcement」：绑定后 `/healthz` 能立刻应答，但在首轮 enforcement 成功之前返回 **503**。因此安装器与升级器的健康确认不会把「面板能应答、systemd active，但转发规则根本没加载」当成成功。首轮 enforcement 带重试（开机早期 nftables 模块可能尚未就绪），仍失败则保持 503 并由周期 reconcile 继续尝试。运行期偶发的 reconcile 失败属于 degraded，不会把 `/healthz` 打成 503（否则 systemd 会反复重启整个服务）。conntrack 不可用**不影响** readiness —— 结构 enforcement 不依赖它，只有 IP slot 进入冻结。
 
 **结构 enforcement 与 IP Slot enforcement 彻底解耦。** 两者对 conntrack 的依赖完全不同：
 
 - **静态/结构层不依赖 conntrack**：DNAT、FORWARD counter、配额阻断、规则新增/删除/修改/启停、nft 对象自愈。conntrack 挂掉时这些必须照常执行 —— 否则会出现「用户删除规则 → API 返回成功 → DB 已删 → nft 旧 DNAT 还在转发」的假成功。
 - **动态 IP Slot 层依赖 conntrack**：observed / candidate / active / granted / rejected / slot 释放。
 
-conntrack 读取失败、不完整、不可用、或无法确认真实连接状态时，**冻结上一轮 slot 状态**：不新增、不释放、不清空 allow set（`/api/health` 会给出 `ip_state_frozen`）。只有「成功读取且结果真实为空」才允许释放 slot —— 「读不到」绝不等于「没人在线」。
+conntrack 的状态被显式分成四种，只有第一种允许做在线判定：
+
+| 状态 | 含义 | slot 行为 |
+|---|---|---|
+| `ok` | 完整读取并解析成功（`Flows` 可能为空） | 正常准入/释放 —— 空就是**真的**没人在线 |
+| `unavailable` | 文件不存在 / 无权限 / 内核未跟踪任何连接 | 冻结上一轮 slot |
+| `partial` | 读到一半中断，**或有任何行解析失败** | 冻结上一轮 slot |
+| `error` | 读取过程出错 | 冻结上一轮 slot |
+
+冻结 = 不新增、不释放、不清空 allow set（`/api/health` 给出 `ip_state_frozen`）。「读不到」「读了一半」「有坏行」都绝不等于「没人在线」；反之完整读到 0 条相关流时必须正常释放，不会永久冻结。有坏行时刻意不做「忽略坏行后当作完整」——那等于用不完整的连接视图去踢用户。
+
+**conntrack 解析是单次流式扫描。** `bufio.Scanner` 逐行处理，同一趟里完成条目统计、协议与状态过滤、字段解析、坏行计数与完整性判定，不产生整个文件的字符串副本，也不做两次全文切分。500ms 周期下这直接决定常驻 GC 压力。
 
 **conntrack 扫描是 O(规则数 + flow 数)。** 每轮先一次遍历 conntrack 建 `(protocol, 原始目标端口) → flows` 索引，之后每条规则 O(1) 取出属于自己的流；同一次扫描内顺带收集 `seenFlowKeys` 供 flow GC 使用。旧实现是「每条规则重新遍历全部 flows」的 O(R×F)。
 
 **flowState 不会无界增长。** 每轮记录本轮出现过的流键，轮末回收「conntrack 中已不存在」的旧 entry；规则删除时按前缀清理该规则的全部流状态。空闲判活改为按「最近一次字节变化时刻」计算并保留 entry（旧实现超窗即删除 entry，下一轮同一条流又被当成新流判为有流量，导致空闲连接永不离线）。
 
-**DNS 查询绝不在锁内进行。** 一轮域名刷新分三段：锁内 snapshot 需要解析的规则（含目标与 `updated_at` 指纹）→ 释放锁并发解析（并发上限 8，每次查询 5s 超时）→ 重新加锁校验规则未被改动后才 apply。解析期间用户改了目标或删了规则，过期结果一律丢弃。因此一次 DNS 超时不会把其它规则的 CRUD 卡住，`last-known-good` 语义保持不变。
+**DNS 查询绝不在锁内进行，且 DB 与 nft 事务一致。** 一轮域名刷新分三段：锁内 snapshot 需要解析的规则（含目标与 `updated_at` 指纹）→ 释放锁并发解析（并发上限 8，每次查询 5s 超时）→ 重新加锁校验规则未被改动后才应用。因此一次 DNS 超时不会把其它规则的 CRUD 卡住。
+
+第三段是一个事务：`BEGIN → 批量写解析列 → ApplyRules(候选规则集) → COMMIT`。写库失败则回滚且 nft 未被改动；apply 失败则回滚并把 nft 退回旧规则集；commit 失败则把 nft 回滚回旧状态并明确报错。无论几条域名同时变化，都只有一次 apply + 一次 commit，不会出现「apply、写库、apply、写库」的中间状态。解析期间用户改了目标或删了规则，过期结果一律丢弃（不覆盖新值、不让已删规则复活），`last-known-good` 语义保持不变。
 
 **域名目标保留 last-known-good。** DNS 临时失败时沿用上次有效地址（状态标记 `stale`），不会因为一次解析抖动切断转发；多 A/AAAA 记录时，只要当前使用的地址仍在结果集里就不切换。解析结果变化只重写链规则，counter 不受影响。彻底解析失败（连历史地址都没有）时该规则不产生 DNAT 规则，但 counter、配额、IP 限制状态全部保留。
 
@@ -134,7 +160,8 @@ conntrack 读取失败、不完整、不可用、或无法确认真实连接状�
 - 绝不执行 `nft flush ruleset`，绝不清空 INPUT/OUTPUT/FORWARD，绝不修改默认 policy，绝不触碰 Docker / firewalld / 用户自有表。
 - 所有 nft 变更先 `nft -c -f` 干跑检查，通过后才 `nft -f` 应用；失败不写入成功状态。
 - 配置写入是原子的（tmp → fsync → chmod 0600 → rename → fsync 目录）；配置损坏时 fail-closed，绝不用默认值覆盖，也绝不因此重置令牌/端口/入口路径。
-- 首次安装若服务启动或健康检查未通过：退出码非 0、不打印「安装完成」、保留现场供排错。
+- 首次安装若服务启动或健康确认未通过：退出码非 0、不打印「安装完成」、保留现场供排错。健康确认包含数据面 —— `/healthz` 在首轮 nft enforcement 成功前返回 503。
+- 后台 DNS 刷新与规则 CRUD 一样是事务化的：DB 与 nft 要么都成功，要么都回滚。
 - 升级是事务化的：备份旧二进制与 `panel.json` → 下载 → SHA256 校验 → 架构与版本自检 → 原子替换 → 配置迁移 → 重启 → systemd active → localhost `/healthz` → `selftest`，**全部通过后**才删除备份。任一步失败即恢复旧二进制与旧配置、重启旧服务并再次验证；确认恢复成功才提示「已回滚」，回滚失败会明确报错。
 - 升级保留：转发规则、流量历史、访问令牌、随机面板端口、随机入口路径及其它用户设置。数据库迁移只 `ADD COLUMN`，不 DROP、不重建表。
 - 卸载只删自有表与自有文件，数据目录需显式确认才删。
@@ -143,7 +170,7 @@ conntrack 读取失败、不完整、不可用、或无法确认真实连接状�
 
 - **IP 限制的授予存在毫秒级竞态**：方案是「放行 SYN 让 conntrack 看到候选 → 准入循环授予 slot → 后续 established 流量放行」。准入循环每 500ms 跑一轮，因此新 IP 的连接在被授予前的极短窗口内，其 established 数据包会被 drop（客户端表现为首次请求偶发失败、重试即成功）。拒绝（超出上限）是可靠的，不会超卖。
 - **UDP 判活只能靠空闲窗口**：UDP 无连接状态，conntrack 流不会因对端离开而消失，因此「在线」判定依赖 `udpIdle`（默认 120s）空闲超时，收敛比 TCP 慢。
-- **配额实时性受 reconcile 周期限制**：判定周期是 500ms，因此理论上最多多跑「500ms × 当前带宽」，而不是「SQLite 刷盘间隔 × 带宽」。
+- **配额实时性受 reconcile 周期限制**：判定周期是 500ms，因此理论上最多多跑「500ms × 当前带宽」，而不是「SQLite 刷盘间隔 × 带宽」。极端情况下（policy 读数与 collector 提交错位）可能短暂少算一个采集周期的量，这是刻意取舍 —— 宁可短暂少算，也不能因一次读数错位把用量翻倍。
 - 只支持同族转发（IPv4→IPv4、IPv6→IPv6），不做 NAT64/46。
 - 面板是 HTTP 明文服务，不内置 TLS。需要传输加密请自行前置反代并设置 `secure_cookie=true`。
 
@@ -163,8 +190,11 @@ go vet ./...         # 静态检查
 go test ./...        # 单元测试
 go test -race ./...  # 竞态检测（需 CGO/gcc）
 
+# conntrack 解析性能（1k / 10k / 50k 条目，含与旧实现的对照）
+go test -run XXX -bench=ParseConntrack -benchmem ./internal/connection/
+
 bash tests/installer_flow_test.sh   # 安装/升级流程（提取 install.sh 真实实现）
-bash tests/baseline_test.sh         # v0.3.1 基线收口防回归
+bash tests/baseline_test.sh         # v0.3.2 基线收口防回归
 ```
 
 真实环境端到端验证（需 root + nftables，会创建 network namespace）：

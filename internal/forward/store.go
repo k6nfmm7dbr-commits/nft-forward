@@ -131,6 +131,85 @@ func (st *Store) UpdateResolved(ctx context.Context, id int64, v4, v6 string, at
 	return nil
 }
 
+// ResolvedUpdate 是一条规则的解析状态更新（供批量事务写入）。
+type ResolvedUpdate struct {
+	ID     int64
+	V4     string
+	V6     string
+	At     int64
+	Status string
+	Err    string
+}
+
+// ErrCommitFailed 标记「事务提交阶段」失败。
+//
+// 为什么需要单独的类型：DNS 刷新是「先在事务里写 DB → 再 apply nft →
+// 最后 commit」。commit 失败时 nft **已经**是新状态，调用方必须把 nft 回滚；
+// 而 commit 之前的任何失败都还没碰过 nft（或已由 apply 自身回滚），
+// 两种情况的善后动作完全不同，必须能区分。
+type ErrCommitFailed struct{ Err error }
+
+func (e *ErrCommitFailed) Error() string { return "事务提交失败: " + e.Err.Error() }
+func (e *ErrCommitFailed) Unwrap() error { return e.Err }
+
+// UpdateResolvedBatch 在**单个 SQLite 事务**里批量写入解析状态，
+// 并在 commit 之前调用 beforeCommit（通常是「把候选规则集应用到 nft」）。
+//
+// 执行顺序与失败语义：
+//
+//  1. BEGIN
+//  2. 逐条 UPDATE 解析列（任一失败 → ROLLBACK，返回普通 error；nft 未被改动）
+//  3. beforeCommit()（失败 → ROLLBACK，返回普通 error）
+//  4. COMMIT（失败 → 返回 *ErrCommitFailed，调用方必须回滚 nft）
+//
+// 这样「DB 与 nft 要么都成功，要么都回滚」的原则也覆盖后台 DNS 刷新 ——
+// 旧实现是「先 apply nft，再逐条写库，写失败只打 warning」，会留下
+// 「nft 用新地址、DB 记旧地址」的长期不一致。
+//
+// beforeCommit 为 nil 时退化为纯批量写入。
+func (st *Store) UpdateResolvedBatch(ctx context.Context, ups []ResolvedUpdate, beforeCommit func() error) error {
+	if len(ups) == 0 {
+		if beforeCommit != nil {
+			return beforeCommit()
+		}
+		return nil
+	}
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	for _, u := range ups {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE rules SET resolved_ipv4=?,resolved_ipv6=?,resolved_at=?,resolve_status=?,resolve_error=?
+			 WHERE id=? AND deleted=0`,
+			u.V4, u.V6, u.At, u.Status, u.Err, u.ID)
+		if err != nil {
+			return fmt.Errorf("写入规则 %d 解析状态失败: %w", u.ID, err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return fmt.Errorf("规则 %d 不存在或已删除", u.ID)
+		}
+	}
+
+	if beforeCommit != nil {
+		if err := beforeCommit(); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return &ErrCommitFailed{Err: err}
+	}
+	committed = true
+	return nil
+}
+
 // SoftDelete 软删除：标记 deleted，保留历史。
 func (st *Store) SoftDelete(ctx context.Context, id int64) error {
 	return st.SoftDeleteTx(ctx, nil, id)

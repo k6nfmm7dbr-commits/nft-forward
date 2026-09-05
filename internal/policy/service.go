@@ -744,18 +744,26 @@ func (s *Service) dropFlowsOf(ruleID int64) {
 	}
 }
 
-// applyNFT 是 nft 同步的核心：结构变化或自有对象缺失才重写链，否则只做元素增量。
+// applyNFT 是 nft 同步的核心：结构/内容有漂移才重写链，否则只做元素增量。
 //
 // 这是流量统计正确性的关键：named counter 是表级对象，重写结构（哪怕只是
 // flush chain）本身不清零 counter，但 **重建表** 会。因此：
-//   - 结构签名未变且期望对象齐全 → 只 `add/delete element`，完全不碰表、链、counter；
-//   - 结构签名变化或有对象缺失   → 幂等 add 表/链/counter/set + flush chain 重建规则，
+//   - 无漂移 → 只 `add/delete element`，完全不碰表、链、counter；
+//   - 有漂移 → 幂等 add 表/链/counter/set + flush chain 重建规则，
 //     已存在的 counter 保留累计值。
 //
-// ★ 自愈判定（v0.3.1 收口）：不再只看 FilterTableExists + up counter + v4 set，
-// 而是与 nft.DesiredObjects 做完整比对 —— 表（含 nff_nat4/nff_nat6/nff_filter）、
-// 链、marks/qblock/allow set、每条规则的 up+down counter、各链最小规则条数。
-// 任何一项缺失都触发重建，因此「人为删表/删链/删 counter/删 set」都能自动恢复。
+// ★ 自愈判定演进：
+//
+//	v0.3.0 及更早：只看 FilterTableExists + up counter + v4 allow set；
+//	v0.3.1：完整对象比对（表/链/set/counter/各链最小规则条数）；
+//	v0.3.2（本版）：再加**内容**比对 —— 每条自有链的规则签名序列与链属性
+//	  （type/hook/priority/policy）。这样「dnat 目标被改成别的地址/端口」、
+//	  「tcp 被改成 udp」、「counter 引用被删」、「allow set 被换错」、
+//	  「配额 drop 规则被改」、「插入额外规则」等**等数量篡改**都能被发现。
+//	  counter 的 packets/bytes 实时读数不参与签名，因此有流量不会触发重建。
+//
+// ★ 原子性：只有内核真正 apply 成功后才更新 lastStructSig。
+// `nft -c` 通过但 `nft -f` 失败时保持旧签名，下一轮继续尝试修复。
 //
 // cur 由调用方传入（sync 已读过一次），避免同一轮重复执行 `nft -j list ruleset`。
 func (s *Service) applyNFT(ctx context.Context, gi *nft.GenInput, quotaBlocked []int64, cur *nft.State) error {
@@ -767,24 +775,25 @@ func (s *Service) applyNFT(ctx context.Context, gi *nft.GenInput, quotaBlocked [
 	}
 
 	sig := nft.StructSig(gi)
-	desired := nft.DesiredObjects(gi)
-	missing := nft.MissingObjects(cur, desired)
+	drift := nft.DetectDrift(gi, cur)
 
-	if sig != s.lastStructSig || len(missing) > 0 {
-		if len(missing) > 0 && sig == s.lastStructSig {
-			// 结构签名没变却缺对象 = 被外部删除，属于真正的自愈事件，记一条日志。
-			desc := nft.DescribeMissing(missing)
-			slog.Warn("检测到自有 nft 对象缺失，正在自动重建", "missing", desc)
+	if sig != s.lastStructSig || !drift.Empty() {
+		if !drift.Empty() && sig == s.lastStructSig {
+			// 结构签名没变却有漂移 = 被外部改动，属于真正的自愈事件。
+			desc := drift.Describe()
+			slog.Warn("检测到自有 nft 对象漂移，正在自动修复", "drift", desc)
 			s.mu.Lock()
 			s.lastHealMissing = desc
 			s.mu.Unlock()
 		}
 		script := nft.GenStructScript(gi, cur.Existing())
 		if err := s.nftApply(ctx, s.runner, s.nftConf, script); err != nil {
+			// ★ 绝不在此更新 lastStructSig：内核没有接受这批规则，
+			// 内部缓存必须保持「未应用」，下一轮重新尝试。
 			return err
 		}
 		s.lastStructSig = sig
-		if len(missing) > 0 {
+		if !drift.Empty() {
 			s.mu.Lock()
 			s.lastHealOK = s.now().Unix()
 			s.mu.Unlock()

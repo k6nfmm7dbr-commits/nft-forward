@@ -119,6 +119,26 @@ ck "do_install 无 start_service || true" 0 "$rc"
 if awk '/if ! start_service; then/{seen=1} /ok "安装完成"/{if(!seen) bad=1} END{exit bad?1:0}' "$TMPD/di.sh"; then rc=0; else rc=1; fi
 ck "「安装完成」只在健康确认通过后打印" 0 "$rc"
 
+# ---- 3d. change_panel_port：手工改端口必须走安全校验 + 事务回滚 ----
+sed -n '/^# >>> change-port/,/^# <<< change-port/p' "$TPL" > "$TMPD/cp.sh"
+grep -q 'change_panel_port()' "$TMPD/cp.sh"; ck "提取到 change_panel_port" 0 $?
+grep -q 'panel-port-set' "$TMPD/cp.sh"; ck "改端口走后端安全校验（panel-port-set）" 0 $?
+if grep -qE 'panel_set port' "$TMPD/cp.sh"; then rc=1; else rc=0; fi
+ck "改端口不直接写配置（必须先校验）" 0 "$rc"
+grep -q 'old_port=' "$TMPD/cp.sh"; ck "改端口记录旧端口（供回滚）" 0 $?
+grep -q 'start_service' "$TMPD/cp.sh"; ck "改端口后做三重健康确认" 0 $?
+grep -q 'port_listening' "$TMPD/cp.sh"; ck "改端口后确认新端口真的在监听" 0 $?
+grep -q 'config-set port "\$oldp"' "$TMPD/cp.sh"; ck "失败时写回旧端口" 0 $?
+grep -q '已回滚到原端口' "$TMPD/cp.sh"; ck "确认恢复成功才提示已回滚" 0 $?
+grep -q '服务未能恢复' "$TMPD/cp.sh"; ck "旧端口也恢复失败时明确报错" 0 $?
+if grep -qE 'restart[^|]*\|\| *true' "$TMPD/cp.sh"; then rc=1; else rc=0; fi
+ck "改端口不 || true 吞错" 0 "$rc"
+
+# ---- 3e. health_check：必须识别数据面未就绪（503）----
+grep -q '"ok":true' "$TMPD/ss.sh"; ck "健康检查要求 ok:true" 0 $?
+grep -q 'data plane not ready' "$TMPD/ss.sh"; ck "健康检查识别数据面未就绪(503)" 0 $?
+grep -q 'healthz' "$TMPD/ss.sh"; ck "健康检查走 /healthz" 0 $?
+
 # ---- 4. do_update：脚本相同也检查二进制 ----
 sed -n '/^# >>> do-update/,/^# <<< do-update/p' "$TPL" > "$TMPD/du.sh"
 grep -q '检查后端二进制是否同步' "$TMPD/du.sh"; ck "do_update 脚本相同时仍检查二进制" 0 $?

@@ -126,7 +126,10 @@ func TestEnsurePanelPortAvoidsReserved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res := reservedPorts(cfg)
+	res, err := reservedPorts(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !res[2222] {
 		t.Fatal("SSH 端口未被排除")
 	}
@@ -155,7 +158,11 @@ func TestReservedPortsIncludesRuleListenPorts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reservedPorts(cfg)[41234] {
+	res, err := reservedPorts(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res[41234] {
 		t.Fatal("已有转发规则的监听端口未被排除")
 	}
 }

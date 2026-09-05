@@ -221,8 +221,14 @@ func TestHealDoesNotTouchForeignTables(t *testing.T) {
 	svc, _, fake, _ := healSetup(t)
 	fake.mu.Lock()
 	fake.tables["inet/user_own_table"] = true
-	fake.chains["inet/user_own_table/user_chain"] = true
-	fake.chainRules["inet/user_own_table/user_chain"] = 3
+	fake.chains["inet/user_own_table/user_chain"] = nft.ChainAttrs{
+		Type: "filter", Hook: "input", Priority: 0, Policy: "accept",
+	}
+	fake.chainExprs["inet/user_own_table/user_chain"] = [][]any{
+		{map[string]any{"accept": nil}},
+		{map[string]any{"accept": nil}},
+		{map[string]any{"accept": nil}},
+	}
 	fake.mu.Unlock()
 
 	fake.dropTable("ip", nft.TableNAT4)

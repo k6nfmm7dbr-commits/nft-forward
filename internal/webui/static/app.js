@@ -168,15 +168,15 @@ function ruleCard(r) {
   var ips = r.ips || {};
   var ipVal = ips.limited ? ((ips.granted_count || 0) + ' / ' + ips.max_ips) : String(ips.granted_count || 0);
   var target = r.target_text || hostPort(r.target_address, r.target_port);
-  var listenAddr = r.listen_addr || '0.0.0.0';
-  // 后端若探测到对外 IP（91.110.232.102 等），listen_addr 字段会带它；否则回退 0.0.0.0。
+  // 只显示监听端口。转发规则没有这个属性：规则自动作用于本机
+  // 所有本地地址（nft 侧 fib daddr type local），显示某一个 IP 只会误导。
   return '<div class="node-card">' +
     '<div class="node-top">' +
       '<div class="node-title">' +
         '<div class="node-name">' + esc(r.name) + '</div>' +
         '<div class="node-meta-line">' +
           '<span class="chip">' + esc(protoLabel(r.protocol)) + '</span>' +
-          '<span class="port">监听 ' + esc(listenAddr) + ':' + esc(r.listen_port) + '</span>' +
+          '<span class="port">监听端口 ' + esc(r.listen_port) + '</span>' +
         '</div>' +
       '</div>' +
       '<div class="node-rate">' +
@@ -454,7 +454,6 @@ function showPolicy(id) {
   document.getElementById('pol-name').value = r.name || '';
   document.getElementById('pol-proto').value = r.protocol || 'tcp+udp';
   document.getElementById('pol-listen-port').value = r.listen_port || '';
-  document.getElementById('pol-listen-ip').value = r.listen_addr || '0.0.0.0';
   document.getElementById('pol-target').value = r.target_address || '';
   document.getElementById('pol-target-port').value = r.target_port || '';
   setSwitch('pol-enable', r.enabled);

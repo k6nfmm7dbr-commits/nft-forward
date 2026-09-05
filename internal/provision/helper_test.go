@@ -29,3 +29,14 @@ func seedRule(dbPath string, listenPort int) error {
 	})
 	return err
 }
+
+// dropRulesTable 删掉 rules 表（模拟 schema 损坏）。
+func dropRulesTable(dbPath string) error {
+	db, err := database.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	_, err = db.Exec("DROP TABLE rules")
+	return err
+}

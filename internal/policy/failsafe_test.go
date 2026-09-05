@@ -194,3 +194,180 @@ func TestQuotaEnforcedWhileConntrackBroken(t *testing.T) {
 		t.Fatalf("配额阻断元素必须下发，实际 %v", got)
 	}
 }
+
+// ---- 真实空表 vs 不可用（v0.3.2 状态枚举）----
+//
+// 这一组用**新的 Status 枚举**显式构造四种状态，确认 policy 层的
+// slot 行为与语义严格对应。
+
+// StatusOK + 0 flows = 真的没人在线 → 释放 slot。
+func TestStatusOKEmptyReleasesSlots(t *testing.T) {
+	svc, _, fake, id := grantAndFreeze(t, connection.Result{
+		Status: connection.StatusOK, Entries: 7, Flows: nil,
+	})
+	if err := svc.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.StateOf(id).IPs.GrantedCount; got != 0 {
+		t.Fatalf("StatusOK + 0 flows 应释放 slot，实际 %d", got)
+	}
+	if svc.StateOf(id).IPs.Frozen {
+		t.Fatal("StatusOK 不应标记冻结")
+	}
+	if got := fake.elementsOf("inet", nft.TableFilter, nft.AllowSetV4(id)); len(got) != 0 {
+		t.Fatalf("allow set 应被清空，实际 %v", got)
+	}
+	if svc.HealthSnapshot().IPStateFrozen {
+		t.Fatal("健康快照不应报告冻结")
+	}
+}
+
+// StatusUnavailable → 冻结（不释放、不清空）。
+func TestStatusUnavailableFreezes(t *testing.T) {
+	svc, _, fake, id := grantAndFreeze(t, connection.Result{Status: connection.StatusUnavailable})
+	if err := svc.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.StateOf(id).IPs.GrantedCount; got != 1 {
+		t.Fatalf("StatusUnavailable 不得释放 slot，实际 %d", got)
+	}
+	if !svc.StateOf(id).IPs.Frozen {
+		t.Fatal("应标记冻结")
+	}
+	if got := fake.elementsOf("inet", nft.TableFilter, nft.AllowSetV4(id)); len(got) != 1 {
+		t.Fatalf("allow set 不得被清空，实际 %v", got)
+	}
+}
+
+// StatusPartial → 冻结。
+func TestStatusPartialFreezes(t *testing.T) {
+	svc, _, fake, id := grantAndFreeze(t, connection.Result{
+		Status: connection.StatusPartial, BadLines: 3, Entries: 100,
+	})
+	if err := svc.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.StateOf(id).IPs.GrantedCount; got != 1 {
+		t.Fatalf("StatusPartial 不得释放 slot，实际 %d", got)
+	}
+	if got := fake.elementsOf("inet", nft.TableFilter, nft.AllowSetV4(id)); len(got) != 1 {
+		t.Fatalf("allow set 不得被清空，实际 %v", got)
+	}
+}
+
+// StatusError → 冻结。
+func TestStatusErrorFreezes(t *testing.T) {
+	svc, _, fake, id := grantAndFreeze(t, connection.Result{
+		Status: connection.StatusError, Err: errors.New("io error"),
+	})
+	if err := svc.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.StateOf(id).IPs.GrantedCount; got != 1 {
+		t.Fatalf("StatusError 不得释放 slot，实际 %d", got)
+	}
+	if got := fake.elementsOf("inet", nft.TableFilter, nft.AllowSetV4(id)); len(got) != 1 {
+		t.Fatalf("allow set 不得被清空，实际 %v", got)
+	}
+}
+
+// 有坏行时即使带回了部分流，也不得据此新授 slot。
+func TestStatusPartialWithFlowsDoesNotGrant(t *testing.T) {
+	svc, store, fake := newTestService(t)
+	id := addRule(t, store, ipLimitRule(20000, 2))
+	svc.SetConntrack(func(string) connection.Result {
+		return connection.Result{
+			Status: connection.StatusPartial, BadLines: 1, Entries: 5,
+			Flows: []connection.Flow{oneFlow(20000, "203.0.113.9", 5100, 500)},
+		}
+	})
+	if err := svc.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.StateOf(id).IPs.GrantedCount; got != 0 {
+		t.Fatalf("Partial 时不得新授 slot，实际 %d", got)
+	}
+	if got := fake.elementsOf("inet", nft.TableFilter, nft.AllowSetV4(id)); len(got) != 0 {
+		t.Fatalf("allow set 不应有元素，实际 %v", got)
+	}
+}
+
+// 冻结 → 恢复：conntrack 恢复后必须解除冻结并按真实情况重算。
+func TestFreezeThenRecover(t *testing.T) {
+	svc, store, fake := newTestService(t)
+	id := addRule(t, store, ipLimitRule(20000, 2))
+	mode := "ok"
+	svc.SetConntrack(func(string) connection.Result {
+		switch mode {
+		case "ok":
+			return connection.Result{Status: connection.StatusOK, Entries: 1,
+				Flows: []connection.Flow{oneFlow(20000, "203.0.113.5", 5000, 100)}}
+		case "frozen":
+			return connection.Result{Status: connection.StatusUnavailable}
+		default: // 恢复且确实没人在线
+			return connection.Result{Status: connection.StatusOK, Entries: 9}
+		}
+	})
+	ctx := context.Background()
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if svc.StateOf(id).IPs.GrantedCount != 1 {
+		t.Fatal("初始应有 1 个授权")
+	}
+
+	mode = "frozen"
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if svc.StateOf(id).IPs.GrantedCount != 1 || !svc.StateOf(id).IPs.Frozen {
+		t.Fatal("冻结期间应保持 1 个授权并标记 frozen")
+	}
+
+	mode = "empty"
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	st := svc.StateOf(id)
+	if st.IPs.Frozen {
+		t.Fatal("恢复后应解除冻结")
+	}
+	if st.IPs.GrantedCount != 0 {
+		t.Fatalf("恢复后确实没人在线，应释放 slot，实际 %d", st.IPs.GrantedCount)
+	}
+	if got := fake.elementsOf("inet", nft.TableFilter, nft.AllowSetV4(id)); len(got) != 0 {
+		t.Fatalf("恢复后 allow set 应清空，实际 %v", got)
+	}
+	if svc.HealthSnapshot().IPStateFrozen {
+		t.Fatal("恢复后健康快照不应报告冻结")
+	}
+}
+
+// 冻结期间 flow 状态表不得被 GC 清空（否则恢复后判活基线丢失）。
+func TestFreezeKeepsFlowState(t *testing.T) {
+	svc, store, _ := newTestService(t)
+	addRule(t, store, ipLimitRule(20000, 2))
+	frozen := false
+	svc.SetConntrack(func(string) connection.Result {
+		if frozen {
+			return connection.Result{Status: connection.StatusUnavailable}
+		}
+		return connection.Result{Status: connection.StatusOK, Entries: 1,
+			Flows: []connection.Flow{oneFlow(20000, "203.0.113.5", 5000, 100)}}
+	})
+	ctx := context.Background()
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := svc.FlowStateLen()
+	if before == 0 {
+		t.Fatal("应有流状态")
+	}
+	frozen = true
+	if err := svc.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.FlowStateLen(); got != before {
+		t.Fatalf("冻结期间不应 GC 流状态：%d → %d", before, got)
+	}
+}

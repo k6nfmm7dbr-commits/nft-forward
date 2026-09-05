@@ -74,7 +74,13 @@ func EnsurePanelPort() (PortResult, error) {
 	if cfg.Port >= 1 && cfg.Port <= 65535 {
 		return PortResult{Port: cfg.Port}, nil
 	}
-	taken := reservedPorts(cfg)
+	taken, err := reservedPorts(cfg)
+	if err != nil {
+		// ★ fail-closed：读不到已有转发端口就绝不继续随机（v0.3.2）。
+		// 旧实现在「DB 存在但打不开/损坏/查询失败」时返回空列表，
+		// 于是新面板端口可能撞上正在使用的转发端口 —— 那是 fail-open。
+		return PortResult{}, fmt.Errorf("拒绝生成面板端口: %w", err)
+	}
 	inUse := portprobe.InUse()
 
 	// 阶段 1：避开 ephemeral；阶段 2：放宽该项（其余检查不变）。
@@ -121,7 +127,10 @@ func pickPort(taken, inUse map[int]bool, avoidEphemeral bool) (int, error) {
 }
 
 // reservedPorts 汇总「绝不能作为面板端口」的集合。
-func reservedPorts(cfg *config.Config) map[int]bool {
+//
+// 读取已有转发端口失败时返回 error（fail-closed）：调用方必须中止端口生成/修改，
+// 绝不能在「不知道哪些端口正被转发占用」的情况下随机一个新端口。
+func reservedPorts(cfg *config.Config) (map[int]bool, error) {
 	out := map[int]bool{}
 	for p := range cfg.GuardPorts() { // 含面板当前端口 + SSH + 用户 guard_ports
 		out[p] = true
@@ -129,30 +138,46 @@ func reservedPorts(cfg *config.Config) map[int]bool {
 	if cfg.Port > 0 {
 		out[cfg.Port] = true
 	}
-	for _, p := range ruleListenPorts(cfg.DB) {
+	ports, err := ruleListenPorts(cfg.DB)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range ports {
 		out[p] = true
 	}
-	return out
+	return out, nil
 }
+
+// ReservedPorts 是 reservedPorts 的导出版本（供手工改端口的校验复用）。
+func ReservedPorts(cfg *config.Config) (map[int]bool, error) { return reservedPorts(cfg) }
 
 // ruleListenPorts 读取已有转发规则的监听端口。
 //
-// 只读且容错：数据库不存在（全新安装）或打不开时返回空 —— 此时本就没有规则。
-func ruleListenPorts(dbPath string) []int {
+// ★ fail-closed 语义（v0.3.2）：
+//
+//	dbPath 为空 / 文件不存在  → (nil, nil)：真正的首次安装，本就没有规则。
+//	文件存在但打不开、schema 异常、查询失败、权限不足 → (nil, error)。
+//
+// 旧实现对后者也返回空列表，等于「读不到就假装没有规则」，新面板端口可能撞上
+// 正在使用的转发端口，用户的转发会被面板抢走。那是 fail-open，必须拒绝。
+func ruleListenPorts(dbPath string) ([]int, error) {
 	if dbPath == "" {
-		return nil
+		return nil, nil
 	}
 	if _, err := os.Stat(dbPath); err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			return nil, nil // 全新安装：库尚未创建
+		}
+		return nil, fmt.Errorf("无法访问规则数据库 %s: %w", dbPath, err)
 	}
 	db, err := database.Open(dbPath)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("无法打开规则数据库 %s: %w", dbPath, err)
 	}
 	defer db.Close()
 	rules, err := forward.NewStore(db.DB).ListActive(context.Background())
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("无法读取已有转发规则: %w", err)
 	}
 	out := make([]int, 0, len(rules))
 	for _, r := range rules {
@@ -160,7 +185,7 @@ func ruleListenPorts(dbPath string) []int {
 			out = append(out, r.ListenPort)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // randInt 返回 [0, n) 内的密码学安全随机整数（拒绝取模偏置）。
@@ -181,4 +206,103 @@ func randInt(n int) (int, error) {
 		return int(v % uint64(n)), nil
 	}
 	return 0, fmt.Errorf("crypto/rand 连续 64 次未取到无偏样本")
+}
+
+// ---- 手工修改面板端口（v0.3.2）----
+//
+// 旧行为：nff 菜单只校验 1 <= port <= 65535，然后写配置 + restart。
+// 于是可以把面板端口改成 SSH 端口、已被监听的端口、或某条转发规则的监听端口 ——
+// 结果是服务起不来（或抢掉用户的转发），而配置已经被改坏。
+//
+// 现在改端口必须复用与首次安装等价的全部安全检查，且失败不写配置。
+
+// PortRejection 描述一次端口校验失败的原因。
+type PortRejection struct {
+	Port   int
+	Reason string
+}
+
+func (e *PortRejection) Error() string {
+	return fmt.Sprintf("端口 %d 不可用：%s", e.Port, e.Reason)
+}
+
+// ValidatePanelPort 校验用户手工指定的面板端口。
+//
+// 检查项（与首次安装的自动选择等价，除 ephemeral 一项）：
+//  1. 1-65535
+//  2. 不等于当前面板端口（无变化则无需重启）
+//  3. TCP 未被监听
+//  4. UDP 未被占用
+//  5. 不与 SSH 端口冲突
+//  6. 不与 guard_ports 冲突
+//  7. 不与已有转发规则的监听端口冲突（读不到规则则 fail-closed 拒绝）
+//  8. bind 探测可用
+//
+// ephemeral 区间：手工指定**不强制拒绝**（用户可能确有需要），
+// 但返回 warn 文本供调用方提示。自动选择仍会尽量避开。
+func ValidatePanelPort(port int) (warn string, err error) {
+	if port < 1 || port > 65535 {
+		return "", &PortRejection{Port: port, Reason: "必须在 1-65535 之间"}
+	}
+	cfg, err := config.LoadStrict()
+	if err != nil {
+		return "", fmt.Errorf("拒绝修改面板端口: %w", err)
+	}
+	if port == cfg.Port {
+		return "", &PortRejection{Port: port, Reason: "与当前面板端口相同"}
+	}
+
+	// SSH / guard_ports / 已有转发端口（含 fail-closed）。
+	if port == cfg.SSHGuard {
+		return "", &PortRejection{Port: port, Reason: "与 SSH 端口冲突"}
+	}
+	for p, label := range cfg.ExtraGuards {
+		if p == port {
+			return "", &PortRejection{Port: port, Reason: "与保留端口冲突（" + label + "）"}
+		}
+	}
+	rulePorts, err := ruleListenPorts(cfg.DB)
+	if err != nil {
+		return "", fmt.Errorf("拒绝修改面板端口: %w", err)
+	}
+	for _, p := range rulePorts {
+		if p == port {
+			return "", &PortRejection{Port: port, Reason: "已被转发规则用作监听端口"}
+		}
+	}
+
+	// 系统占用：/proc 监听表 + 实际 bind。
+	if portprobe.InUse()[port] {
+		return "", &PortRejection{Port: port, Reason: "已被本机进程监听/占用"}
+	}
+	if portprobe.BindBusy(port, true, true) {
+		return "", &PortRejection{Port: port, Reason: "bind 探测失败（端口已被占用）"}
+	}
+
+	if portprobe.InEphemeral(port) {
+		lo, hi, _ := portprobe.EphemeralRange()
+		warn = fmt.Sprintf("端口 %d 落在内核临时端口区间 %d-%d，可能与出站连接偶发冲突",
+			port, lo, hi)
+	}
+	return warn, nil
+}
+
+// SetPanelPortChecked 校验并写入新面板端口。返回旧端口（供调用方回滚）。
+//
+// 只负责「校验 + 写配置」；重启、健康确认与回滚由安装器脚本完成
+// （它才有 systemd 与 curl）。
+func SetPanelPortChecked(port int) (oldPort int, warn string, err error) {
+	cfg, err := config.LoadStrict()
+	if err != nil {
+		return 0, "", fmt.Errorf("拒绝修改面板端口: %w", err)
+	}
+	oldPort = cfg.Port
+	warn, err = ValidatePanelPort(port)
+	if err != nil {
+		return oldPort, "", err
+	}
+	if err := config.SetPort(port); err != nil {
+		return oldPort, warn, fmt.Errorf("写入面板端口失败: %w", err)
+	}
+	return oldPort, warn, nil
 }

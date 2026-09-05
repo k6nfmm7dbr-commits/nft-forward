@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -8,8 +9,10 @@ import (
 	"time"
 
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/config"
+	"github.com/k6nfmm7dbr-commits/nft-forward/internal/connection"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/database"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/forward"
+	"github.com/k6nfmm7dbr-commits/nft-forward/internal/nft"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/policy"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/rulesvc"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/traffic"
@@ -45,6 +48,44 @@ func newTestServer(t *testing.T) (*httptest.Server, *Server) {
 	}
 	store := forward.NewStore(db.DB)
 	pol := policy.New(db.DB, store, nil, cfg.NftConf, "")
+	// 数据面 readiness：注入不接触真实 nft 的 apply/read，让首轮 reconcile 成功。
+	// /healthz 在首轮 enforcement 成功前返回 503，因此测试服务器必须先「就绪」，
+	// 否则所有面板断言都会被 503 干扰。
+	pol.SetNFTApply(func(context.Context, nft.Runner, string, string) error { return nil })
+	pol.SetNFTReadState(func(context.Context, nft.Runner) (*nft.State, error) {
+		return nft.ParseState("")
+	})
+	pol.SetConntrack(func(string) connection.Result {
+		return connection.Result{Status: connection.StatusOK, Available: true, Entries: 1}
+	})
+	if err := pol.Reconcile(context.Background()); err != nil {
+		t.Fatalf("测试用首轮 reconcile 失败: %v", err)
+	}
+	collect := traffic.NewCollector(db, nil, cfg.TZ)
+	rules := rulesvc.New(store, nil, nil, func() forward.GuardPorts { return forward.GuardPorts{} })
+	s, _ := New(cfg, db, store, pol, rules, collect)
+	ts := httptest.NewServer(s.recover(s))
+	t.Cleanup(func() { ts.Close(); db.Close() })
+	return ts, s
+}
+
+// newNotReadyServer 构造一台**数据面未就绪**的面板（首轮 reconcile 未成功）。
+func newNotReadyServer(t *testing.T) (*httptest.Server, *Server) {
+	t.Helper()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "traffic.db")
+	db, err := database.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		DB: dbPath, NftConf: filepath.Join(dir, "nft.conf"),
+		Listen: "127.0.0.1", Port: 10002, Interval: 2, TZ: "UTC",
+		Token: testToken, EntryPath: testEntry,
+	}
+	store := forward.NewStore(db.DB)
+	pol := policy.New(db.DB, store, nil, cfg.NftConf, "")
+	// 不调用 Reconcile：policy.Ready() 保持 false。
 	collect := traffic.NewCollector(db, nil, cfg.TZ)
 	rules := rulesvc.New(store, nil, nil, func() forward.GuardPorts { return forward.GuardPorts{} })
 	s, _ := New(cfg, db, store, pol, rules, collect)

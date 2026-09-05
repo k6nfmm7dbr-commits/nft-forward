@@ -216,6 +216,87 @@ ck "自愈不影响用户自有表" 0 $?
 nft delete table inet e2e_foreign 2>/dev/null || true
 
 echo
+echo "== C2. 内容级自愈（等数量篡改，真实 nft replace rule） =="
+# ★ 这一组是 v0.3.2 的核心：规则条数不变、对象都在，只有内容被改。
+# 旧版本（只比对象存在 + 条数）对它们全部漏检。
+sleep 3
+PORT_H=$(nff_curl "$API/api/rules/$RID" | python3 -c 'import json,sys;print(json.load(sys.stdin)["listen_port"])')
+
+# 取出第一条 DNAT 规则的 handle（真实 nft 才能 replace）
+dnat_handle() {
+  nft -a list chain ip nff_nat4 nff_nat4_prerouting 2>/dev/null |
+    awk -v p="dport $PORT_H" '$0 ~ p {for(i=1;i<=NF;i++) if($i=="handle"){print $(i+1); exit}}'
+}
+H=$(dnat_handle)
+if [ -z "$H" ]; then
+  echo "  [FAIL] 无法定位 DNAT 规则 handle（跳过内容级自愈验收）"
+  F=$((F + 1))
+else
+  # ① DNAT 目标地址被改（条数不变）
+  BEFORE_N=$(nft list chain ip nff_nat4 nff_nat4_prerouting | grep -c 'dnat to')
+  nft replace rule ip nff_nat4 nff_nat4_prerouting handle "$H" \
+    fib daddr type local tcp dport "$PORT_H" ct mark set "$RID" dnat to 8.8.8.8:80 2>/dev/null
+  if nft list chain ip nff_nat4 nff_nat4_prerouting | grep -q '8.8.8.8'; then
+    sleep 4
+    AFTER_N=$(nft list chain ip nff_nat4 nff_nat4_prerouting | grep -c 'dnat to')
+    if nft list chain ip nff_nat4 nff_nat4_prerouting | grep -q '8.8.8.8'; then
+      F=$((F + 1)); echo "  [FAIL] 内容级自愈: DNAT 目标被改后未恢复"
+    else
+      P=$((P + 1)); echo "  [PASS] 内容级自愈: DNAT 目标被改（条数 $BEFORE_N→$AFTER_N）已恢复"
+    fi
+  else
+    echo "  [SKIP] nft replace 未生效（内核/nft 版本限制），跳过 DNAT 篡改验收"
+  fi
+
+  # ② 协议 tcp→udp（条数不变）
+  H=$(dnat_handle)
+  if [ -n "$H" ]; then
+    nft replace rule ip nff_nat4 nff_nat4_prerouting handle "$H" \
+      fib daddr type local udp dport "$PORT_H" ct mark set "$RID" dnat to 10.203.0.100:80 2>/dev/null
+    sleep 4
+    if nft list chain ip nff_nat4 nff_nat4_prerouting | grep -q "tcp dport $PORT_H"; then
+      P=$((P + 1)); echo "  [PASS] 内容级自愈: 协议被改已恢复"
+    else
+      F=$((F + 1)); echo "  [FAIL] 内容级自愈: 协议被改后未恢复 TCP DNAT"
+    fi
+  fi
+fi
+
+# ③ 配额阻断规则被改成 accept（filter 链首条）
+QH=$(nft -a list chain inet nff_filter nff_filter_forward 2>/dev/null |
+  awk '/nff_filter_qblock/ {for(i=1;i<=NF;i++) if($i=="handle"){print $(i+1); exit}}')
+if [ -n "$QH" ]; then
+  nft replace rule inet nff_filter nff_filter_forward handle "$QH" \
+    ct mark @nff_filter_qblock accept 2>/dev/null
+  sleep 4
+  if nft list chain inet nff_filter nff_filter_forward | grep -q 'nff_filter_qblock drop'; then
+    P=$((P + 1)); echo "  [PASS] 内容级自愈: 配额阻断规则被改已恢复"
+  else
+    F=$((F + 1)); echo "  [FAIL] 内容级自愈: 配额阻断规则被改后未恢复 drop"
+  fi
+else
+  echo "  [SKIP] 未定位到配额阻断规则 handle"
+fi
+
+# ④ 插入一条额外规则（条数变多）
+nft add rule inet nff_filter nff_filter_forward ct mark 999999 drop 2>/dev/null
+sleep 4
+if nft list chain inet nff_filter nff_filter_forward | grep -q 'ct mark 999999'; then
+  F=$((F + 1)); echo "  [FAIL] 内容级自愈: 额外插入的规则未被清除"
+else
+  P=$((P + 1)); echo "  [PASS] 内容级自愈: 额外插入的规则已被清除"
+fi
+
+# ⑤ 稳定期不得反复重建：counter 累计值必须保持
+CB=$(nft list counter inet nff_filter "nff_filter_up_$RID" 2>/dev/null |
+  grep -oE 'bytes [0-9]+' | awk '{print $2}')
+sleep 5
+CA=$(nft list counter inet nff_filter "nff_filter_up_$RID" 2>/dev/null |
+  grep -oE 'bytes [0-9]+' | awk '{print $2}')
+ck "内容校验不导致 counter 被清零" 1 \
+  "$([ "${CA:-0}" -ge "${CB:-0}" ] && echo 1 || echo 0)"
+
+echo
 echo "== D. conntrack 异常期间规则 CRUD 仍真实生效 =="
 # 用一个不存在的 conntrack 路径无法在运行中的服务上模拟，因此改为验证
 # 「删除规则后 nft 侧真的撤销」这条最关键的一致性断言。
@@ -240,6 +321,82 @@ nff_api_init || exit 2
 AFTER="$NFF_PORT|$NFF_ENTRY|$NFF_TOKEN"
 ck "服务重启后三项不变" "$BEFORE" "$AFTER"
 ck "重启后面板可用" "200" "$(code -H "$AUTH_HDR" "$API/api/healthz")"
+
+echo
+echo "== F. 数据面 readiness =="
+# /healthz 的 200 必须代表「首轮 nft enforcement 已完成」，而不是「HTTP 活着」。
+HB=$(curl -s "http://127.0.0.1:${NFF_PORT}/healthz")
+echo "  healthz: $HB"
+printf '%s' "$HB" | grep -q '"ok":true'
+ck "数据面就绪时 healthz 返回 ok:true" 0 $?
+# selftest 必须含 data plane 项且为 OK
+ST=$("$CORE_BIN" selftest 2>&1 || true)
+printf '%s' "$ST" | grep -q 'data plane'
+ck "selftest 含 data plane 项" 0 $?
+printf '%s' "$ST" | grep -qE 'OK +data plane'
+ck "selftest 的 data plane 为 OK" 0 $?
+# conntrack 不可用不应影响 data plane（本机 conntrack 可用时该项无从验证，只记录）
+printf '%s' "$ST" | grep -E 'conntrack|ct_acct' | sed 's/^/  /'
+
+echo
+echo "== G. 手工改端口事务 =="
+# 拒绝路径：SSH 端口 / 当前端口 / 已有转发端口 / 非法端口，一律不写配置。
+before_port=$("$CORE_BIN" config-get port)
+for bad in 22 "$before_port" 0 99999; do
+  if "$CORE_BIN" panel-port-check "$bad" >/dev/null 2>&1; then
+    F=$((F + 1)); echo "  [FAIL] 端口 $bad 应被拒绝"
+  else
+    P=$((P + 1)); echo "  [PASS] 端口 $bad 被拒绝"
+  fi
+done
+# 已有转发规则端口也必须拒绝
+RULE_PORT=$(nff_curl "$API/api/rules" |
+  python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print(d[0]["listen_port"] if d else "")' 2>/dev/null || true)
+if [ -n "$RULE_PORT" ]; then
+  if "$CORE_BIN" panel-port-check "$RULE_PORT" >/dev/null 2>&1; then
+    F=$((F + 1)); echo "  [FAIL] 转发端口 $RULE_PORT 应被拒绝"
+  else
+    P=$((P + 1)); echo "  [PASS] 转发端口 $RULE_PORT 被拒绝"
+  fi
+fi
+ck "拒绝后端口配置未被改动" "$before_port" "$("$CORE_BIN" config-get port)"
+
+# 成功路径：换到一个空闲端口，验证服务、认证、令牌与入口路径。
+OLD_TOKEN=$("$CORE_BIN" config-get token)
+OLD_ENTRY=$("$CORE_BIN" config-get entry_path)
+NEWP=$(python3 -c '
+import random, socket
+for _ in range(200):
+    p = random.randint(10000, 65535)
+    s = socket.socket()
+    try:
+        s.bind(("", p)); s.close(); print(p); break
+    except OSError:
+        s.close()
+')
+if [ -n "$NEWP" ]; then
+  if bash "$SELF_DIR/../install.sh" --set-panel-port "$NEWP" >/tmp/nff-portchg.log 2>&1; then
+    P=$((P + 1)); echo "  [PASS] 改端口到 $NEWP 成功"
+  else
+    F=$((F + 1)); echo "  [FAIL] 改端口失败:"; sed 's/^/      /' /tmp/nff-portchg.log | tail -8
+  fi
+  ck "端口已变更" "$NEWP" "$("$CORE_BIN" config-get port)"
+  ck "令牌不变" "$OLD_TOKEN" "$("$CORE_BIN" config-get token)"
+  ck "入口路径不变" "$OLD_ENTRY" "$("$CORE_BIN" config-get entry_path)"
+  ck "新端口 healthz 可用" "200" \
+    "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${NEWP}/healthz")"
+  ck "新端口认证可用" "200" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $OLD_TOKEN" \
+       "http://127.0.0.1:${NEWP}/${OLD_ENTRY}/api/healthz")"
+  # 换回原端口
+  bash "$SELF_DIR/../install.sh" --set-panel-port "$before_port" >/dev/null 2>&1 || true
+  ck "已换回原端口" "$before_port" "$("$CORE_BIN" config-get port)"
+  nff_api_init || exit 2
+else
+  echo "  [SKIP] 未找到空闲端口，跳过改端口验收"
+fi
 
 echo
 echo "FAULT E2E PASS=$P FAIL=$F"

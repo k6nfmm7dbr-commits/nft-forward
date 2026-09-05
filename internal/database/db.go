@@ -139,13 +139,18 @@ func (d *DB) migrate() error {
 
 // migrateRuleColumns 为老库补齐 rules 表新增列。
 //
-// 老库特征：存在 listen_address（NOT NULL，无默认值时插入会失败）。
-// 处理方式见 legacyListenAddrDefault：给它补一个默认值语义，
-// 由 forward.Store 的 INSERT 显式写入 ” 占位，从此不再参与任何业务判断。
+// 老库（v0.2 之前）的 rules 表带一个 listen_address 列。它的定义是
+// `TEXT NOT NULL DEFAULT '0.0.0.0'`，因此新代码的 INSERT 不写该列也能成功
+// —— 由默认值填充。策略是**保留列、永不读写、绝不 DROP**：
+// SQLite 的 DROP COLUMN 需要重写整表，中途失败可能丢数据，而留着它零成本。
 func (d *DB) migrateRuleColumns() error {
 	have, err := d.ruleColumns()
 	if err != nil {
 		return err
+	}
+	if have["listen_address"] {
+		// 只记一次日志，便于排查「为什么这个库里有个没人用的列」。
+		slog.Debug("检测到历史 listen_address 列（保留不用，不会被删除）")
 	}
 	for _, c := range addColumns {
 		if have[c.col] {
@@ -179,16 +184,6 @@ func (d *DB) ruleColumns() (map[string]bool, error) {
 		out[name] = true
 	}
 	return out, rows.Err()
-}
-
-// HasLegacyListenAddress 报告本库是否仍带历史 listen_address 列。
-// 供 forward.Store 决定 INSERT 是否需要为其写入占位值，以及 selftest 展示。
-func (d *DB) HasLegacyListenAddress() bool {
-	cols, err := d.ruleColumns()
-	if err != nil {
-		return false
-	}
-	return cols["listen_address"]
 }
 
 type pragmaConnector struct{ dsn string }

@@ -13,7 +13,7 @@
 set -Eeuo pipefail
 
 APP_NAME="NFT Forward"
-APP_VERSION="0.3.1"
+APP_VERSION="0.3.2"
 REPO="k6nfmm7dbr-commits/nft-forward"
 RAW_URL="${NFF_RAW_URL:-https://raw.githubusercontent.com/${REPO}/main/install.sh}"
 # 二进制走 dist 分支（rolling latest，与 Git Tag 无关）。raw 对同一路径总返回
@@ -525,21 +525,31 @@ start_service() {
   return 0
 }
 
-# health_check 本机健康检查：127.0.0.1/healthz 必须返回 ok。
+# health_check 本机健康检查：127.0.0.1/healthz 必须返回 ok:true。
 #
-# /healthz 只对 loopback 开放（外部访问一律普通 404），因此这里必须走 127.0.0.1。
+# /healthz 只对 loopback 开放（外部访问一律普通 404），因此必须走 127.0.0.1。
+#
+# ★ v0.3.2 起 200 + ok:true 严格代表「进程已完成首轮 nft 数据面 enforcement」；
+# HTTP 活着但数据面未加载时服务返回 503 + ok:false，这里会一直等到超时并失败。
+# 因此安装/升级不会再把「面板能应答但转发没生效」当成健康。
+#
+# 等待窗口 20s：首轮 enforcement 可能需要重试（开机早期 nft 模块未就绪）。
 health_check() {
   local port body i=0
   port=$(panel_get port)
   [[ "$port" =~ ^[0-9]+$ ]] || { warn "面板端口未配置"; return 1; }
-  while [[ $i -lt 10 ]]; do
-    body=$(curl -fsS -m 5 "http://127.0.0.1:${port}/healthz" 2>/dev/null || true)
+  while [[ $i -lt 20 ]]; do
+    body=$(curl -sS -m 5 "http://127.0.0.1:${port}/healthz" 2>/dev/null || true)
     case "$body" in
       *'"ok":true'*) return 0 ;;
+      *'data plane not ready'*)
+        # 数据面尚未就绪：继续等（这正是需要区分 200/503 的场景）
+        ;;
     esac
     sleep 1
     i=$((i+1))
   done
+  [[ -n "$body" ]] && warn "healthz 最后一次响应: $body"
   return 1
 }
 
@@ -555,6 +565,87 @@ config_ready() {
   return 0
 }
 # <<< start-service
+
+# >>> change-port
+# change_panel_port 事务化修改面板端口。
+#
+# 旧行为只校验 1-65535 就写配置 + restart：可以把面板端口改成 SSH 端口、
+# 已被监听的端口、或某条转发规则的监听端口，结果服务起不来（或抢掉用户的转发），
+# 而配置已经被改坏。
+#
+# 现在：
+#   1. 交给后端做与首次安装等价的全部安全检查（TCP/UDP 占用、SSH、guard_ports、
+#      已有转发端口、bind 探测；读不到规则库时 fail-closed 拒绝）
+#   2. 检查通过才写入新端口（后端返回旧端口，供回滚）
+#   3. restart → systemd active → 本机 /healthz（含数据面就绪）
+#   4. 确认新端口真的在监听
+#   5. 任一步失败 → 恢复旧端口 → restart → 再次验证旧端口可用 → 才提示已回滚
+#   6. 旧端口也恢复失败 → 明确 ERROR
+#
+# Token 与随机入口路径全程不动。
+change_panel_port() {  # change_panel_port <新端口>
+  local newp="$1"
+  if [[ ! "$newp" =~ ^[0-9]+$ ]]; then
+    warn "端口必须是数字"
+    return 1
+  fi
+
+  # 1-2) 后端校验 + 写入（失败时不写配置，并打印具体原因）
+  local out oldp
+  if ! out=$("$CORE_BIN" panel-port-set "$newp" 2>&1); then
+    err "端口未修改：$out"
+    return 1
+  fi
+  oldp=$(printf '%s\n' "$out" | sed -nE 's/^old_port=([0-9]+)$/\1/p')
+  printf '%s\n' "$out" | sed -nE 's/^warn=(.*)$/\1/p' | while IFS= read -r w; do
+    [[ -n "$w" ]] && warn "$w"
+  done
+  if [[ -z "$oldp" ]]; then
+    err "无法确定旧端口，已中止（配置可能已被修改，请运行 nff 查看面板信息）"
+    return 1
+  fi
+  info "端口已写入配置（$oldp → $newp），正在重启并验证..."
+
+  # 3-4) 重启 + 三重确认 + 确认新端口真的在监听
+  if start_service && port_listening "$newp"; then
+    ok "面板端口已改为 $newp"
+    show_panel_info
+    return 0
+  fi
+
+  # 5) 回滚
+  err "新端口验证失败，正在回滚到 $oldp"
+  if ! "$CORE_BIN" config-set port "$oldp" >/dev/null 2>&1; then
+    err "严重: 旧端口写回失败！请手工执行: nft-forward config-set port $oldp"
+    return 1
+  fi
+  if start_service && port_listening "$oldp"; then
+    ok "已回滚到原端口 $oldp（服务已恢复并通过健康检查）"
+    return 1
+  fi
+  err "严重: 已写回旧端口 $oldp，但服务未能恢复"
+  err "请查看日志: journalctl -u nft-forward -n 60"
+  return 1
+}
+
+# port_listening 确认某端口真的处于监听状态（最多等 10s）。
+port_listening() {  # port_listening <端口>
+  local p="$1" i=0
+  while [[ $i -lt 10 ]]; do
+    if command -v ss >/dev/null 2>&1; then
+      ss -Hlnt "sport = :$p" 2>/dev/null | grep -q . && return 0
+    elif command -v netstat >/dev/null 2>&1; then
+      netstat -lnt 2>/dev/null | grep -qE "[:.]${p}[[:space:]]" && return 0
+    else
+      # 无 ss/netstat：退化为直接连一次
+      (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null && { exec 3<&-; return 0; }
+    fi
+    sleep 1
+    i=$((i+1))
+  done
+  return 1
+}
+# <<< change-port
 
 install_self() {
   install -d -m 0755 "$BIN_DIR" "$APP_DIR"
@@ -965,15 +1056,7 @@ menu_panel() {
     case "$c" in
       1) printf '新端口 (1-65535): '
          local p=""; read -r p || true
-         if [[ "$p" =~ ^[0-9]+$ ]] && ((10#$p >= 1 && 10#$p <= 65535)); then
-           if panel_set port "$p" && start_service; then
-             ok "面板端口已改为 $p"
-           else
-             err "修改失败"
-           fi
-         else
-           warn "端口非法"
-         fi
+         change_panel_port "$p"
          pause ;;
       2) local cur; cur=$(panel_get listen)
          if [[ "$cur" == "127.0.0.1" ]]; then
@@ -1087,6 +1170,8 @@ main() {
     --clear-firewall) require_root; "$CORE_BIN" clear; exit $? ;;
     --panel-url) panel_url; exit 0 ;;
     --panel-info) require_root; "$CORE_BIN" panel-info; exit $? ;;
+    --set-panel-port)  # 内部/脚本使用：非交互修改面板端口（走完整校验与回滚）
+      require_root; detect_platform; change_panel_port "${2:-}"; exit $? ;;
     --selftest) require_root; "$CORE_BIN" selftest; exit $? ;;
     --update|update|upgrade) do_update "${2:-}"; exit $? ;;
     --apply-update) apply_update; exit $? ;;   # 内部使用：升级时由新脚本调用
@@ -1106,6 +1191,7 @@ $APP_NAME v$APP_VERSION — nftables 端口转发 + 流量监控面板（Go 单�
   --selftest         自检
   --panel-url        输出面板访问地址（含随机入口路径）
   --panel-info       输出面板地址与访问令牌
+  --set-panel-port N 修改面板端口（完整安全校验 + 失败自动回滚）
   --clear-firewall   只移除自有 nft 表（nff_*）
   --uninstall        卸载
   --version          版本信息

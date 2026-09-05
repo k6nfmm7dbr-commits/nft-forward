@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# baseline_test.sh — v0.3.1 基线收口防回归。
+# baseline_test.sh — v0.3.2 基线收口防回归。
 #
 # 这些是硬约束，任何一条被打破都说明出现了功能退化：
 #   A. 版本一致性：install.sh APP_VERSION == Go Version == README == CHANGELOG
@@ -16,7 +16,7 @@
 #   L. 无 N+1 查询 / 锁内 DNS
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VER="0.3.1"
+VER="0.3.2"
 PASS=0; FAIL=0
 ck() { if [[ "$3" == "$2" ]]; then PASS=$((PASS+1)); echo "  [PASS] $1"; else FAIL=$((FAIL+1)); echo "  [FAIL] $1 (期望 $2 实得 $3)"; fi; }
 # nocomment <file> —— 剥掉 // 注释后的源码（避免注释里的说明文字误命中）
@@ -65,20 +65,28 @@ if sed -n '/func (s \*Server) updateRule/,/^}/p' "$ROOT/internal/api/rules.go" |
 ck "updateRule 不把 listen_address 写入更新" 0 "$rc"
 
 FE="$ROOT/internal/webui/static"
-bad=$(grep -rniE 'listen[_-]?addr|监听地址' "$FE" | grep -viE 'pol-listen-ip|listen_addr|listenAddr|监听 IP')
+# 前端不得有任何「监听地址」相关字段：v0.3.2 起连只读展示也一并移除
+# （那是主机属性而非规则属性，多网卡时必然显示错误的 IP）。
+bad=$(grep -rniE 'listen[_-]?addr|监听地址|pol-listen-ip' "$FE" || true)
 if [ -n "$bad" ]; then rc=1; else rc=0; fi
-ck "前端无可配置监听地址字段" 0 "$rc"
-grep -q 'pol-listen-ip' "$FE/index.html"; ck "前端展示只读监听 IP" 0 $?
+ck "前端无任何监听地址字段（含只读展示）" 0 "$rc"
 grep -q '监听端口' "$FE/index.html"; ck "前端保留监听端口字段" 0 $?
 grep -q '留空则随机' "$FE/index.html"; ck "监听端口支持留空随机（有提示）" 0 $?
 grep -q 'IP 或域名' "$FE/index.html"; ck "目标地址支持 IP 或域名（占位提示）" 0 $?
+# API / SSE 视图里也不得出现 listen_addr（剥注释后检查：说明性注释允许提到它）
+if nocomment "$ROOT/internal/api/handlers.go" | grep -qE 'ListenAddr|listen_addr'; then rc=1; else rc=0; fi
+ck "RuleView 无 listen_addr 字段" 0 "$rc"
+if grep_prod 'detectHostIP|hostIP'; then rc=1; else rc=0; fi
+ck "已移除本机对外 IP 探测（规则展示不需要）" 0 "$rc"
 
 if grep -qE 'ip daddr [0-9]' "$ROOT/internal/nft/engine.go"; then rc=1; else rc=0; fi
 ck "nft DNAT 不按监听地址匹配" 0 "$rc"
 grep -q '"listen"' "$ROOT/internal/config/config.go"; ck "面板 bind 配置 listen 保留" 0 $?
 grep -q 'net.JoinHostPort(cfg.Listen' "$ROOT/internal/api/server.go"; ck "面板仍按 listen 绑定" 0 $?
-grep -q 'HasLegacyListenAddress' "$ROOT/internal/database/db.go"; ck "识别老库 legacy 列" 0 $?
-if nocomment "$ROOT/internal/database/db.go" | grep -qE 'DROP COLUMN|DROP TABLE|DELETE FROM rules'; then rc=1; else rc=0; fi
+# 老库 legacy 列：保留不读写，绝不 DROP COLUMN
+grep -q 'listen_address' "$ROOT/internal/database/db.go"; ck "迁移逻辑识别老库 legacy 列" 0 $?
+if nocomment "$ROOT/internal/database/db.go" \
+  | grep -qE 'DROP COLUMN|DROP TABLE|DELETE FROM rules'; then rc=1; else rc=0; fi
 ck "绝不 DROP COLUMN / DROP TABLE / 删规则行" 0 "$rc"
 grep -q 'ADD COLUMN' "$ROOT/internal/database/db.go"; ck "迁移只用 ADD COLUMN" 0 $?
 
@@ -104,14 +112,41 @@ grep -q 'func MissingObjects' "$ROOT/internal/nft/desired.go"; ck "存在缺失�
 for obj in TableNAT4 TableNAT6 TableFilter SetQuotaBlock 'AllowSetV4' 'AllowSetV6' 'CounterUp' 'CounterDown' 'ChainForward' 'ChainPrerouting' 'ChainPostrouting' 'MarksSet'; do
   grep -q "$obj" "$ROOT/internal/nft/desired.go"; ck "Desired State 覆盖 $obj" 0 $?
 done
-grep -q 'MissingObjects' "$ROOT/internal/policy/service.go"; ck "policy 用完整比对判定自愈" 0 $?
+grep -q 'nft.DetectDrift' "$ROOT/internal/policy/service.go"; ck "policy 用完整漂移检测判定自愈" 0 $?
 if grep -q 'structMissing' "$ROOT/internal/policy/service.go"; then rc=1; else rc=0; fi
 ck "已移除旧的三项式自愈判定" 0 "$rc"
 
+# ---- C3. 内容校验（等数量篡改也要发现）----
+grep -q 'func DetectDrift' "$ROOT/internal/nft/desired.go"; ck "存在内容漂移检测" 0 $?
+grep -q 'func DesiredRuleSigs' "$ROOT/internal/nft/intent.go"; ck "存在期望规则签名" 0 $?
+grep -q 'func DesiredChainAttrs' "$ROOT/internal/nft/intent.go"; ck "存在期望链属性" 0 $?
+grep -q 'func parseRuleFacts' "$ROOT/internal/nft/facts.go"; ck "从 nft JSON 提取规则事实" 0 $?
+grep -q 'ChainRuleSigs' "$ROOT/internal/nft/state.go"; ck "State 携带链内规则签名" 0 $?
+grep -q 'ChainAttrsMap' "$ROOT/internal/nft/state.go"; ck "State 携带链属性" 0 $?
+for fld in DNATAddr DNATPort Proto DPort SetMark MarkSet Direction CtState Counter SAddrFamily SAddrNotInSet Verdict FibDaddrLocal Unknown; do
+  grep -q "$fld" "$ROOT/internal/nft/facts.go"; ck "规则事实覆盖 $fld" 0 $?
+done
+for fld in Hook Priority Policy Type; do
+  grep -q "$fld" "$ROOT/internal/nft/facts.go"; ck "链属性覆盖 $fld" 0 $?
+done
+# counter 实时读数绝不能进签名（否则有流量就重建、counter 反复清零）
+if sed -n '/func (f RuleFacts) Sig/,/^}/p' "$ROOT/internal/nft/facts.go" | grep -qiE 'bytes|packets'; then rc=1; else rc=0; fi
+ck "规则签名不含 counter 实时读数" 0 "$rc"
+# 渲染与期望同源：脚本行必须由 ruleIntent.render 产生
+grep -q 'in.render()' "$ROOT/internal/nft/engine.go"; ck "脚本规则由意图渲染（与期望同源）" 0 $?
+if sed -n '/func genFilterStruct/,/^}/p' "$ROOT/internal/nft/engine.go" | grep -q 'add rule inet'; then rc=1; else rc=0; fi
+ck "filter 规则不再手写 add rule 文本" 0 "$rc"
+if sed -n '/func genNATStruct/,/^}/p' "$ROOT/internal/nft/engine.go" | grep -q 'dnat to'; then rc=1; else rc=0; fi
+ck "NAT DNAT 不再手写文本" 0 "$rc"
+
 # ---- D. fib daddr type local ----
-grep -q 'fib daddr type local' "$ROOT/internal/nft/engine.go"; ck "DNAT 带 fib daddr type local" 0 $?
-DNAT_LOCAL=$(grep -c 'fib daddr type local %s dport' "$ROOT/internal/nft/engine.go" || true)
-ck "DNAT 规则生成处均带 fib local" 1 "$([ "$DNAT_LOCAL" -ge 1 ] && echo 1 || echo 0)"
+# DNAT 渲染已移到 intent.go（与自愈期望签名同源），检查点随之移动。
+grep -q 'fib daddr type local' "$ROOT/internal/nft/intent.go"; ck "DNAT 带 fib daddr type local" 0 $?
+DNAT_LOCAL=$(grep -c 'fib daddr type local %s dport' "$ROOT/internal/nft/intent.go" || true)
+ck "DNAT 规则渲染处带 fib local" 1 "$([ "$DNAT_LOCAL" -ge 1 ] && echo 1 || echo 0)"
+# 期望签名里也必须要求 fib local（否则「被删掉 fib」不会被自愈发现）
+grep -q 'FibDaddrLocal = true' "$ROOT/internal/nft/intent.go"; ck "期望事实要求 fib local" 0 $?
+grep -q 'FibDaddrLocal' "$ROOT/internal/nft/facts.go"; ck "实际事实解析 fib local" 0 $?
 
 # ---- E. 域名目标语义 ----
 grep -q 'func (r \*Rule) DialV4' "$ROOT/internal/forward/rule.go"; ck "规则区分 DialV4/DialV6" 0 $?

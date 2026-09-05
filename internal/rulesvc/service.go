@@ -53,6 +53,13 @@ type RuleStore interface {
 	SoftDelete(ctx context.Context, id int64) error
 	HardDelete(ctx context.Context, id int64) error
 	UpdateResolved(ctx context.Context, id int64, v4, v6 string, at int64, status, errMsg string) error
+
+	// UpdateResolvedBatch 在单个事务里批量写解析状态，并在 commit 之前
+	// 调用 beforeCommit（用于把候选规则集应用到 nft）。
+	//
+	// 语义见 forward.Store.UpdateResolvedBatch：commit 阶段失败返回
+	// *forward.ErrCommitFailed，调用方必须据此回滚 nft。
+	UpdateResolvedBatch(ctx context.Context, ups []forward.ResolvedUpdate, beforeCommit func() error) error
 }
 
 // Enforcer 抽象「把当前规则集同步到 nftables」的能力。
@@ -421,7 +428,11 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 //
 //  1. 加锁 → snapshot 需要解析的规则（域名 + 当前状态 + version 指纹）→ 解锁
 //  2. 锁外并发解析（A/AAAA 由 resolve 内部并行，规则之间受 dnsConcurrency 限流）
-//  3. 重新加锁 → 校验目标域名 / updated_at 未被用户改动 → 仍是当前版本才 apply
+//  3. 重新加锁 → 校验目标域名 / updated_at 未被用户改动 → 事务化 apply
+//
+// ★ DB 与 nft 事务一致（v0.3.2 收口）：阶段 3 走 store.UpdateResolvedBatch
+// （BEGIN → 批量写解析列 → ApplyRules → COMMIT），任一步失败都回到
+// 「DB 与 nft 都是旧状态」。详见函数体内的注释。
 //
 // 关键行为：
 //   - 只有 last-known-good 地址真正变化才走 nft 同步（避免无谓重写）；
@@ -498,7 +509,7 @@ func (s *Service) RefreshDNS(ctx context.Context) (int, error) {
 	}
 	wg.Wait()
 
-	// ---- 阶段 3：重新加锁，校验版本后应用 ----
+	// ---- 阶段 3：重新加锁，校验版本后事务化应用 ----
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	defer s.hold()()
@@ -514,45 +525,90 @@ func (s *Service) RefreshDNS(ctx context.Context) (int, error) {
 
 	changed := 0
 	next := make([]*forward.Rule, 0, len(current))
-	applied := make(map[int64]resolve.State, len(results))
 	for _, r := range current {
 		cp := *r
 		next = append(next, &cp)
 	}
+	nextByID := make(map[int64]*forward.Rule, len(next))
+	for _, r := range next {
+		nextByID[r.ID] = r
+	}
+
+	// ups 是要写库的解析状态；与 next（送给 nft 的候选规则集）严格同源。
+	ups := make([]forward.ResolvedUpdate, 0, len(results))
 	for _, res := range results {
 		cur, ok := byID[res.id]
 		if !ok {
-			continue // 规则已被删除：丢弃过期结果
+			// 规则在解析期间被删除：丢弃过期结果，绝不「复活」它。
+			slog.Debug("丢弃过期 DNS 解析结果（规则已删除）", "rule", res.id)
+			continue
 		}
-		// 解析期间用户改了目标或改过规则 → 本次结果已过期，丢弃。
+		// 解析期间用户改了目标或改过规则（含启停）→ 本次结果已过期，丢弃。
 		if cur.TargetAddress != res.host || cur.UpdatedAt != res.updatedAt {
 			slog.Debug("丢弃过期 DNS 解析结果（规则在解析期间被修改）", "rule", res.id)
 			continue
 		}
-		applied[res.id] = res.state
+		cand := nextByID[res.id]
+		if cand == nil {
+			continue
+		}
+		applyResolve(cand, res.state)
+		ups = append(ups, forward.ResolvedUpdate{
+			ID: res.id, V4: res.state.V4, V6: res.state.V6,
+			At: res.state.At, Status: res.state.Status, Err: res.state.Err,
+		})
 		prev := resolve.State{V4: cur.ResolvedV4, V6: cur.ResolvedV6}
 		if res.state.Changed(prev) {
 			changed++
 		}
-		for _, r := range next {
-			if r.ID == res.id {
-				applyResolve(r, res.state)
-			}
-		}
 	}
 
-	if changed > 0 {
-		// 地址有实际变化 → 同步 nft（结构签名变化会触发链重写，counter 保留）。
-		if err := s.applyWithRollback(ctx, next, current); err != nil {
-			return 0, fmt.Errorf("DNS 目标更新应用失败: %w", err)
-		}
+	if len(ups) == 0 {
+		return 0, nil
 	}
-	// 状态落库：即使地址没变也要写（stale/ok 状态与错误文本需要反映到 UI）。
-	for id, st := range applied {
-		if err := s.store.UpdateResolved(ctx, id, st.V4, st.V6, st.At, st.Status, st.Err); err != nil {
-			slog.Warn("写入 DNS 解析状态失败", "rule", id, "err", err)
+
+	// ★ 事务化：DB 与 nft 要么都成功，要么都回滚（v0.3.2 收口）。
+	//
+	// 旧实现是「先 ApplyRules 到 nft，再逐条 UpdateResolved，写失败只打
+	// warning」——一旦某条写库失败，nft 已用新地址而 DB 仍记旧地址，
+	// 这种不一致会一直存在（下一轮解析结果相同时甚至不会再触发同步）。
+	//
+	// 现在：
+	//   BEGIN → 批量写解析列 → ApplyRules(候选集) → COMMIT
+	//
+	//   · 写库失败      → ROLLBACK，nft 未被改动
+	//   · ApplyRules 失败 → ROLLBACK（apply 内部已把 nft 回滚到旧状态）
+	//   · COMMIT 失败    → nft 已是新状态，必须把 nft 回滚回旧规则集，
+	//                      并且明确报错（不再是 warning）
+	//
+	// 无论几条域名规则变化，都只有一次 ApplyRules + 一次 commit，
+	// 不会出现「apply、写库、apply、写库」的多次中间状态。
+	applied := false
+	err = s.store.UpdateResolvedBatch(ctx, ups, func() error {
+		if changed == 0 {
+			// 地址没变：不需要重写 nft（避免无谓的链重建）。
+			return nil
 		}
+		if aerr := s.apply(ctx, next); aerr != nil {
+			// apply 自身失败：nft 未进入新状态，但可能处于半应用，
+			// 统一回滚到变更前规则集。
+			s.rollbackNFT(ctx, current, "DNS 目标更新应用失败")
+			return fmt.Errorf("DNS 目标更新应用失败: %w", aerr)
+		}
+		applied = true
+		return nil
+	})
+	if err != nil {
+		var commitErr *forward.ErrCommitFailed
+		if errors.As(err, &commitErr) && applied {
+			// nft 已是新状态但 DB 未提交 → 必须把 nft 退回旧状态，
+			// 否则会留下「nft 新地址、DB 旧地址」的不一致。
+			slog.Error("DNS 解析状态提交失败，正在回滚 nftables", "err", commitErr.Err)
+			s.rollbackNFT(ctx, current, "DNS 解析状态提交失败")
+		}
+		return 0, fmt.Errorf("DNS 刷新失败: %w", err)
 	}
+
 	if changed > 0 {
 		s.fire()
 	}

@@ -24,6 +24,14 @@ type memStore struct {
 	failCreate bool
 	failUpdate bool
 	failDelete bool
+	// failResolvedWrite 让 UpdateResolvedBatch 在「写解析列」阶段失败
+	// （此时 nft 尚未被改动）。
+	failResolvedWrite bool
+	// failResolvedCommit 让 UpdateResolvedBatch 在 commit 阶段失败
+	// （此时 nft 已是新状态，调用方必须回滚 nft）。
+	failResolvedCommit bool
+	// resolvedCommits 统计成功提交的批次数（断言「一次 refresh 只提交一次」）。
+	resolvedCommits int
 	// createdIDs 记录曾经插入过的 ID（用于断言回滚是否物理删除）。
 	createdIDs []int64
 }
@@ -118,6 +126,53 @@ func (m *memStore) UpdateResolved(_ context.Context, id int64, v4, v6 string, at
 	return nil
 }
 
+// UpdateResolvedBatch 模拟「事务 + commit 前钩子」语义，可注入两类故障：
+//
+//	failResolvedWrite  写解析列阶段失败（nft 尚未被改动）
+//	failResolvedCommit commit 阶段失败（nft 已是新状态，调用方必须回滚 nft）
+//
+// 事务性用「先在副本上改，commit 成功才写回」模拟：任何阶段失败都不留下部分更新。
+func (m *memStore) UpdateResolvedBatch(_ context.Context, ups []forward.ResolvedUpdate,
+	beforeCommit func() error) error {
+	m.mu.Lock()
+	if m.failResolvedWrite {
+		m.mu.Unlock()
+		return errors.New("disk I/O error")
+	}
+	// 校验目标规则都还在（与真实 SQL 的 WHERE id=? AND deleted=0 一致）。
+	staged := make([]forward.ResolvedUpdate, 0, len(ups))
+	for _, u := range ups {
+		if _, ok := m.rules[u.ID]; !ok {
+			m.mu.Unlock()
+			return fmt.Errorf("规则 %d 不存在或已删除", u.ID)
+		}
+		staged = append(staged, u)
+	}
+	m.mu.Unlock()
+
+	if beforeCommit != nil {
+		if err := beforeCommit(); err != nil {
+			return err // 回滚：什么都没写
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failResolvedCommit {
+		return &forward.ErrCommitFailed{Err: errors.New("database is locked")}
+	}
+	for _, u := range staged {
+		r, ok := m.rules[u.ID]
+		if !ok {
+			continue
+		}
+		r.ResolvedV4, r.ResolvedV6, r.ResolvedAt = u.V4, u.V6, u.At
+		r.ResolveStatus, r.ResolveError = u.Status, u.Err
+	}
+	m.resolvedCommits++
+	return nil
+}
+
 func (m *memStore) count() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -141,12 +196,22 @@ type fakeEnforcer struct {
 	failNext int // >0 时接下来 N 次 apply 失败
 	failAll  bool
 	holdN    int
+
+	// failApply 等价于 failAll（DNS 事务测试用的可读别名）。
+	failApply bool
+	// failApplyAfter > 0 时，第 failApplyAfter 次及之后的 apply 全部失败。
+	// 用于「commit 失败 → 回滚 nft 也失败」这类多阶段故障注入。
+	failApplyAfter int
+	// applyCalls 统计 ApplyRules 的调用次数（含失败的调用）。
+	applyCalls int
 }
 
 func (f *fakeEnforcer) ApplyRules(_ context.Context, rules []*forward.Rule) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.failAll || f.failNext > 0 {
+	f.applyCalls++
+	if f.failAll || f.failApply || f.failNext > 0 ||
+		(f.failApplyAfter > 0 && f.applyCalls >= f.failApplyAfter) {
 		if f.failNext > 0 {
 			f.failNext--
 		}
@@ -180,7 +245,7 @@ func (f *fakeEnforcer) lastApplied() []*forward.Rule {
 func (f *fakeEnforcer) applyCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.applied)
+	return f.applyCalls
 }
 
 // stubResolver 是可控解析器。
@@ -190,17 +255,27 @@ type stubResolver struct {
 	v6   []string
 	err4 error
 	err6 error
+	// calls 统计查询次数（测试用于判断解析是否已开始）。
+	calls int
+	// gate 非 nil 时解析会阻塞直到该通道关闭（精确控制并发时序）。
+	gate chan struct{}
 }
 
 func (s *stubResolver) LookupNetIP(_ context.Context, network, _ string) ([]netip.Addr, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.calls++
+	gate := s.gate
 	var list []string
 	var err error
 	if network == "ip4" {
 		list, err = s.v4, s.err4
 	} else {
 		list, err = s.v6, s.err6
+	}
+	s.mu.Unlock()
+
+	if gate != nil {
+		<-gate
 	}
 	if err != nil {
 		return nil, err
@@ -218,6 +293,12 @@ func (s *stubResolver) set(v4, v6 []string, err4, err6 error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.v4, s.v6, s.err4, s.err6 = v4, v6, err4, err6
+}
+
+func (s *stubResolver) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
 }
 
 var errDNSTimeout = &net.DNSError{Err: "i/o timeout", IsTimeout: true}

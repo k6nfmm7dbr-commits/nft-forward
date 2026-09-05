@@ -39,6 +39,18 @@ type State struct {
 	// 顺带取出 counter 读数即可算出「尚未落库的增量」，无需额外
 	// `nft list counters` 系统调用（那会与 collector 的采集重复）。
 	CounterBytes map[string]int64
+
+	// ChainRuleSigs 是每条自有链内规则的 canonical signature 序列（保持 nft
+	// 中的实际顺序），键为 "family/table/chain"。
+	//
+	// 这是「内容正确」自愈的基础：只比对象存在与规则条数，无法察觉
+	// 「dnat to 1.2.3.4 被改成 dnat to 8.8.8.8」这类等数量篡改。
+	// nil 表示本 State 未携带规则内容（旧夹具/降级读取），此时跳过该维度。
+	ChainRuleSigs map[string][]string
+
+	// ChainAttrsMap 是每条自有链的关键属性（type/hook/priority/policy）。
+	// base chain 的挂载点被改动会让整条链失效，必须纳入校验。nil 时跳过。
+	ChainAttrsMap map[string]ChainAttrs
 }
 
 // Existing 视图（供 GenStructScript 清理遗留对象）。
@@ -99,7 +111,27 @@ func (s *State) HasTableSet(family, table, set string) bool {
 	return false
 }
 
+// RuleSigsOf 返回某链的规则签名序列与该信息是否可用。
+func (s *State) RuleSigsOf(family, table, chain string) ([]string, bool) {
+	if s == nil || s.ChainRuleSigs == nil {
+		return nil, false
+	}
+	return s.ChainRuleSigs[ObjKey(family, table, chain)], true
+}
+
+// ChainAttrsOf 返回某链的属性与该信息是否可用。
+func (s *State) ChainAttrsOf(family, table, chain string) (ChainAttrs, bool) {
+	if s == nil || s.ChainAttrsMap == nil {
+		return ChainAttrs{}, false
+	}
+	a, ok := s.ChainAttrsMap[ObjKey(family, table, chain)]
+	return a, ok
+}
+
 // nft -j list ruleset 的最小结构（只取本程序需要的部分）。
+//
+// 刻意不解析 handle / comment：它们随内核状态变化，纳入比较会造成无谓重建。
+// counter 的 packets/bytes 只用于配额实时判定，不参与结构签名。
 type rulesetDoc struct {
 	Nftables []struct {
 		Table *struct {
@@ -110,11 +142,16 @@ type rulesetDoc struct {
 			Family string `json:"family"`
 			Table  string `json:"table"`
 			Name   string `json:"name"`
+			Type   string `json:"type"`
+			Hook   string `json:"hook"`
+			Prio   *int   `json:"prio"`
+			Policy string `json:"policy"`
 		} `json:"chain"`
 		Rule *struct {
 			Family string `json:"family"`
 			Table  string `json:"table"`
 			Chain  string `json:"chain"`
+			Expr   []any  `json:"expr"`
 		} `json:"rule"`
 		Counter *struct {
 			Family string `json:"family"`
@@ -161,11 +198,13 @@ func ReadState(ctx context.Context, runner Runner) (*State, error) {
 // ParseState 解析 `nft -j list ruleset` 输出。
 func ParseState(jsonOut string) (*State, error) {
 	st := &State{
-		SetElements:  map[string][]string{},
-		Chains:       map[string]bool{},
-		RuleCounts:   map[string]int{},
-		TableSets:    map[string][]string{},
-		CounterBytes: map[string]int64{},
+		SetElements:   map[string][]string{},
+		Chains:        map[string]bool{},
+		RuleCounts:    map[string]int{},
+		TableSets:     map[string][]string{},
+		CounterBytes:  map[string]int64{},
+		ChainRuleSigs: map[string][]string{},
+		ChainAttrsMap: map[string]ChainAttrs{},
 	}
 	if strings.TrimSpace(jsonOut) == "" {
 		return st, nil
@@ -186,9 +225,26 @@ func ParseState(jsonOut string) (*State, error) {
 				st.NAT6TableExists = true
 			}
 		case item.Chain != nil && ownedTable(item.Chain.Table):
-			st.Chains[ObjKey(item.Chain.Family, item.Chain.Table, item.Chain.Name)] = true
+			key := ObjKey(item.Chain.Family, item.Chain.Table, item.Chain.Name)
+			st.Chains[key] = true
+			prio := 0
+			if item.Chain.Prio != nil {
+				prio = *item.Chain.Prio
+			}
+			st.ChainAttrsMap[key] = ChainAttrs{
+				Type: item.Chain.Type, Hook: item.Chain.Hook,
+				Priority: prio, Policy: item.Chain.Policy,
+			}
+			// 预置空序列：链存在但一条规则都没有时，ChainRuleSigs 里也要有这个键，
+			// 否则「链被 flush 空」会被 RuleSigsOf 当成「信息不可用」而漏检。
+			if _, ok := st.ChainRuleSigs[key]; !ok {
+				st.ChainRuleSigs[key] = []string{}
+			}
 		case item.Rule != nil && ownedTable(item.Rule.Table):
-			st.RuleCounts[ObjKey(item.Rule.Family, item.Rule.Table, item.Rule.Chain)]++
+			key := ObjKey(item.Rule.Family, item.Rule.Table, item.Rule.Chain)
+			st.RuleCounts[key]++
+			st.ChainRuleSigs[key] = append(st.ChainRuleSigs[key],
+				parseRuleFacts(item.Rule.Expr).Sig())
 		case item.Counter != nil && item.Counter.Table == TableFilter:
 			st.Counters = append(st.Counters, item.Counter.Name)
 			st.CounterBytes[item.Counter.Name] = item.Counter.Bytes

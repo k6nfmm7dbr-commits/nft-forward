@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/config"
+	"github.com/k6nfmm7dbr-commits/nft-forward/internal/connection"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/database"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/nft"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/version"
@@ -131,9 +133,16 @@ func selfTest() int {
 	}
 
 	if _, err := os.Stat("/proc/net/nf_conntrack"); err == nil {
-		check("conntrack", "OK", "可读")
+		res := connection.ReadConntrack("")
+		switch {
+		case res.Usable():
+			check("conntrack", "OK", fmt.Sprintf("%d 条目可读", res.Entries))
+		default:
+			// conntrack 不可用只降级 IP 限制，不影响转发数据面。
+			check("conntrack", "WARN", res.Note())
+		}
 	} else {
-		check("conntrack", "WARN", "不可用（在线 IP 判活将冻结）")
+		check("conntrack", "WARN", "不可用（在线 IP 判活将冻结，转发不受影响）")
 	}
 
 	acct := strings.TrimSpace(string(mustRead("/proc/sys/net/netfilter/nf_conntrack_acct")))
@@ -163,12 +172,56 @@ func selfTest() int {
 		check("authentication", "OK", "令牌校验通过")
 	}
 
+	// data plane：本机 /healthz 是否 200。
+	//
+	// 200 严格代表「进程已完成首轮 nft enforcement」；503 表示 HTTP 活着但
+	// 数据面未加载 —— 这正是需要 FAIL 的情况（旧版本会把它当成健康）。
+	switch dataPlaneState(cfg) {
+	case dpReady:
+		check("data plane", "OK", "首轮 nft enforcement 已完成")
+	case dpNotReady:
+		check("data plane", "FAIL", "服务在运行但数据面未就绪（首轮 nft enforcement 失败）")
+	default:
+		check("data plane", "WARN", "无法确认（服务可能未运行）")
+	}
+
 	if fail > 0 {
 		fmt.Println("自检存在失败项")
 		return 1
 	}
 	fmt.Println("自检通过")
 	return 0
+}
+
+// 数据面状态。
+type dpState int
+
+const (
+	dpUnknown dpState = iota
+	dpReady
+	dpNotReady
+)
+
+// dataPlaneState 通过本机 /healthz 判断数据面就绪状态。
+func dataPlaneState(cfg *config.Config) dpState {
+	if cfg.Port == 0 {
+		return dpUnknown
+	}
+	url := "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.Port)) + "/healthz"
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return dpUnknown
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return dpReady
+	case http.StatusServiceUnavailable:
+		return dpNotReady
+	}
+	return dpUnknown
 }
 
 // localAuthWorks 用本机回环验证认证链路：

@@ -74,8 +74,20 @@ type LiveDelta struct {
 // Used 返回某规则的实时累计字节（已落库 + 尚未落库）。
 //
 // cur 是当前 nft named counter 读数（counter 名 → bytes）。cur 为 nil 时
-// 退化为已落库累计。counter 被外部重置（cur < baseline）时，未落库增量就是
-// 重置后的新值本身 —— 与 collector 的 reset 处理保持一致，绝不出现负数。
+// 退化为已落库累计。
+//
+// ★ 为什么 c < base 时贡献 0 而不是 c（v0.3.2 修正双算）：
+//
+// policy 读 nft 与 collector 提交是两个独立时刻，二者存在毫秒级错位。
+// 若 collector 刚以 cur=1200 提交（committed 已含到 1200、baseline=1200），
+// 而 policy 手上是稍早的读数 cur=1000，那么 c<base。旧实现在这里按
+// 「counter 被重置」处理、把整个 1000 又加一遍 —— 用量瞬间翻倍，
+// 配额可能立刻误判超限。
+//
+// 真正的 counter 重置（自愈重建）同样表现为 c<base，但那部分增量会由
+// collector 下一轮的 reset 检测折进 committed（它会把 cur 作为增量入账）。
+// 因此这里贡献 0 只会在**最多一个采集周期内**少算，绝不会多算。
+// 宁可短暂少算，也不能凭一次错位就把用量翻倍。
 func (d LiveDelta) Used(ruleID int64, cur map[string]int64) int64 {
 	used := d.Committed[ruleID]
 	if len(cur) == 0 {
@@ -84,14 +96,10 @@ func (d LiveDelta) Used(ruleID int64, cur map[string]int64) int64 {
 	for _, name := range []string{nft.CounterUp(ruleID), nft.CounterDown(ruleID)} {
 		c, ok := cur[name]
 		if !ok {
-			continue
+			continue // counter 尚未创建/已删除：没有未落库增量
 		}
-		base := d.Baseline[name]
-		switch {
-		case c > base:
+		if base := d.Baseline[name]; c > base {
 			used += c - base
-		case c < base:
-			used += c // counter 已重置：新值即未落库增量
 		}
 	}
 	return used

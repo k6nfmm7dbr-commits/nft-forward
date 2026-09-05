@@ -11,6 +11,8 @@
 //	nft-forward config-ensure-port     首次生成随机五位数面板端口（幂等）
 //	nft-forward config-ensure-entry    首次生成随机面板入口路径（幂等）
 //	nft-forward config-ensure-all      一次完成上面三项（安装器用）
+//	nft-forward panel-port-check <p>   只校验新面板端口（不写入）
+//	nft-forward panel-port-set <p>     校验并写入新面板端口，输出 old_port=<旧端口>
 //	nft-forward panel-info             打印面板地址与访问令牌
 //	nft-forward clear                  只删除 nff_* 自有表（不清系统规则）
 //	nft-forward（无参数）               运维菜单（不含规则 CRUD，规则统一走 Web 面板）
@@ -19,6 +21,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/config"
@@ -93,6 +96,47 @@ func main() {
 		fmt.Println(res.Port)
 	case "config-ensure-all":
 		os.Exit(ensureAll())
+	case "panel-port-set":
+		// 手工修改面板端口：复用与首次安装等价的全部安全检查。
+		// 成功时输出 old_port=<旧端口>（供安装器回滚），可能附带 warn=<提示>。
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "用法: nft-forward panel-port-set <端口>")
+			os.Exit(1)
+		}
+		port, perr := strconv.Atoi(strings.TrimSpace(args[1]))
+		if perr != nil {
+			fmt.Fprintln(os.Stderr, "端口必须是数字:", args[1])
+			os.Exit(1)
+		}
+		oldPort, warn, err := provision.SetPanelPortChecked(port)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+		fmt.Printf("old_port=%d\n", oldPort)
+		if warn != "" {
+			fmt.Printf("warn=%s\n", warn)
+		}
+	case "panel-port-check":
+		// 只校验不写入（供脚本预检）。
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "用法: nft-forward panel-port-check <端口>")
+			os.Exit(1)
+		}
+		port, perr := strconv.Atoi(strings.TrimSpace(args[1]))
+		if perr != nil {
+			fmt.Fprintln(os.Stderr, "端口必须是数字:", args[1])
+			os.Exit(1)
+		}
+		warn, err := provision.ValidatePanelPort(port)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+		if warn != "" {
+			fmt.Printf("warn=%s\n", warn)
+		}
+		fmt.Println("ok")
 	case "panel-info":
 		os.Exit(panelInfo())
 	case "version", "--version", "-v":
@@ -103,7 +147,7 @@ func main() {
 		fmt.Println("未知命令:", args[0])
 		fmt.Println("可用: serve / selftest / config-get / config-set / config-migrate / " +
 			"config-ensure-token / config-ensure-port / config-ensure-entry / config-ensure-all / " +
-			"panel-info / clear / version")
+			"panel-port-check / panel-port-set / panel-info / clear / version")
 		os.Exit(1)
 	}
 }

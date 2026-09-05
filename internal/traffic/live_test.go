@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// LiveDelta.Used 的三种情形：正常增量、counter 重置、counter 缺失。
+// LiveDelta.Used 的三种情形：正常增量、counter 低于基线、counter 缺失。
 func TestLiveDeltaUsed(t *testing.T) {
 	d := LiveDelta{
 		Ready:     true,
@@ -18,18 +18,32 @@ func TestLiveDeltaUsed(t *testing.T) {
 	if got != 1400 {
 		t.Fatalf("应为 1400，实际 %d", got)
 	}
-	// counter 被重置（当前值 < 基线）：新值即未落库增量，绝不出现负数
+	// ★ counter 低于基线：贡献 0，绝不把整个 cur 再加一遍。
+	//
+	// 这一情形有两个来源，处理方式相同：
+	//   a) policy 与 collector 的读数错位（policy 手上是稍早的值）—— 加一遍会**翻倍**；
+	//   b) counter 真被重置（自愈重建）—— 那部分增量由 collector 下一轮 reset
+	//      检测折进 Committed，这里不重复计。
 	got = d.Used(1, map[string]int64{"nff_filter_up_1": 5, "nff_filter_down_1": 7})
-	if got != 1012 {
-		t.Fatalf("重置后应为 1000+5+7=1012，实际 %d", got)
+	if got != 1000 {
+		t.Fatalf("counter 低于基线时应只算已落库累计 1000，实际 %d（双算风险）", got)
+	}
+	// 混合：up 正常增长、down 低于基线 → 只算 up 的增量
+	got = d.Used(1, map[string]int64{"nff_filter_up_1": 450, "nff_filter_down_1": 100})
+	if got != 1050 {
+		t.Fatalf("应为 1000+50=1050，实际 %d", got)
 	}
 	// 没有 counter 读数：退回已落库累计
 	if got := d.Used(1, nil); got != 1000 {
 		t.Fatalf("无 counter 读数应为 1000，实际 %d", got)
 	}
-	// 未知规则
+	// counter 存在但规则无基线（新建规则）：全部算未落库增量
 	if got := d.Used(99, map[string]int64{"nff_filter_up_99": 50}); got != 50 {
-		t.Fatalf("未知规则应只算未落库增量，实际 %d", got)
+		t.Fatalf("新规则应只算未落库增量，实际 %d", got)
+	}
+	// counter 已被删除（规则删除后残留判定）：不贡献
+	if got := d.Used(1, map[string]int64{"other": 999}); got != 1000 {
+		t.Fatalf("无关 counter 不应计入，实际 %d", got)
 	}
 }
 

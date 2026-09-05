@@ -200,3 +200,125 @@ func DescribeMissing(miss []Object) string {
 	}
 	return s
 }
+
+// ---- 内容校验（v0.3.2）----
+//
+// 只判断「对象存在 + 规则条数 >= N」会漏掉等数量篡改，例如
+//
+//	tcp dport 30001 dnat to 1.2.3.4:443  →  tcp dport 30001 dnat to 8.8.8.8:443
+//
+// 表、链、set、counter 都在，条数也没变，但数据面已被劫持。
+// 因此在对象校验之上再做**内容**校验：
+//
+//	期望：DesiredRuleSigs / DesiredChainAttrs（由 ruleIntent 派生）
+//	实际：State.ChainRuleSigs / State.ChainAttrsMap（由 nft -j 解析派生）
+//
+// 两侧都是 canonical signature，逐项按序比较。counter 的实时读数不参与，
+// 因此有流量不会触发重建。
+
+// Drift 描述一次 desired-state 比对的结果。
+type Drift struct {
+	// Missing 是缺失的对象（表/链/set/counter/规则条数不足）。
+	Missing []Object
+	// Content 是内容不一致的描述（每项一行，已排序）。
+	Content []string
+}
+
+// Empty 报告是否完全一致。
+func (d Drift) Empty() bool { return len(d.Missing) == 0 && len(d.Content) == 0 }
+
+// Describe 返回一行可读描述（对象缺失优先，随后内容差异）。
+func (d Drift) Describe() string {
+	var parts []string
+	if s := DescribeMissing(d.Missing); s != "" {
+		parts = append(parts, s)
+	}
+	if len(d.Content) > 0 {
+		n := len(d.Content)
+		if n > 6 {
+			n = 6
+		}
+		s := strings.Join(d.Content[:n], "; ")
+		if len(d.Content) > n {
+			s += fmt.Sprintf(" …(共 %d 项内容差异)", len(d.Content))
+		}
+		parts = append(parts, s)
+	}
+	return strings.Join(parts, " | ")
+}
+
+// DetectDrift 比对期望与现状，返回全部差异。
+//
+// cur 为 nil 视为「什么都没有」。State 未携带某维度信息（旧夹具/降级读取）时
+// 跳过该维度 —— 「未知」不等于「不一致」，否则会陷入无意义的反复重建。
+func DetectDrift(g *GenInput, cur *State) Drift {
+	d := Drift{Missing: MissingObjects(cur, DesiredObjects(g))}
+	if cur == nil {
+		return d // 全部缺失，内容比较无意义
+	}
+
+	// 链属性（type / hook / priority / policy）
+	wantAttrs := DesiredChainAttrs(g)
+	attrKeys := make([]string, 0, len(wantAttrs))
+	for k := range wantAttrs {
+		attrKeys = append(attrKeys, k)
+	}
+	sort.Strings(attrKeys)
+	for _, k := range attrKeys {
+		want := wantAttrs[k]
+		got, ok := cur.ChainAttrsMap[k]
+		if cur.ChainAttrsMap == nil {
+			break // 信息不可用，整个维度跳过
+		}
+		if !ok {
+			continue // 链本身缺失，已由 Missing 覆盖
+		}
+		if got.Sig() != want.Sig() {
+			d.Content = append(d.Content,
+				fmt.Sprintf("chain %s 属性不符(期望 %s 实际 %s)", k, want.Sig(), got.Sig()))
+		}
+	}
+
+	// 链内规则序列
+	wantSigs := DesiredRuleSigs(g)
+	if cur.ChainRuleSigs != nil {
+		for _, k := range sortedChainKeys(wantSigs) {
+			want := wantSigs[k]
+			got, ok := cur.ChainRuleSigs[k]
+			if !ok {
+				continue // 链缺失，Missing 已覆盖
+			}
+			if diff := diffSigs(want, got); diff != "" {
+				d.Content = append(d.Content, fmt.Sprintf("chain %s 规则不符: %s", k, diff))
+			}
+		}
+		// 期望里没有、但实际存在规则的自有链 —— 说明规则残留在不该有内容的链上。
+		for _, k := range sortedChainKeys(cur.ChainRuleSigs) {
+			if _, expected := wantSigs[k]; expected {
+				continue
+			}
+			if n := len(cur.ChainRuleSigs[k]); n > 0 {
+				d.Content = append(d.Content,
+					fmt.Sprintf("chain %s 存在 %d 条不应有的规则", k, n))
+			}
+		}
+	}
+	sort.Strings(d.Content)
+	return d
+}
+
+// diffSigs 比较两个签名序列，返回首个差异的可读描述（相同返回空串）。
+//
+// 按序比较：本程序的规则顺序有语义（配额阻断必须在 counter 之前，
+// 否则被阻断流量会先被计数、用量继续虚增）。
+func diffSigs(want, got []string) string {
+	if len(want) != len(got) {
+		return fmt.Sprintf("条数 %d→%d", len(want), len(got))
+	}
+	for i := range want {
+		if want[i] != got[i] {
+			return fmt.Sprintf("第 %d 条 期望[%s] 实际[%s]", i+1, want[i], got[i])
+		}
+	}
+	return ""
+}

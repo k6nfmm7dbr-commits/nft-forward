@@ -34,6 +34,14 @@ jobs:
       - name: go test -race
         run: go test -race ./...
 
+      - name: benchmark（conntrack parser，仅记录不设阈值）
+        run: |
+          go test -run XXX -bench=ParseConntrack -benchmem ./internal/connection/ | tee /tmp/bench.txt
+          echo "### conntrack parser benchmark" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^Benchmark' /tmp/bench.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
       - name: shellcheck（安装器 / 脚本静态检查）
         run: |
           sudo apt-get update -qq >/dev/null
@@ -44,7 +52,7 @@ jobs:
       - name: 安装/升级流程测试（提取 install.sh 真实实现）
         run: bash tests/installer_flow_test.sh
 
-      - name: v0.3.1 基线收口测试（认证 / 暴露面 / fail-safe / 自愈 / 性能）
+      - name: v0.3.2 基线收口测试（认证 / 暴露面 / fail-safe / 内容级自愈 / readiness）
         run: bash tests/baseline_test.sh
 
       # 真实 nftables + network namespace E2E。
@@ -60,14 +68,31 @@ jobs:
           # conntrack 是在线 IP / IP 限制的事实来源：先尽力加载模块并开启字节计费。
           sudo modprobe nf_conntrack 2>/dev/null || true
           sudo sysctl -w net.netfilter.nf_conntrack_acct=1 >/dev/null 2>&1 || true
-          echo "--- conntrack 探测 ---"
+          echo "--- conntrack 数据源探测（三种）---"
+          CT_OK=false
+          # 1) /proc/net/nf_conntrack（本程序实际使用的数据源）
           if sudo test -r /proc/net/nf_conntrack; then
-            echo "ct=true" >> "$GITHUB_OUTPUT"
-            echo "可读，当前条目数：$(sudo wc -l < /proc/net/nf_conntrack)"
-            echo "nf_conntrack_acct=$(sudo sysctl -n net.netfilter.nf_conntrack_acct 2>/dev/null || echo '?')"
+            CT_OK=true
+            echo "  [ok] /proc/net/nf_conntrack 可读，条目数：$(sudo wc -l < /proc/net/nf_conntrack)"
           else
-            echo "ct=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::runner 上 /proc/net/nf_conntrack 不可读，在线 IP / IP 限制无法在 CI 验证"
+            echo "  [--] /proc/net/nf_conntrack 不可读"
+          fi
+          # 2) /proc/net/ip_conntrack（很老的内核）
+          if sudo test -r /proc/net/ip_conntrack; then
+            echo "  [ok] /proc/net/ip_conntrack 可读（legacy 路径）"
+          else
+            echo "  [--] /proc/net/ip_conntrack 不存在"
+          fi
+          # 3) conntrack CLI（仅用于诊断，本程序不依赖它）
+          if sudo conntrack -L -o extended >/dev/null 2>&1; then
+            echo "  [ok] conntrack CLI 可用（诊断用；产品代码不依赖）"
+          else
+            echo "  [--] conntrack CLI 不可用"
+          fi
+          echo "nf_conntrack_acct=$(sudo sysctl -n net.netfilter.nf_conntrack_acct 2>/dev/null || echo '?')"
+          echo "ct=$CT_OK" >> "$GITHUB_OUTPUT"
+          if [ "$CT_OK" != "true" ]; then
+            echo "::warning::runner 上 /proc/net/nf_conntrack 不可读 —— 在线 IP / IP 限制的真实数据面 E2E 无法在此环境验证（parser / policy / slot 状态机由单元测试完整覆盖）"
           fi
           if sudo nft list tables >/dev/null 2>&1 && sudo ip netns add nff-cap-probe 2>/dev/null; then
             sudo ip netns del nff-cap-probe

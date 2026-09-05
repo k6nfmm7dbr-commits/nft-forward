@@ -52,10 +52,6 @@ type Server struct {
 	// entry 是随机入口路径（形如 "/3e4f65a8c24d2bd5b9e80147"，无尾斜杠）。
 	entry string
 
-	// hostIP 是本机对外 IP（启动时探测一次），仅供展示「监听 IP」字段。
-	// 不是 nft 数据面配置——规则本身仍由 fib daddr type local 作用于所有本机地址。
-	hostIP string
-
 	// SSE 订阅。
 	subsMu sync.Mutex
 	subs   map[chan []byte]struct{}
@@ -86,7 +82,6 @@ func New(cfg *config.Config, db *database.DB, store *forward.Store, pol *policy.
 		rules:      rules,
 		collect:    collect,
 		entry:      cfg.EntryRoute(),
-		hostIP:     detectHostIP(),
 		subs:       map[chan []byte]struct{}{},
 		deprecated: map[string]time.Time{},
 		started:    time.Now(),
@@ -127,9 +122,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// healthz：仅 loopback 可见。外部访问与其它未知路径同样得到极简 404 ——
 	// 公网扫描器无法通过裸 /healthz 确认这是一个真实管理服务。
+	//
+	// ★ 语义（v0.3.2）：200 不再只代表「Go HTTP 线程活着」，而是
+	// 「进程已完成首轮 nft 数据面 enforcement」。数据面未就绪时返回 503，
+	// 这样安装器/升级器的健康确认不会把「HTTP 活着但转发没加载」当成成功。
 	if route == "/healthz" {
 		if !isLoopback(r) {
 			notFound(w, r)
+			return
+		}
+		if !s.dataPlaneReady() {
+			s.send(w, r, http.StatusServiceUnavailable,
+				"application/json; charset=utf-8", []byte(`{"ok":false,"reason":"data plane not ready"}`))
 			return
 		}
 		s.send(w, r, http.StatusOK, "application/json; charset=utf-8", []byte(`{"ok":true}`))
@@ -254,13 +258,18 @@ func (s *Server) logDeprecated(field string) {
 	}
 }
 
-// listenAddr 返回给前端展示用的「监听 IP」。
-// 启动时探测到的本机对外 IP，失败时回退 "0.0.0.0"。
-func (s *Server) listenAddr() string {
-	if s.hostIP == "" {
-		return "0.0.0.0"
+// dataPlaneReady 报告 nft 数据面是否已完成首轮 enforcement。
+//
+// 判据取自 policy 层的 Ready()（首轮 reconcile 成功即置位），
+// 而不是「HTTP goroutine 是否活着」。
+//
+// 刻意**不**把运行期偶发的 reconcile 失败算作未就绪：那属于 degraded，
+// 不该让 systemd 反复重启整个服务。安装/升级关心的是「首轮是否成功」。
+func (s *Server) dataPlaneReady() bool {
+	if s.policy == nil {
+		return false
 	}
-	return s.hostIP
+	return s.policy.Ready()
 }
 
 // ---- 静态资源 ----
@@ -429,28 +438,4 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
-}
-
-// detectHostIP 探测本机对外 IP（仅供展示「监听 IP」字段用）。
-//
-// 实现：开一个 UDP socket "连接" 1.1.1.1:80（不发任何数据），内核会选出去
-// 那一侧的本地 IP，再关闭 socket。零网络流量、可在受限网络下失败（返回空串）。
-//
-// 注意：探测结果并不决定 nft 规则行为——规则本身由 fib daddr type local
-// 作用于所有本机地址。这里只是给面板一个「客户端该连哪个 IP」的人话展示。
-func detectHostIP() string {
-	conn, err := net.Dial("udp", "1.1.1.1:80")
-	if err != nil {
-		return ""
-	}
-	defer conn.Close()
-	local, ok := conn.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		return ""
-	}
-	ip := local.IP
-	if v4 := ip.To4(); v4 != nil {
-		return v4.String()
-	}
-	return ip.String()
 }

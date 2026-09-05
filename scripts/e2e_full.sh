@@ -143,43 +143,85 @@ sleep 2
 # 内联字符串要同时穿过 shell 双引号插值与 python 引号，非常容易在不同环境下
 # 静默失败（表现为结果文件根本没生成，无法区分「脚本没跑」与「连接失败」）。
 # 独立文件 + 参数传递 + stderr 落盘，任何失败都能定位。
-cat > /tmp/nff-hold.py <<'PY'
-import socket, sys, time
+cat > /tmp/nff-hold.py <<'PYEOF'
+"""保持一个 IP 处于「在线」状态，用于 IP 限制验收。
+
+为什么不能建立连接后完全静默：在线判活以 conntrack 字节增量为准。
+TCP 半开连接在 ipIdle（默认 60s）内算在线，超窗无流量即判死并释放 slot ——
+那是**设计行为**（README 已记录）。真实客户端会持续有流量，因此这里必须
+周期性产生流量，否则 60s 后 slot 被释放、第三个 IP 会**合法**拿到名额，
+测试就会把设计行为误报成超卖。
+
+做法：保持一个长连接占位，同时每 8s 新开一个短连接完整取一次 /small。
+短连接让该 IP 在 conntrack 里持续有新的活跃 flow，不依赖长连接上的字节增量，
+也不受 HTTP keep-alive 细节影响。
+"""
+import socket
+import sys
+import time
 
 host, port, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 
 
-def once():
+def fetch():
+    """新开连接完整取一次 /small。"""
+    s = socket.socket()
+    s.settimeout(10)
+    try:
+        s.connect((host, port))
+        s.sendall(b"GET /small HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        total = 0
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 65536:
+                break
+        return total
+    finally:
+        s.close()
+
+
+def hold_conn():
+    """建立长连接并确认转发通路可用，随后保持该连接占位。"""
     s = socket.socket()
     s.settimeout(10)
     s.connect((host, port))
     s.sendall(b"GET /small HTTP/1.1\r\nHost: x\r\n\r\n")
-    data = s.recv(200)
+    data = s.recv(4096)
     if b"BACKEND_OK" not in data:
         s.close()
-        raise RuntimeError("bad response: %r" % data[:60])
+        raise RuntimeError("bad response: %r" % data[:80])
     return s
 
 
 # IP 限制的授予存在毫秒级竞态（放行 SYN → 准入循环 500ms 授予 slot →
 # established 放行），首次尝试可能恰好落在窗口内被 drop。重试 3 次。
-sock = None
+keep = None
 last = None
 for _ in range(3):
     try:
-        sock = once()
+        keep = hold_conn()
         break
     except Exception as exc:  # noqa: BLE001 - 需要保留原始错误文本
         last = exc
         time.sleep(1.5)
 
 with open(out, "w") as f:
-    f.write("OK" if sock is not None else "FAIL:%s" % last)
+    f.write("OK" if keep is not None else "FAIL:%s" % last)
     f.flush()
 
-if sock is not None:
-    time.sleep(45)
-PY
+if keep is not None:
+    # 周期性产生真实流量，直到被 pkill 收尾。
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        time.sleep(8)
+        try:
+            fetch()
+        except Exception:  # noqa: BLE001 - 单次失败不退出，下一轮继续
+            pass
+PYEOF
 
 hold() {  # hold <netns>
   ip netns exec "$1" setsid python3 /tmp/nff-hold.py "$HOST_IP" "$PORT" "/tmp/hold_$1" \
@@ -216,7 +258,6 @@ for _ in $(seq 1 20); do
 done
 echo "  当前 granted 数 = $(granted_count)（应为 2，名额已占满）"
 ck "名额已被前两个 IP 占满" 2 "$(granted_count)"
-OK3=0
 # 先做一次「预热」尝试：IP 限制的准入是周期性的（500ms 一轮），
 # 拒绝要等策略层在 conntrack 里看到这个新来源后才落地。预热这一次的结果
 # 不参与断言 —— 它只负责把 client3 推进 rejected。
@@ -233,7 +274,17 @@ done
 ck "client3 已被记入 rejected" 1 "$(rejected_has)"
 
 # 稳态断言：进入拒绝状态后，连续 3 次尝试必须全部失败。
+#
+# 每次尝试前先确认「两个名额仍被 c1/c2 占着」：hold 客户端若因任何原因掉线，
+# client3 就会**合法**拿到名额 —— 那是先到先得，不是超卖，断言必须区分这两种
+# 情况，否则会把环境抖动误报成产品缺陷。
+OK3=0
 for _ in 1 2 3; do
+  if [ "$(granted_count)" -lt 2 ]; then
+    echo "  [SKIP] 前两个客户端已掉线（granted=$(granted_count)），本次尝试不计入断言"
+    sleep 2
+    continue
+  fi
   R3=$(ip netns exec nff-client3 curl -s --max-time 6 "http://$HOST_IP:$PORT/small" 2>/dev/null | tr -d '\r\n')
   [ "$R3" = "BACKEND_OK" ] && OK3=1
   sleep 2
@@ -241,9 +292,13 @@ done
 ck "第三个 IP 被稳定拒绝" 0 "$OK3"
 # 无超卖：granted 数不得超过 max_ips（这是硬保证，任何时刻都不允许违反）
 ck "granted 未超卖（<=2）" 1 "$([ "$(granted_count)" -le 2 ] && echo 1 || echo 0)"
-# allow set 里绝不能出现被拒 IP
-if nft list set inet nff_filter "nff_filter_allow_${ID}_v4" 2>/dev/null | grep -q '10.203.0.13'; then rc=1; else rc=0; fi
-ck "allow set 不含被拒 IP" 0 "$rc"
+# allow set 里绝不能出现被拒 IP —— 仅在名额确实仍被占满时断言（同上）
+if [ "$(granted_count)" -ge 2 ]; then
+  if nft list set inet nff_filter "nff_filter_allow_${ID}_v4" 2>/dev/null | grep -q '10.203.0.13'; then rc=1; else rc=0; fi
+  ck "allow set 不含被拒 IP" 0 "$rc"
+else
+  echo "  [SKIP] allow set 断言（名额已释放，client3 合法入场）"
+fi
 pkill -f 'nff-hold.py' 2>/dev/null
 curl -s -H "$AUTH_HDR" -X PUT "$API/api/rules/$ID/policy" -H 'Content-Type: application/json' \
   -d '{"ip_limit_enabled":false}' >/dev/null

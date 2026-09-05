@@ -224,6 +224,9 @@ func GenStructScript(g *GenInput, ex *Existing) string {
 }
 
 // genNATStruct 生成一个族的 NAT 表结构（幂等 add + flush chain + 规则）。
+//
+// 链内规则一律由 natIntents 渲染 —— 与自愈内容校验用的期望签名同源，
+// 避免「脚本改了、期望没改」造成的无限重建或永久漏检。
 func genNATStruct(family, table string, targets []dnatTarget) string {
 	var b strings.Builder
 	marks := MarksSet(table)
@@ -255,22 +258,16 @@ func genNATStruct(family, table string, targets []dnatTarget) string {
 		}
 		fmt.Fprintf(&b, "add element %s %s %s { %s }\n", family, table, marks, strings.Join(ids, ", "))
 
-		for _, t := range targets {
-			r := t.rule
-			target := fmt.Sprintf("%s:%d", t.addr, r.TargetPort)
-			if strings.Contains(t.addr, ":") {
-				target = fmt.Sprintf("[%s]:%d", t.addr, r.TargetPort) // IPv6 需方括号
-			}
-			for _, p := range ruleProtos(r) {
-				// fib daddr type local 必须在最前：先确认「发给本机」，
-				// 再看端口，最后打 ct mark 并 DNAT。
-				fmt.Fprintf(&b,
-					"add rule %s %s %s fib daddr type local %s dport %d ct mark set %d dnat to %s\n",
-					family, table, pre, p, r.ListenPort, r.ID, target)
-			}
+		preIntents, postIntents := natIntents(family, table, targets)
+		for _, in := range preIntents {
+			b.WriteString(in.render())
+			b.WriteByte('\n')
 		}
 		// 只对本程序 DNAT 过的连接做 masquerade。
-		fmt.Fprintf(&b, "add rule %s %s %s ct mark @%s masquerade\n", family, table, post, marks)
+		for _, in := range postIntents {
+			b.WriteString(in.render())
+			b.WriteByte('\n')
+		}
 	}
 	b.WriteString("\n")
 	return b.String()
@@ -301,26 +298,15 @@ func genFilterStruct(g *GenInput, ex *Existing) string {
 	fmt.Fprintf(&b, "flush chain inet %s %s\n", TableFilter, fwd)
 
 	// 3) 重建规则。
-	//    配额阻断放最前：被阻断的流量不计入用量（否则用量会继续虚增）。
-	fmt.Fprintf(&b, "add rule inet %s %s ct mark @%s drop\n", TableFilter, fwd, SetQuotaBlock)
-	for _, r := range all {
-		st := g.stateOf(r.ID)
-		fmt.Fprintf(&b, "add rule inet %s %s ct mark %d ct direction original counter name \"%s\"\n",
-			TableFilter, fwd, r.ID, CounterUp(r.ID))
-		fmt.Fprintf(&b, "add rule inet %s %s ct mark %d ct direction reply counter name \"%s\"\n",
-			TableFilter, fwd, r.ID, CounterDown(r.ID))
-		if st != nil && st.IPLimitEnabled {
-			// ★ 必须限定 `ct direction original`：
-			// FORWARD 链同时看到往返两个方向。reply 方向的 saddr 是**后端目标**
-			// 的地址，它永远不在客户端 allow set 里 —— 若不限定方向，返回包会被
-			// 无条件 drop，启用 IP 限制等于彻底切断转发。
-			// 只 drop「已建立 + original 方向 + 源不在 allow set」的包；SYN
-			// (ct state new) 放行，这样 conntrack 才能看到候选 IP。
-			fmt.Fprintf(&b, "add rule inet %s %s ct mark %d ct direction original ct state established ip saddr != @%s drop\n",
-				TableFilter, fwd, r.ID, AllowSetV4(r.ID))
-			fmt.Fprintf(&b, "add rule inet %s %s ct mark %d ct direction original ct state established ip6 saddr != @%s drop\n",
-				TableFilter, fwd, r.ID, AllowSetV6(r.ID))
-		}
+	//
+	//    顺序由 filterIntents 决定：配额阻断在最前（被阻断的流量不计入用量，
+	//    否则用量会继续虚增），随后每条规则的 up/down counter，
+	//    最后是启用 IP 限制的规则的 v4/v6 drop。
+	//
+	//    渲染与自愈期望签名同源（见 internal/nft/intent.go）。
+	for _, in := range filterIntents(g) {
+		b.WriteString(in.render())
+		b.WriteByte('\n')
 	}
 
 	// 4) 清理遗留对象（规则被删除/关闭 IP 限制后残留的 counter 与 set）。

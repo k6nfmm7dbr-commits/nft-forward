@@ -72,11 +72,29 @@ func Serve() int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// 启动立即 reconcile 一次（恢复 nft 期望状态）。
-	if err := pol.Reconcile(ctx); err != nil {
-		slog.Warn("首次 reconcile 失败", "err", err)
+	// ---- HTTP 先起来，但此刻数据面尚未就绪 ----
+	//
+	// 顺序刻意是「先 Serve，再做首轮 reconcile」：
+	//   · 先 Serve → /healthz 能立刻应答，安装器/systemd 不会因连不上而误判；
+	//   · 但在首轮 reconcile 成功之前 /healthz 返回 503（见 api.Server.Ready），
+	//     因此「HTTP 活着但转发数据面没加载」不会被当成健康。
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- hs.Serve(ln) }()
+	slog.Info("HTTP 已监听（数据面就绪前 /healthz 返回 503）", "listen", addr)
+
+	// ---- 首轮数据面 enforcement：成功才算 ready ----
+	//
+	// 带重试：nftables 在开机早期可能短暂不可用（模块尚未加载完），
+	// 一次失败就判死会让安装/升级无谓失败。重试仍失败则保持未就绪
+	// （healthz 503），由周期 reconcile 继续尝试自愈。
+	//
+	// conntrack 不可用**不影响**这里：结构 enforcement（DNAT/counter/quota）
+	// 不依赖 conntrack，只有 IP slot 会进入冻结状态。
+	if reconcileWithRetry(ctx, pol) {
+		slog.Info("数据面就绪（首轮 nft enforcement 成功）", "entry", cfg.EntryRoute()+"/")
 	} else {
-		slog.Info("策略系统就绪")
+		slog.Error("首轮 nft enforcement 失败：数据面未就绪，/healthz 将返回 503；" +
+			"周期 reconcile 会继续尝试恢复")
 	}
 
 	// 首轮采集立即执行一次：让 collector 的 LiveDelta 尽快就绪，
@@ -92,7 +110,7 @@ func Serve() int {
 
 	// 策略周期 reconcile（一致性自愈 + 配额事件兜底 + IP 准入）。
 	// 500ms 是为了缩短「连接已建立但 slot 未授予」的竞态窗口。
-	// reconcile 只在结构变化时重写 nft 链，稳定期只做元素增量，
+	// reconcile 只在结构/内容漂移时重写 nft 链，稳定期只做元素增量，
 	// 因此高频运行不会清零流量 counter。
 	polCtx, polCancel := context.WithCancel(ctx)
 	defer polCancel()
@@ -107,11 +125,6 @@ func Serve() int {
 	snapCtx, snapCancel := context.WithCancel(ctx)
 	defer snapCancel()
 	go runSnapshotPublisher(snapCtx, srv, 2*time.Second)
-
-	slog.Info("面板已启动", "listen", addr, "entry", cfg.EntryRoute()+"/")
-
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- hs.Serve(ln) }()
 
 	select {
 	case <-ctx.Done():
@@ -135,6 +148,32 @@ func Serve() int {
 		slog.Warn("HTTP 关闭超时", "err", err)
 	}
 	return 0
+}
+
+// initialReconcileAttempts 是首轮数据面 enforcement 的尝试次数。
+//
+// 开机早期 nftables 内核模块可能尚未完全就绪（systemd 的 After= 只保证
+// 网络目标，不保证 nf_tables 已加载）。一次失败就判死会让安装/升级无谓失败，
+// 因此重试若干次；仍失败则保持未就绪状态（healthz 503），交给周期 reconcile。
+const initialReconcileAttempts = 5
+
+// reconcileWithRetry 反复尝试首轮 reconcile，成功返回 true。
+func reconcileWithRetry(ctx context.Context, pol *policy.Service) bool {
+	for i := 0; i < initialReconcileAttempts; i++ {
+		if err := pol.Reconcile(ctx); err == nil {
+			return true
+		} else if i == initialReconcileAttempts-1 {
+			slog.Error("首轮 nft enforcement 失败", "attempts", initialReconcileAttempts, "err", err)
+		} else {
+			slog.Warn("首轮 nft enforcement 失败，稍后重试", "attempt", i+1, "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(time.Duration(i+1) * time.Second):
+		}
+	}
+	return false
 }
 
 func runCollector(ctx context.Context, c *traffic.Collector, interval time.Duration) {
