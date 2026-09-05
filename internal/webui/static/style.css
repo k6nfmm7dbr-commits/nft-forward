@@ -1,5 +1,4 @@
-/* NFT Forward Panel — Graphite UI（视觉与 SBX 面板完全统一）
-   Pure visual layer: all JS ids, data-* hooks and state classes stay unchanged. */
+/* 面板样式表 —— Graphite UI（纯视觉层：所有 JS id / data-* 钩子与状态类保持不变） */
 :root {
   --bg: #0c0e11;
   --surface: #15181d;
@@ -439,7 +438,7 @@ select { padding-right: 31px; background-image: linear-gradient(45deg,transparen
   * { animation: none !important; transition: none !important; }
 }
 
-/* ===== NFT Forward 专有补充（转发规则场景需要，SBX 无对应元素） ===== */
+/* ===== 转发规则场景专有补充 ===== */
 
 /* 规则卡片的「目标」行：域名/IPv6 可能很长，允许换行不撑破卡片 */
 .rule-target { display: flex; align-items: baseline; gap: 6px; margin-top: 6px; min-width: 0; }

@@ -199,6 +199,11 @@ if grep -qE "fetch\('/api|EventSource\('/api|new URL\('/api" "$FE/app.js"; then 
 ck "前端不使用绝对 /api 路径" 0 "$rc"
 grep -q "credentials: 'same-origin'" "$FE/app.js"; ck "前端请求带同源凭据" 0 $?
 grep -q "r.status === 401" "$FE/app.js"; ck "前端 401 时回登录页" 0 $?
+# 未认证即可取得的资源（style.css / login.html / login.js）不得含产品指纹
+for f in style.css login.html login.js; do
+  if grep -inE 'nft.?forward|nftables|nff_' "$FE/$f" >/dev/null 2>&1; then rc=1; else rc=0; fi
+  ck "未认证可取资源 $f 无产品指纹" 0 "$rc"
+done
 grep -q 'config-ensure-token' "$ROOT/cmd/nft-forward/main.go"; ck "CLI 提供 config-ensure-token" 0 $?
 grep -q 'func EnsureToken' "$ROOT/internal/config/config.go"; ck "config 实现 EnsureToken" 0 $?
 grep -q 'tokenBytes = 16' "$ROOT/internal/config/config.go"; ck "令牌 16 bytes → 32 hex" 0 $?
