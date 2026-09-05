@@ -88,6 +88,36 @@ ck "install_core 校验 candidate 版本与 APP_VERSION 一致" 0 $?
 grep -q '现有安装未被改动' "$TMPD/ic.sh"; ck "install_core 失败路径明示未改动现有安装" 0 $?
 grep -q 'CORE_BIN.bak' "$TMPD/ic.sh"; ck "install_core 替换前备份旧二进制" 0 $?
 grep -q 'mv -f "\$dl" "\$CORE_BIN"' "$TMPD/ic.sh"; ck "install_core 原子 rename 替换" 0 $?
+# ★ 备份不得在替换成功后立即删除：升级要到健康检查全过才允许删（可回滚的前提）
+if grep -q 'rm -f "\$CORE_BIN.bak"' "$TMPD/ic.sh"; then rc=1; else rc=0; fi
+ck "install_core 不提前删除旧二进制备份" 0 "$rc"
+grep -q 'CORE_BACKUP=' "$TMPD/ic.sh"; ck "install_core 导出备份路径供回滚使用" 0 $?
+
+# ---- 3b. start_service：三重健康确认，绝不假成功 ----
+sed -n '/^# >>> start-service/,/^# <<< start-service/p' "$TPL" > "$TMPD/ss.sh"
+grep -q 'panel_running' "$TMPD/ss.sh"; ck "start_service 检查服务 active" 0 $?
+grep -q 'health_check' "$TMPD/ss.sh"; ck "start_service 做本机 HTTP 健康检查" 0 $?
+grep -q '127.0.0.1' "$TMPD/ss.sh"; ck "健康检查走 127.0.0.1（healthz 仅 loopback）" 0 $?
+grep -q 'config_ready' "$TMPD/ss.sh"; ck "提供配置就绪校验" 0 $?
+grep -q 'entry_path' "$TMPD/ss.sh"; ck "配置校验含随机入口路径" 0 $?
+grep -q 'token' "$TMPD/ss.sh"; ck "配置校验含访问令牌" 0 $?
+CODE_SS="$TMPD/ss_code.sh"
+sed -e 's/#.*$//' "$TMPD/ss.sh" > "$CODE_SS"
+# `curl ... || true` 是有意为之：健康检查要在循环里重试，单次失败不能让
+# `set -e` 直接终止脚本。真正禁止的是「服务启动/回滚等关键动作被 || true 吞掉」。
+if grep -vE 'curl ' "$CODE_SS" | grep -qE '\|\| *true'; then rc=1; else rc=0; fi
+ck "start_service 关键动作无 || true 吞错" 0 "$rc"
+
+# ---- 3c. do_install：失败不打印「安装完成」 ----
+sed -n '/^# >>> do-install/,/^# <<< do-install/p' "$TPL" > "$TMPD/di.sh"
+grep -q 'ensure_panel_conf || die' "$TMPD/di.sh"; ck "do_install 配置初始化失败即中止" 0 $?
+grep -q 'if ! start_service; then' "$TMPD/di.sh"; ck "do_install 检查服务启动结果" 0 $?
+grep -q '安装未完成' "$TMPD/di.sh"; ck "do_install 失败时明确报错" 0 $?
+if grep -qE 'start_service *\|\| *true' "$TMPD/di.sh"; then rc=1; else rc=0; fi
+ck "do_install 无 start_service || true" 0 "$rc"
+# 「安装完成」必须出现在 start_service 检查之后
+if awk '/if ! start_service; then/{seen=1} /ok "安装完成"/{if(!seen) bad=1} END{exit bad?1:0}' "$TMPD/di.sh"; then rc=0; else rc=1; fi
+ck "「安装完成」只在健康确认通过后打印" 0 "$rc"
 
 # ---- 4. do_update：脚本相同也检查二进制 ----
 sed -n '/^# >>> do-update/,/^# <<< do-update/p' "$TPL" > "$TMPD/du.sh"
@@ -96,13 +126,42 @@ grep -q 'CORE_REPLACED' "$TMPD/du.sh"; ck "do_update 依据 CORE_REPLACED 决定
 grep -q 'bash -n "\$tmp"' "$TMPD/du.sh"; ck "do_update 下载后做语法校验" 0 $?
 grep -q 'SELF_PATH.bak' "$TMPD/du.sh"; ck "do_update 升级前备份本体" 0 $?
 grep -q '回滚失败' "$TMPD/du.sh"; ck "do_update 回滚失败不被吞掉" 0 $?
+# 回滚后必须重新确认服务健康，而不是无条件宣称「已恢复」
+grep -q 'panel_running && health_check' "$TMPD/du.sh"; ck "do_update 回滚后验证服务健康" 0 $?
+if grep -qE 'apply-update[^|]*\|\| *true' "$TMPD/du.sh"; then rc=1; else rc=0; fi
+ck "do_update 回滚不 || true 吞错" 0 "$rc"
 
-# ---- 5. apply_update：保留用户数据 + nft 硬依赖 ----
+# ---- 5. apply_update：保留用户数据 + nft 硬依赖 + 真正可回滚 ----
 sed -n '/^# >>> apply-update/,/^# <<< apply-update/p' "$TPL" > "$TMPD/au.sh"
 grep -q 'nft list tables' "$TMPD/au.sh"; ck "apply_update 探测 nft 真实可用性" 0 $?
-grep -q 'config-migrate' "$TMPD/au.sh"; ck "apply_update 清理废弃配置键" 0 $?
+grep -q 'ensure_panel_conf' "$TMPD/au.sh"; ck "apply_update 迁移/补齐配置" 0 $?
 if grep -qE 'rm -[rf]+ .*(traffic\.db|panel\.json)' "$TMPD/au.sh"; then rc=1; else rc=0; fi
 ck "apply_update 绝不删除 traffic.db / panel.json" 0 "$rc"
+grep -q 'PANEL_CONF.bak' "$TMPD/au.sh"; ck "apply_update 备份 panel.json" 0 $?
+grep -q 'core_rollback' "$TMPD/au.sh"; ck "apply_update 失败调用回滚" 0 $?
+grep -q 'core_backup_commit' "$TMPD/au.sh"; ck "apply_update 成功后才提交（删备份）" 0 $?
+grep -q 'selftest' "$TMPD/au.sh"; ck "apply_update 升级后跑 selftest" 0 $?
+# 备份提交必须在健康检查与 selftest 之后
+if awk '/selftest/{seen=1} /core_backup_commit/{if(!seen) bad=1} END{exit bad?1:0}' "$TMPD/au.sh"; then rc=0; else rc=1; fi
+ck "备份仅在 selftest 通过后删除" 0 "$rc"
+# 回滚实现：恢复二进制 + 恢复配置 + 重启并验证
+grep -q 'mv -f "\$CORE_BACKUP" "\$CORE_BIN"' "$TMPD/au.sh"; ck "回滚恢复旧二进制" 0 $?
+grep -q 'cp -p "\$CONF_BACKUP" "\$PANEL_CONF"' "$TMPD/au.sh"; ck "回滚恢复旧配置（端口/令牌/入口）" 0 $?
+grep -q 'if start_service; then' "$TMPD/au.sh"; ck "回滚后重启并验证旧服务" 0 $?
+grep -q '已回滚到升级前版本' "$TMPD/au.sh"; ck "确认恢复成功才提示已回滚" 0 $?
+grep -q '回滚未完成' "$TMPD/au.sh"; ck "回滚失败明确报错" 0 $?
+if grep -qE 'core_rollback[^|]*\|\| *true' "$TMPD/au.sh"; then rc=1; else rc=0; fi
+ck "回滚不被 || true 吞掉" 0 "$rc"
+
+# ---- 5b. ensure_panel_conf：三项安全字段 fail-closed ----
+grep -q 'config-ensure-all' "$TPL"; ck "安装器调用 config-ensure-all" 0 $?
+if grep -qE 'config-ensure-(all|token|port|entry)[^|]*\|\| *true' "$TPL"; then rc=1; else rc=0; fi
+ck "config-ensure 错误不被吞掉" 0 "$rc"
+sed -n '/^ensure_panel_conf()/,/^}/p' "$TPL" > "$TMPD/epc.sh"
+grep -q '配置已损坏' "$TMPD/epc.sh"; ck "配置损坏时明确报错" 0 $?
+grep -q '原文件未被改动' "$TMPD/epc.sh"; ck "配置损坏时不覆盖原文件" 0 $?
+grep -q 'chmod 600' "$TMPD/epc.sh"; ck "panel.json 收紧到 0600" 0 $?
+grep -q 'config_ready' "$TMPD/epc.sh"; ck "初始化后校验三项齐备" 0 $?
 
 # ---- 6. 安全边界（剥注释与字符串字面量后检查）----
 # 为什么要剥字符串：提示文案里会出现 "可手工执行: nft delete table ..." 这类

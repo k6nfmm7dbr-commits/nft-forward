@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>登录</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="login-body">
+<div class="login">
+  <div class="brand-mark" aria-hidden="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11l-3-3M20 17H9l3 3"/></svg>
+  </div>
+  <h1>访问验证</h1>
+  <p>请输入访问令牌</p>
+  <div class="err" id="err"></div>
+  <form method="post" action="login">
+    <input type="password" name="token" placeholder="访问令牌" autocomplete="current-password"
+           autofocus required aria-label="访问令牌" maxlength="128">
+    <button type="submit">进入</button>
+  </form>
+</div>
+<script src="login.js"></script>
+</body>
+</html>

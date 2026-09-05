@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"database/sql"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -52,6 +54,9 @@ type FullSnapshot struct {
 }
 
 // buildFullSnapshot 构建全量快照。
+//
+// 流量数据一次性批量读取（totals 一条 SQL、daily 一条 SQL），不再对每条规则
+// 各发一次 QueryRow —— 规则多时那是明显的 N+1。
 func (s *Server) buildFullSnapshot() FullSnapshot {
 	ctx := context.Background()
 	rules, _ := s.store.ListActive(ctx)
@@ -64,6 +69,13 @@ func (s *Server) buildFullSnapshot() FullSnapshot {
 		today = time.Unix(collectStatus.LastOK, 0).In(s.collect.Location()).Format("2006-01-02")
 	}
 
+	ids := make([]int64, 0, len(rules))
+	for _, r := range rules {
+		ids = append(ids, r.ID)
+	}
+	totals := s.totalsBatch(ctx, ids)
+	daily := s.dailyBatch(ctx, ids, today)
+
 	for _, r := range rules {
 		v := RuleView{Rule: *r}
 		v.Status = ruleStatus(r, polStates[r.ID])
@@ -72,8 +84,12 @@ func (s *Server) buildFullSnapshot() FullSnapshot {
 		if rate, ok := collectStatus.Rates[r.ID]; ok {
 			v.Rate = rate
 		}
-		v.TotalUp, v.TotalDown = s.totals(ctx, r.ID)
-		v.TodayUp, v.TodayDown = s.dailyFor(ctx, r.ID, today)
+		if t, ok := totals[r.ID]; ok {
+			v.TotalUp, v.TotalDown = t.up, t.down
+		}
+		if d, ok := daily[r.ID]; ok {
+			v.TodayUp, v.TodayDown = d.up, d.down
+		}
 		if ps, ok := polStates[r.ID]; ok {
 			v.ActiveIPs = ps.IPs.GrantedCount
 			v.ConnTCP = ps.ConnTCP
@@ -120,19 +136,84 @@ func ruleStatus(r *forward.Rule, ps *policy.RuleState) string {
 	return "normal"
 }
 
-func (s *Server) totals(ctx context.Context, ruleID int64) (int64, int64) {
-	var up, down int64
-	_ = s.db.QueryRowContext(ctx, "SELECT upload_bytes,download_bytes FROM traffic_totals WHERE rule_id=?", ruleID).Scan(&up, &down)
-	return up, down
+// bytesPair 是一对上传/下载字节。
+type bytesPair struct{ up, down int64 }
+
+// totalsBatch 一次读取多条规则的累计流量（避免 per-rule QueryRow 的 N+1）。
+//
+// SQL 参数化：占位符按 id 数量生成，值全部走 args，绝不拼接字面量。
+func (s *Server) totalsBatch(ctx context.Context, ids []int64) map[int64]bytesPair {
+	out := make(map[int64]bytesPair, len(ids))
+	if len(ids) == 0 {
+		return out
+	}
+	q := "SELECT rule_id,upload_bytes,download_bytes FROM traffic_totals WHERE rule_id IN (" +
+		placeholders(len(ids)) + ")"
+	rows, err := s.db.QueryContext(ctx, q, int64Args(ids)...)
+	if err != nil {
+		s.logError("批量读取累计流量失败", err)
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var up, down sql.NullInt64
+		if err := rows.Scan(&id, &up, &down); err != nil {
+			s.logError("解析累计流量失败", err)
+			return out
+		}
+		out[id] = bytesPair{up: up.Int64, down: down.Int64}
+	}
+	if err := rows.Err(); err != nil {
+		s.logError("批量读取累计流量失败", err)
+	}
+	return out
 }
 
-func (s *Server) dailyFor(ctx context.Context, ruleID int64, day string) (int64, int64) {
-	if day == "" {
-		return 0, 0
+// dailyBatch 一次读取多条规则在某一天的流量。
+func (s *Server) dailyBatch(ctx context.Context, ids []int64, day string) map[int64]bytesPair {
+	out := make(map[int64]bytesPair, len(ids))
+	if len(ids) == 0 || day == "" {
+		return out
 	}
-	var up, down int64
-	_ = s.db.QueryRowContext(ctx, "SELECT upload_bytes,download_bytes FROM traffic_daily WHERE rule_id=? AND day=?", ruleID, day).Scan(&up, &down)
-	return up, down
+	q := "SELECT rule_id,upload_bytes,download_bytes FROM traffic_daily WHERE day=? AND rule_id IN (" +
+		placeholders(len(ids)) + ")"
+	args := append([]any{day}, int64Args(ids)...)
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		s.logError("批量读取今日流量失败", err)
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var up, down sql.NullInt64
+		if err := rows.Scan(&id, &up, &down); err != nil {
+			s.logError("解析今日流量失败", err)
+			return out
+		}
+		out[id] = bytesPair{up: up.Int64, down: down.Int64}
+	}
+	if err := rows.Err(); err != nil {
+		s.logError("批量读取今日流量失败", err)
+	}
+	return out
+}
+
+// placeholders 生成 "?,?,?" 形式的参数占位符。
+func placeholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+func int64Args(ids []int64) []any {
+	out := make([]any, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, id)
+	}
+	return out
 }
 
 // ---- 健康检查 ----
@@ -189,21 +270,28 @@ func (s *Server) buildHealth() HealthView {
 		UptimeSec: int64(time.Since(s.started).Seconds()),
 	}
 	// SQLite：一次极轻量查询确认可读写。
+	//
+	// 错误文本只保留归类结论，不回传原始 err（SQLite / nft 的错误串可能带
+	// 文件路径与内部细节，那是给日志的，不是给已登录用户看的）。
 	if err := s.db.PingContext(ctx); err != nil {
-		hv.DBError = err.Error()
+		s.logError("健康检查：数据库不可用", err)
+		hv.DBError = "数据库不可用"
 	} else if _, err := s.db.ExecContext(ctx,
 		"INSERT INTO meta(k,v) VALUES('health_probe',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
 		strconv.FormatInt(time.Now().Unix(), 10)); err != nil {
-		hv.DBError = err.Error()
+		s.logError("健康检查：数据库不可写", err)
+		hv.DBError = "数据库不可写"
 	} else {
 		hv.DBOK = true
 	}
 
 	// nft 命令可用性（只读探测，不改任何规则）。
 	if _, _, stderr, err := (nft.ExecRunner{}).Run(ctx, "nft", "list", "tables"); err != nil {
-		hv.NftError = err.Error()
+		s.logError("健康检查：nft 不可用", err)
+		hv.NftError = "nft 命令不可用"
 	} else if strings.TrimSpace(stderr) != "" {
-		hv.NftError = strings.TrimSpace(stderr)
+		slog.Warn("健康检查：nft 报错", "stderr", strings.TrimSpace(stderr))
+		hv.NftError = "nft 执行报错"
 	} else {
 		hv.NftOK = true
 	}
@@ -248,10 +336,6 @@ func (s *Server) buildHealth() HealthView {
 // ---- GET ----
 
 func (s *Server) handleAPIGet(w http.ResponseWriter, r *http.Request, route string) {
-	if !s.authorized(r) {
-		s.sendJSON(w, r, http.StatusUnauthorized, M{"error": "unauthorized"})
-		return
-	}
 	switch {
 	case route == "/api/healthz":
 		s.sendJSON(w, r, http.StatusOK, M{"ok": true})
@@ -371,12 +455,17 @@ func (s *Server) ruleView(ctx context.Context, id int64) (*RuleView, error) {
 	if rate, ok := s.collect.Snapshot().Rates[id]; ok {
 		v.Rate = rate
 	}
-	v.TotalUp, v.TotalDown = s.totals(ctx, id)
+	v.TotalUp, v.TotalDown = 0, 0
+	if t, ok := s.totalsBatch(ctx, []int64{id})[id]; ok {
+		v.TotalUp, v.TotalDown = t.up, t.down
+	}
 	today := ""
 	if cs := s.collect.Snapshot(); cs.LastOK > 0 {
 		today = time.Unix(cs.LastOK, 0).In(s.collect.Location()).Format("2006-01-02")
 	}
-	v.TodayUp, v.TodayDown = s.dailyFor(ctx, id, today)
+	if d, ok := s.dailyBatch(ctx, []int64{id}, today)[id]; ok {
+		v.TodayUp, v.TodayDown = d.up, d.down
+	}
 	if ps, ok := polStates[id]; ok {
 		v.ActiveIPs = ps.IPs.GrantedCount
 		v.ConnTCP = ps.ConnTCP
@@ -425,10 +514,6 @@ type DailyRow struct {
 // ---- POST ----
 
 func (s *Server) handleAPIPost(w http.ResponseWriter, r *http.Request, route string) {
-	if !s.authorized(r) {
-		s.sendJSON(w, r, http.StatusUnauthorized, M{"error": "unauthorized"})
-		return
-	}
 	if route == "/api/rules" {
 		s.createRule(w, r)
 		return
@@ -455,10 +540,6 @@ func (s *Server) handleAPIPost(w http.ResponseWriter, r *http.Request, route str
 // ---- PUT/DELETE ----
 
 func (s *Server) handleAPIMut(w http.ResponseWriter, r *http.Request, route string) {
-	if !s.authorized(r) {
-		s.sendJSON(w, r, http.StatusUnauthorized, M{"error": "unauthorized"})
-		return
-	}
 	rest := strings.TrimPrefix(route, "/api/rules/")
 	parts := strings.SplitN(rest, "/", 2)
 	id, err := strconv.ParseInt(parts[0], 10, 64)

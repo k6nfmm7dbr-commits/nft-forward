@@ -164,17 +164,18 @@ type PolicyInput struct {
 // ErrNotFound 表示规则不存在或已删除。
 var ErrNotFound = errors.New("规则不存在或已删除")
 
+// dnsConcurrency 是后台 DNS 刷新的并发上限。
+//
+// 上限的意义：域名规则可能有几十条，全部并发查询会瞬间打满 DNS 服务端与本机
+// socket；串行又会让一轮刷新耗时 = 规则数 × 超时。8 是折中值，配合 resolve
+// 层每次查询 5s 超时，最坏一轮 = ceil(N/8) × 5s，且全程不持任何锁。
+const dnsConcurrency = 8
+
 // Create 创建规则。返回落库后的正式规则（含最终监听端口与解析结果）。
+//
+// DNS 解析在**加锁之前**完成：它只依赖用户提交的目标地址，不需要看已有规则。
+// 这样一次域名解析超时（最长 5s）不会把其它规则的 CRUD 全部堵住。
 func (s *Service) Create(ctx context.Context, in CreateInput) (*forward.Rule, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	defer s.hold()()
-
-	existing, err := s.store.ListActive(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("读取规则列表失败: %w", err)
-	}
-
 	cand := &forward.Rule{
 		Name:          in.Name,
 		Enabled:       in.Enabled == nil || *in.Enabled,
@@ -191,6 +192,25 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*forward.Rule, er
 	if !forward.ValidPort(cand.TargetPort) {
 		return nil, fmt.Errorf("目标端口必须在 1-65535: %d", cand.TargetPort)
 	}
+
+	// 域名目标：创建时必须能解析出至少一个 A 或 AAAA，否则拒绝创建 ——
+	// 不给用户留下一条一开始就完全不工作的规则。（锁外执行）
+	var rstate resolve.State
+	if cand.IsDomainTarget() {
+		rstate = resolve.Resolve(ctx, s.resolver, cand.TargetAddress, resolve.State{}, s.now())
+		if rstate.Empty() {
+			return nil, fmt.Errorf("无法解析目标域名 %s：%s", cand.TargetAddress, rstate.Err)
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	defer s.hold()()
+
+	existing, err := s.store.ListActive(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("读取规则列表失败: %w", err)
+	}
 	if cand.ListenPort == 0 {
 		p, aerr := s.alloc.Allocate(cand, existing, s.guards())
 		if aerr != nil {
@@ -201,15 +221,8 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*forward.Rule, er
 	if err := forward.CheckConflicts(cand, existing, s.guards()); err != nil {
 		return nil, err
 	}
-
-	// 域名目标：创建时必须能解析出至少一个 A 或 AAAA，否则拒绝创建 ——
-	// 不给用户留下一条一开始就完全不工作的规则。
 	if cand.IsDomainTarget() {
-		st := resolve.Resolve(ctx, s.resolver, cand.TargetAddress, resolve.State{}, s.now())
-		if st.Empty() {
-			return nil, fmt.Errorf("无法解析目标域名 %s：%s", cand.TargetAddress, st.Err)
-		}
-		applyResolve(cand, st)
+		applyResolve(cand, rstate)
 	}
 
 	// 写库取 ID（nft 侧对象名依赖 ID）。
@@ -233,7 +246,25 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*forward.Rule, er
 }
 
 // Update 编辑规则（转发设置）。
+//
+// 与 Create 同理：新目标是域名时，DNS 解析在加锁前完成（只依赖用户输入），
+// 锁内只做校验、nft apply、落库。
 func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (*forward.Rule, error) {
+	// 锁外预解析：仅当调用方显式给了目标地址且它是域名。
+	var newTarget string
+	var pre *resolve.State
+	if in.TargetAddress != nil {
+		norm, _, terr := forward.NormalizeTarget(*in.TargetAddress)
+		if terr != nil {
+			return nil, terr
+		}
+		newTarget = norm
+		if forward.IsDomain(norm) {
+			st := resolve.Resolve(ctx, s.resolver, norm, resolve.State{}, s.now())
+			pre = &st
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	defer s.hold()()
@@ -264,27 +295,26 @@ func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (*forwar
 	}
 	targetChanged := false
 	if in.TargetAddress != nil {
-		norm, _, terr := forward.NormalizeTarget(*in.TargetAddress)
-		if terr != nil {
-			return nil, terr
-		}
-		targetChanged = norm != cur.TargetAddress
-		cand.TargetAddress = norm
+		targetChanged = newTarget != cur.TargetAddress
+		cand.TargetAddress = newTarget
 	}
 	if err := forward.CheckConflicts(&cand, existing, s.guards()); err != nil {
 		return nil, err
 	}
 
 	// 目标变了就重新解析：
-	//   · 新目标是域名 → 必须能解析（同创建语义）；
+	//   · 新目标是域名 → 必须能解析（同创建语义；结果来自锁外预解析）；
 	//   · 新目标是 IP  → 清空解析状态（IP 目标不需要 DNS）。
 	if targetChanged {
 		if cand.IsDomainTarget() {
-			st := resolve.Resolve(ctx, s.resolver, cand.TargetAddress, resolve.State{}, s.now())
-			if st.Empty() {
-				return nil, fmt.Errorf("无法解析目标域名 %s：%s", cand.TargetAddress, st.Err)
+			if pre == nil || pre.Empty() {
+				reason := "解析失败"
+				if pre != nil && pre.Err != "" {
+					reason = pre.Err
+				}
+				return nil, fmt.Errorf("无法解析目标域名 %s：%s", cand.TargetAddress, reason)
 			}
-			applyResolve(&cand, st)
+			applyResolve(&cand, *pre)
 		} else {
 			clearResolve(&cand)
 		}
@@ -386,63 +416,141 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 
 // RefreshDNS 对所有域名规则做一轮解析并在地址变化时同步 nft。
 //
+// ★ DNS 查询绝不在锁内进行（v0.3.1 收口）。旧实现全程持有 mu + enforcer 锁，
+// 一次 DNS 超时（5s）就会把所有规则 CRUD 卡死数秒到数十秒。现在分三段：
+//
+//  1. 加锁 → snapshot 需要解析的规则（域名 + 当前状态 + version 指纹）→ 解锁
+//  2. 锁外并发解析（A/AAAA 由 resolve 内部并行，规则之间受 dnsConcurrency 限流）
+//  3. 重新加锁 → 校验目标域名 / updated_at 未被用户改动 → 仍是当前版本才 apply
+//
 // 关键行为：
 //   - 只有 last-known-good 地址真正变化才走 nft 同步（避免无谓重写）；
 //   - DNS 临时失败保留旧地址（resolve.Resolve 已保证），只更新状态文本；
+//   - 解析期间用户改了目标或删除了规则 → 丢弃这条过期结果，绝不覆盖新值；
 //   - 解析状态字段用独立 SQL 写入，不触碰用户配置字段，不抬 updated_at；
 //   - 变化时走与 Web 变更完全相同的 apply 路径，因此 counter 不清零。
 //
 // 返回本轮发生地址变化的规则数。
 func (s *Service) RefreshDNS(ctx context.Context) (int, error) {
+	// ---- 阶段 1：锁内 snapshot ----
+	s.mu.Lock()
+	existing, err := s.store.ListActive(ctx)
+	if err != nil {
+		s.mu.Unlock()
+		return 0, err
+	}
+	type job struct {
+		id        int64
+		host      string
+		prev      resolve.State
+		updatedAt int64
+	}
+	var jobs []job
+	var clearIDs []int64
+	for _, r := range existing {
+		if !r.IsDomainTarget() {
+			// IP 目标：清掉可能残留的解析状态（例如从域名改成 IP 的旧数据）。
+			if r.ResolveStatus != "" || r.ResolvedV4 != "" || r.ResolvedV6 != "" {
+				clearIDs = append(clearIDs, r.ID)
+			}
+			continue
+		}
+		jobs = append(jobs, job{
+			id:        r.ID,
+			host:      r.TargetAddress,
+			updatedAt: r.UpdatedAt,
+			prev: resolve.State{V4: r.ResolvedV4, V6: r.ResolvedV6, At: r.ResolvedAt,
+				Status: r.ResolveStatus, Err: r.ResolveError},
+		})
+	}
+	s.mu.Unlock()
+
+	// IP 目标的解析状态清理不需要 DNS，直接写库（Update 只改解析列）。
+	for _, id := range clearIDs {
+		if err := s.store.UpdateResolved(ctx, id, "", "", 0, "", ""); err != nil {
+			slog.Warn("清理解析状态失败", "rule", id, "err", err)
+		}
+	}
+	if len(jobs) == 0 {
+		return 0, nil
+	}
+
+	// ---- 阶段 2：锁外并发解析 ----
+	type result struct {
+		id        int64
+		host      string
+		updatedAt int64
+		state     resolve.State
+	}
+	results := make([]result, len(jobs))
+	sem := make(chan struct{}, dnsConcurrency)
+	var wg sync.WaitGroup
+	now := s.now()
+	for i, jb := range jobs {
+		wg.Add(1)
+		go func(i int, jb job) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			st := resolve.Resolve(ctx, s.resolver, jb.host, jb.prev, now)
+			results[i] = result{id: jb.id, host: jb.host, updatedAt: jb.updatedAt, state: st}
+		}(i, jb)
+	}
+	wg.Wait()
+
+	// ---- 阶段 3：重新加锁，校验版本后应用 ----
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	defer s.hold()()
 
-	existing, err := s.store.ListActive(ctx)
+	current, err := s.store.ListActive(ctx)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("读取规则列表失败: %w", err)
 	}
-	changed := 0
-	next := make([]*forward.Rule, 0, len(existing))
-	type pending struct {
-		id    int64
-		state resolve.State
+	byID := make(map[int64]*forward.Rule, len(current))
+	for _, r := range current {
+		byID[r.ID] = r
 	}
-	var writes []pending
 
-	for _, r := range existing {
+	changed := 0
+	next := make([]*forward.Rule, 0, len(current))
+	applied := make(map[int64]resolve.State, len(results))
+	for _, r := range current {
 		cp := *r
-		if !cp.IsDomainTarget() {
-			// IP 目标：清掉可能残留的解析状态（例如从域名改成 IP 的旧数据）。
-			if cp.ResolveStatus != "" || cp.ResolvedV4 != "" || cp.ResolvedV6 != "" {
-				clearResolve(&cp)
-				writes = append(writes, pending{id: cp.ID, state: resolve.State{}})
-			}
-			next = append(next, &cp)
+		next = append(next, &cp)
+	}
+	for _, res := range results {
+		cur, ok := byID[res.id]
+		if !ok {
+			continue // 规则已被删除：丢弃过期结果
+		}
+		// 解析期间用户改了目标或改过规则 → 本次结果已过期，丢弃。
+		if cur.TargetAddress != res.host || cur.UpdatedAt != res.updatedAt {
+			slog.Debug("丢弃过期 DNS 解析结果（规则在解析期间被修改）", "rule", res.id)
 			continue
 		}
-		prev := resolve.State{V4: cp.ResolvedV4, V6: cp.ResolvedV6, At: cp.ResolvedAt,
-			Status: cp.ResolveStatus, Err: cp.ResolveError}
-		st := resolve.Resolve(ctx, s.resolver, cp.TargetAddress, prev, s.now())
-		if st.Changed(prev) {
+		applied[res.id] = res.state
+		prev := resolve.State{V4: cur.ResolvedV4, V6: cur.ResolvedV6}
+		if res.state.Changed(prev) {
 			changed++
 		}
-		applyResolve(&cp, st)
-		writes = append(writes, pending{id: cp.ID, state: st})
-		next = append(next, &cp)
+		for _, r := range next {
+			if r.ID == res.id {
+				applyResolve(r, res.state)
+			}
+		}
 	}
 
 	if changed > 0 {
 		// 地址有实际变化 → 同步 nft（结构签名变化会触发链重写，counter 保留）。
-		if err := s.applyWithRollback(ctx, next, existing); err != nil {
+		if err := s.applyWithRollback(ctx, next, current); err != nil {
 			return 0, fmt.Errorf("DNS 目标更新应用失败: %w", err)
 		}
 	}
 	// 状态落库：即使地址没变也要写（stale/ok 状态与错误文本需要反映到 UI）。
-	for _, w := range writes {
-		if err := s.store.UpdateResolved(ctx, w.id, w.state.V4, w.state.V6,
-			w.state.At, w.state.Status, w.state.Err); err != nil {
-			slog.Warn("写入 DNS 解析状态失败", "rule", w.id, "err", err)
+	for id, st := range applied {
+		if err := s.store.UpdateResolved(ctx, id, st.V4, st.V6, st.At, st.Status, st.Err); err != nil {
+			slog.Warn("写入 DNS 解析状态失败", "rule", id, "err", err)
 		}
 	}
 	if changed > 0 {

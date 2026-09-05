@@ -48,6 +48,55 @@ type Status struct {
 	Rates  map[int64]Rate
 }
 
+// LiveDelta 是配额实时判定所需的「已落库累计 + 未落库基线」原子快照。
+//
+// 为什么需要它：collector 每 interval（默认 2s）才刷一次库。配额若只看 SQLite
+// 里的 totals，1Gbps 下 2 秒就能多跑 250MB，配额形同虚设。
+//
+// 实时用量的计算方式（policy 层）：
+//
+//	used = Committed[ruleID] + Σ max(0, 当前 nft counter - Baseline[counter])
+//
+// 当前 counter 读数来自 policy 每轮本就要执行的 `nft -j list ruleset`，
+// 因此不增加任何系统调用；Committed 与 Baseline 在同一把锁下随 commit 原子更新，
+// 因此既不会重复计费，也不会漏计。
+type LiveDelta struct {
+	// Ready 表示 collector 已完成至少一轮采集（Committed/Baseline 可信）。
+	Ready bool
+	// At 是快照时刻（Unix 秒）。
+	At int64
+	// Committed 是每条规则已落库的累计字节（upload+download）。
+	Committed map[int64]int64
+	// Baseline 是每个 named counter 已落库的基线字节。
+	Baseline map[string]int64
+}
+
+// Used 返回某规则的实时累计字节（已落库 + 尚未落库）。
+//
+// cur 是当前 nft named counter 读数（counter 名 → bytes）。cur 为 nil 时
+// 退化为已落库累计。counter 被外部重置（cur < baseline）时，未落库增量就是
+// 重置后的新值本身 —— 与 collector 的 reset 处理保持一致，绝不出现负数。
+func (d LiveDelta) Used(ruleID int64, cur map[string]int64) int64 {
+	used := d.Committed[ruleID]
+	if len(cur) == 0 {
+		return used
+	}
+	for _, name := range []string{nft.CounterUp(ruleID), nft.CounterDown(ruleID)} {
+		c, ok := cur[name]
+		if !ok {
+			continue
+		}
+		base := d.Baseline[name]
+		switch {
+		case c > base:
+			used += c - base
+		case c < base:
+			used += c // counter 已重置：新值即未落库增量
+		}
+	}
+	return used
+}
+
 // Collector 采集 nft named counter 并写库。
 type Collector struct {
 	db     *database.DB
@@ -59,6 +108,11 @@ type Collector struct {
 	lastError string
 	lastOK    int64
 	rates     map[int64]Rate
+
+	// committed / baseline 与 ready 一起构成 LiveDelta，随 commit 成功原子更新。
+	committed map[int64]int64
+	baseline  map[string]int64
+	ready     bool
 }
 
 // NewCollector 构造采集器。
@@ -67,11 +121,13 @@ func NewCollector(db *database.DB, runner nft.Runner, tz string) *Collector {
 		runner = nft.ExecRunner{}
 	}
 	return &Collector{
-		db:     db,
-		runner: runner,
-		tz:     tz,
-		now:    time.Now,
-		rates:  map[int64]Rate{},
+		db:        db,
+		runner:    runner,
+		tz:        tz,
+		now:       time.Now,
+		rates:     map[int64]Rate{},
+		committed: map[int64]int64{},
+		baseline:  map[string]int64{},
 	}
 }
 
@@ -101,6 +157,28 @@ func (c *Collector) Snapshot() Status {
 		rates[k] = v
 	}
 	return Status{Error: c.lastError, LastOK: c.lastOK, Rates: rates}
+}
+
+// LiveSnapshot 返回配额实时判定所需的原子快照（thread-safe，纯内存）。
+//
+// 供 policy 每轮 reconcile 使用：不触发任何 nft 系统调用 ——
+// 当前 counter 读数由 policy 自己那次 `nft -j list ruleset` 提供。
+func (c *Collector) LiveSnapshot() LiveDelta {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := LiveDelta{
+		Ready:     c.ready,
+		At:        c.lastOK,
+		Committed: make(map[int64]int64, len(c.committed)),
+		Baseline:  make(map[string]int64, len(c.baseline)),
+	}
+	for k, v := range c.committed {
+		out.Committed[k] = v
+	}
+	for k, v := range c.baseline {
+		out.Baseline[k] = v
+	}
+	return out
 }
 
 // nftCountersDoc 是 `nft -j list counters table inet nff_filter` 的 JSON 结构。
@@ -305,6 +383,13 @@ func (c *Collector) Tick(ctx context.Context) error {
 		return err
 	}
 
+	// commit 成功后再读一次落库累计，作为配额实时判定的「已持久化」基准。
+	// 放在 commit 之后：只有真正入库的数字才允许被当成 committed。
+	committed, cerr := c.loadTotals(ctx)
+	if cerr != nil {
+		slog.Debug("读取累计流量失败（配额实时快照本轮沿用旧值）", "err", cerr)
+	}
+
 	// 更新内存速率。
 	c.mu.Lock()
 	for id, agg := range deltas {
@@ -322,12 +407,42 @@ func (c *Collector) Tick(ctx context.Context) error {
 	}
 	c.lastError = ""
 	c.lastOK = nowSec
+	// 配额实时判定快照：baseline 恒等于「已落库的 counter 读数」，
+	// committed 是已落库的规则累计。两者与 commit 在同一逻辑步骤内更新，
+	// 因此 policy 读到的组合永远自洽（不重复计费、不漏计）。
+	c.baseline = make(map[string]int64, len(newBaselines))
+	for name, b := range newBaselines {
+		c.baseline[name] = b.bytes
+	}
+	if committed != nil {
+		c.committed = committed
+	}
+	c.ready = true
 	c.mu.Unlock()
 
 	if resetHits > 0 {
 		slog.Warn("检测到 counter 归零，已补入累计；为避免假峰值本轮不写速率", "count", resetHits)
 	}
 	return nil
+}
+
+// loadTotals 读取所有规则的已落库累计（upload+download）。
+func (c *Collector) loadTotals(ctx context.Context) (map[int64]int64, error) {
+	rows, err := c.db.QueryContext(ctx,
+		"SELECT rule_id,upload_bytes,download_bytes FROM traffic_totals")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]int64{}
+	for rows.Next() {
+		var id, up, down int64
+		if err := rows.Scan(&id, &up, &down); err != nil {
+			return nil, err
+		}
+		out[id] = up + down
+	}
+	return out, rows.Err()
 }
 
 func (c *Collector) setErr(msg string) {

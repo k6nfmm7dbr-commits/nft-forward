@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # 验证 SSE 长连接不再被 WriteTimeout(60s) 切断
 OUT=/tmp/sse_check.out
+. "$(dirname "$0")/e2e_common.sh"
+nff_api_init || exit 2
 start=$(date +%s)
-timeout 95 curl -sN "http://127.0.0.1:8090/api/events" -o "$OUT"
+timeout 95 curl -sN -H "$AUTH_HDR" "$API/api/events" -o "$OUT"
 end=$(date +%s)
 alive=$((end - start))
 pings=$(grep -c ping "$OUT" 2>/dev/null || echo 0)

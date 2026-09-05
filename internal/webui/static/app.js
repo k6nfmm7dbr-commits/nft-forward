@@ -12,13 +12,29 @@
 var state = { ruleId: null, summary: null, live: null };
 
 /* ---------- API ---------- */
+
+/* BASE 是面板的随机入口前缀（形如 "/3e4f65a8c24d2bd5b9e80147/"）。
+ *
+ * 面板不再挂在站点根下，所有请求都必须相对入口拼接。取 location.pathname
+ * 到最后一个斜杠为止即可 —— 服务端已保证入口目录带尾斜杠（无尾斜杠会 302 到
+ * 带斜杠版本），因此这里恒等于入口前缀。
+ *
+ * 刻意不把入口路径写进 JS 常量：它是每台机器不同的随机值，硬编码就意味着
+ * 前端资源要按机器生成。
+ */
+var BASE = location.pathname.replace(/[^/]*$/, '');
+
+// url 把入口内的相对路径拼成绝对路径（'api/summary' → '/<entry>/api/summary'）。
+function url(path) { return BASE + String(path).replace(/^\/+/, ''); }
+
 var inflight = {};
 function api(path, params) {
   var key = path + JSON.stringify(params || {});
   if (inflight[key]) return inflight[key];
-  var u = new URL(path, location.origin);
+  var u = new URL(url(path), location.origin);
   if (params) Object.keys(params).forEach(function (k) { u.searchParams.set(k, params[k]); });
-  var req = fetch(u, { cache: 'no-store' }).then(function (r) {
+  var req = fetch(u, { cache: 'no-store', credentials: 'same-origin' }).then(function (r) {
+    if (r.status === 401) { location.href = url('login'); throw new Error('未登录'); }
     if (!r.ok) throw new Error('请求失败 ' + r.status);
     return r.json();
   }).finally(function () { delete inflight[key]; });
@@ -28,12 +44,13 @@ function api(path, params) {
 
 // mutate 统一处理写请求：业务错误抛出服务端文案。
 function mutate(method, path, body) {
-  var opts = { method: method, cache: 'no-store', headers: {} };
+  var opts = { method: method, cache: 'no-store', credentials: 'same-origin', headers: {} };
   if (body !== undefined) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
   }
-  return fetch(path, opts).then(function (r) {
+  return fetch(url(path), opts).then(function (r) {
+    if (r.status === 401) { location.href = url('login'); throw new Error('未登录'); }
     return r.json().then(function (d) {
       if (!r.ok) throw new Error((d && d.error) || ('请求失败 ' + r.status));
       return d;
@@ -641,7 +658,7 @@ function showIPs(id) {
 /* ---------- SSE ---------- */
 function startEvents() {
   // EventSource 原生自动重连；服务重启后重连即收到完整 snapshot。
-  var es = new EventSource('/api/events');
+  var es = new EventSource(url('api/events'), { withCredentials: true });
   es.addEventListener('snapshot', function (e) {
     try {
       var snap = JSON.parse(e.data);
@@ -652,7 +669,13 @@ function startEvents() {
       }
     } catch (err) { /* 忽略坏包，下一次快照会覆盖 */ }
   });
-  es.onerror = function () { /* 断线由 EventSource 自动重连 */ };
+  es.onerror = function () {
+    // EventSource 自身会重连；但会话过期（401）时它只会无限重试，
+    // 页面表现为「一直连接中」。用一次轻量探测确认是否已登出，是则回登录页。
+    fetch(url('api/healthz'), { cache: 'no-store', credentials: 'same-origin' })
+      .then(function (r) { if (r.status === 401) { es.close(); location.href = url('login'); } })
+      .catch(function () { /* 网络抖动：交给 EventSource 自动重连 */ });
+  };
 }
 
 /* ---------- 事件绑定 ---------- */

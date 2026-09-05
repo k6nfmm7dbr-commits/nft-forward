@@ -2,13 +2,18 @@
 //
 // 子命令：
 //
-//	nft-forward serve                启动面板服务
-//	nft-forward selftest             自检（SQLite/nft/ip_forward/conntrack 等）
-//	nft-forward config-get <key>     读取配置
-//	nft-forward config-set <k> <v>   写入配置
-//	nft-forward config-migrate       清理废弃配置键
-//	nft-forward clear                只删除 nff_* 自有表（不清系统规则）
-//	nft-forward（无参数）             运维菜单（不含规则 CRUD，规则统一走 Web 面板）
+//	nft-forward serve                  启动面板服务
+//	nft-forward selftest               自检（SQLite/nft/ip_forward/conntrack/认证等）
+//	nft-forward config-get <key>       读取配置
+//	nft-forward config-set <k> <v>     写入配置
+//	nft-forward config-migrate         清理废弃配置键
+//	nft-forward config-ensure-token    首次生成 32 位十六进制访问令牌（幂等）
+//	nft-forward config-ensure-port     首次生成随机五位数面板端口（幂等）
+//	nft-forward config-ensure-entry    首次生成随机面板入口路径（幂等）
+//	nft-forward config-ensure-all      一次完成上面三项（安装器用）
+//	nft-forward panel-info             打印面板地址与访问令牌
+//	nft-forward clear                  只删除 nff_* 自有表（不清系统规则）
+//	nft-forward（无参数）               运维菜单（不含规则 CRUD，规则统一走 Web 面板）
 package main
 
 import (
@@ -17,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/config"
+	"github.com/k6nfmm7dbr-commits/nft-forward/internal/provision"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/service"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/version"
 )
@@ -62,13 +68,71 @@ func main() {
 		} else {
 			fmt.Println("已删除废弃键:", strings.Join(dropped, ", "))
 		}
+	case "config-ensure-token":
+		// 幂等：已有令牌原样输出，没有则用 crypto/rand 生成 32 位十六进制并写回。
+		// panel.json 损坏时 fail-closed（非零退出），安装器必须据此中止。
+		tok, err := config.EnsureToken()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "生成访问令牌失败:", err)
+			os.Exit(1)
+		}
+		fmt.Println(tok)
+	case "config-ensure-entry":
+		p, err := config.EnsureEntryPath()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "生成面板入口路径失败:", err)
+			os.Exit(1)
+		}
+		fmt.Println(p)
+	case "config-ensure-port":
+		res, err := provision.EnsurePanelPort()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "生成面板端口失败:", err)
+			os.Exit(1)
+		}
+		fmt.Println(res.Port)
+	case "config-ensure-all":
+		os.Exit(ensureAll())
+	case "panel-info":
+		os.Exit(panelInfo())
 	case "version", "--version", "-v":
 		fmt.Println(version.Name, "v"+version.Version)
 	case "menu":
 		menu()
 	default:
 		fmt.Println("未知命令:", args[0])
-		fmt.Println("可用: serve / selftest / config-get / config-set / config-migrate / clear / version")
+		fmt.Println("可用: serve / selftest / config-get / config-set / config-migrate / " +
+			"config-ensure-token / config-ensure-port / config-ensure-entry / config-ensure-all / " +
+			"panel-info / clear / version")
 		os.Exit(1)
 	}
+}
+
+// ensureAll 一次完成三项初始化（端口 → 令牌 → 入口路径），任一失败即非零退出。
+//
+// 顺序无关紧要（三者互不依赖），但都必须成功：安装器据退出码决定是否继续。
+func ensureAll() int {
+	if _, err := provision.EnsurePanelPort(); err != nil {
+		fmt.Fprintln(os.Stderr, "生成面板端口失败:", err)
+		return 1
+	}
+	if _, err := config.EnsureToken(); err != nil {
+		fmt.Fprintln(os.Stderr, "生成访问令牌失败:", err)
+		return 1
+	}
+	if _, err := config.EnsureEntryPath(); err != nil {
+		fmt.Fprintln(os.Stderr, "生成面板入口路径失败:", err)
+		return 1
+	}
+	c, err := config.LoadStrict()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "读取配置失败:", err)
+		return 1
+	}
+	if err := c.ValidateServe(); err != nil {
+		fmt.Fprintln(os.Stderr, "初始化未完成:", err)
+		return 1
+	}
+	fmt.Println("ok")
+	return 0
 }

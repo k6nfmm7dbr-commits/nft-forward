@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # 验证：10MiB 经转发后，DB 记录的流量误差应 < 1%（此前几乎全丢）
 set -u
-API="http://127.0.0.1:8090"
+. "$(dirname "$0")/e2e_common.sh"
+nff_api_init || exit 2
 
-rid=$(curl -s -X POST "$API/api/rules" \
+rid=$(curl -s -H "$AUTH_HDR" -X POST "$API/api/rules" \
   -H "Content-Type: application/json" \
   -d '{"name":"traffic-test","enabled":true,"protocol":"tcp","listen_port":29500,"target_address":"10.203.0.100","target_port":80}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
@@ -58,5 +59,5 @@ PY
 rc=$?
 
 echo "--- 清理测试规则 ---"
-curl -s -X DELETE "$API/api/rules/$rid" >/dev/null
+curl -s -H "$AUTH_HDR" -X DELETE "$API/api/rules/$rid" >/dev/null
 exit $rc

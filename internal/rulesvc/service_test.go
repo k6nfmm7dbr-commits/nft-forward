@@ -231,6 +231,9 @@ func newSvc(t *testing.T, store RuleStore, enf Enforcer, res *stubResolver, guar
 	s := New(store, enf, res, func() forward.GuardPorts { return guard })
 	a := forward.NewAllocator(&fixedRand{}, allFree{})
 	a.SetRange(30000, 30099)
+	// 关闭 ephemeral 避让：测试要的是确定端口序列，而内核区间因环境而异
+	// （CI 与开发机不同会让断言飘）。真实分配路径仍然启用该避让。
+	a.SetAvoidEphemeral(false)
 	s.SetAllocator(a)
 	s.SetClock(func() time.Time { return time.Unix(1000, 0) })
 	return s

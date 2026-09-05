@@ -19,9 +19,16 @@
       <small>nftables 端口转发 · 流量监控</small>
     </div>
   </div>
-  <div class="conn-chip">
-    <span id="pulse"></span>
-    <em id="status-txt">连接中…</em>
+  <div class="topbar-right">
+    <div class="conn-chip">
+      <span id="pulse"></span>
+      <em id="status-txt">连接中…</em>
+    </div>
+    <form class="logout-form" method="post" action="logout">
+      <button type="submit" class="icon-btn" id="btn-logout" aria-label="退出登录" title="退出登录">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>
+      </button>
+    </form>
   </div>
 </header>
 

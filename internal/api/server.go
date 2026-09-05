@@ -1,12 +1,25 @@
 // Package api 实现 Web API + SSE。
 //
-// v0.3 起 Token 认证已移除：面板仅本机监听场景下无需认证。
-// 所有 mutation 仍受 strict body size + 来源 IP 速率保护。
+// 路由结构（v0.3.1 起）：
+//
+//	<entry>/                面板首页（未登录 → 登录页）
+//	<entry>/login           登录页（GET）/ 提交令牌（POST）
+//	<entry>/logout          清除会话
+//	<entry>/app.js …        前端静态资源（需认证）
+//	<entry>/api/…           JSON API + SSE（需认证）
+//	/healthz                健康检查（仅 loopback）
+//	其它一切                极简 404，无任何面板特征
+//
+// <entry> 是首次安装生成的随机入口路径（96 bit，crypto/rand），与令牌完全
+// 独立、不可互相推导。随机路径 **不是** 身份认证：进入正确入口后仍必须通过
+// Token 登录，二者同时满足才能访问面板。
+//
+// 认证机制与 SBX 对齐：Authorization: Bearer 或 HttpOnly Cookie，
+// 常量时间比较，登录失败节流，登录体 64 KiB 上限。绝不接受 ?token=。
 package api
 
 import (
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -21,7 +34,6 @@ import (
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/policy"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/rulesvc"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/traffic"
-	"github.com/k6nfmm7dbr-commits/nft-forward/internal/webui"
 )
 
 const (
@@ -36,6 +48,9 @@ type Server struct {
 	policy  *policy.Service
 	rules   *rulesvc.Service
 	collect *traffic.Collector
+
+	// entry 是随机入口路径（形如 "/3e4f65a8c24d2bd5b9e80147"，无尾斜杠）。
+	entry string
 
 	// hostIP 是本机对外 IP（启动时探测一次），仅供展示「监听 IP」字段。
 	// 不是 nft 数据面配置——规则本身仍由 fib daddr type local 作用于所有本机地址。
@@ -70,6 +85,7 @@ func New(cfg *config.Config, db *database.DB, store *forward.Store, pol *policy.
 		policy:     pol,
 		rules:      rules,
 		collect:    collect,
+		entry:      cfg.EntryRoute(),
 		hostIP:     detectHostIP(),
 		subs:       map[chan []byte]struct{}{},
 		deprecated: map[string]time.Time{},
@@ -100,32 +116,111 @@ func (s *Server) recover(next http.Handler) http.Handler {
 }
 
 // ServeHTTP 路由分发。
+//
+// 第一道闸门是随机入口路径：不以 <entry> 开头的请求（除 loopback /healthz）
+// 一律极简 404，不泄漏任何面板存在的线索。
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	route := strings.TrimRight(r.URL.Path, "/")
 	if route == "" {
 		route = "/"
 	}
+
+	// healthz：仅 loopback 可见。外部访问与其它未知路径同样得到极简 404 ——
+	// 公网扫描器无法通过裸 /healthz 确认这是一个真实管理服务。
+	if route == "/healthz" {
+		if !isLoopback(r) {
+			notFound(w, r)
+			return
+		}
+		s.send(w, r, http.StatusOK, "application/json; charset=utf-8", []byte(`{"ok":true}`))
+		return
+	}
+
+	sub, ok := s.stripEntry(route)
+	if !ok {
+		notFound(w, r)
+		return
+	}
+	// 入口根必须带尾斜杠：前端所有资源与 API 都用相对路径拼接
+	// （BASE = pathname 去掉最后一段）。/entry 不重定向的话，
+	// style.css 会被解析成站点根下的 /style.css → 404。
+	if sub == "/" && !strings.HasSuffix(r.URL.Path, "/") &&
+		(r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		s.redirect(w, s.entry+"/")
+		return
+	}
+	s.serveEntry(w, r, sub)
+}
+
+// stripEntry 剥掉随机入口前缀，返回入口内的相对路由（形如 "/"、"/api/rules"）。
+//
+// 未初始化入口路径（entry == ""）时一律不匹配：宁可 404 也不退化成
+// 「整站可达」。serve 启动前已强校验入口存在，这里只是二重保险。
+func (s *Server) stripEntry(route string) (string, bool) {
+	if s.entry == "" {
+		return "", false
+	}
+	if route == s.entry {
+		return "/", true
+	}
+	if strings.HasPrefix(route, s.entry+"/") {
+		rest := route[len(s.entry):]
+		if rest == "" {
+			return "/", true
+		}
+		return rest, true
+	}
+	return "", false
+}
+
+// serveEntry 处理入口内的请求。
+func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, route string) {
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
 		if strings.HasPrefix(route, "/api/") {
+			if !s.authorized(r) {
+				logAuthFailure(r, route)
+				s.sendJSON(w, r, http.StatusUnauthorized, M{"error": "unauthorized"})
+				return
+			}
 			s.handleAPIGet(w, r, route)
 			return
 		}
 		s.handleStatic(w, r, route)
 	case http.MethodPost:
+		switch route {
+		case "/login":
+			s.handleLogin(w, r)
+			return
+		case "/logout":
+			s.handleLogout(w, r)
+			return
+		}
 		if strings.HasPrefix(route, "/api/") {
+			if !s.authorized(r) {
+				logAuthFailure(r, route)
+				s.sendJSON(w, r, http.StatusUnauthorized, M{"error": "unauthorized"})
+				return
+			}
 			s.handleAPIPost(w, r, route)
 			return
 		}
-		s.sendJSON(w, r, http.StatusNotFound, M{"error": "not found"})
+		notFound(w, r)
 	case http.MethodPut, http.MethodDelete:
 		if strings.HasPrefix(route, "/api/") {
+			if !s.authorized(r) {
+				logAuthFailure(r, route)
+				s.sendJSON(w, r, http.StatusUnauthorized, M{"error": "unauthorized"})
+				return
+			}
 			s.handleAPIMut(w, r, route)
 			return
 		}
-		s.sendJSON(w, r, http.StatusNotFound, M{"error": "not found"})
+		notFound(w, r)
 	default:
-		s.sendJSON(w, r, http.StatusMethodNotAllowed, M{"error": "method not allowed"})
+		// 其它方法（OPTIONS/PATCH/TRACE…）与未知路径同样处理：极简 404。
+		// 返回 405 会告诉探测者「这个路径确实存在」，属于不必要的信息泄漏。
+		notFound(w, r)
 	}
 }
 
@@ -138,13 +233,7 @@ func (s *Server) sendJSON(w http.ResponseWriter, r *http.Request, code int, v an
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.WriteHeader(code)
-	if r.Method != http.MethodHead {
-		_, _ = w.Write(data)
-	}
+	s.send(w, r, code, "application/json; charset=utf-8", data)
 }
 
 // logError 记录内部错误（细节只进日志，不回给用户）。
@@ -165,13 +254,6 @@ func (s *Server) logDeprecated(field string) {
 	}
 }
 
-// ---- 认证 ----
-
-// authorized v0.3 起 token 已移除，面板仅本机监听无需认证，永远放行。
-func (s *Server) authorized(r *http.Request) bool {
-	return true
-}
-
 // listenAddr 返回给前端展示用的「监听 IP」。
 // 启动时探测到的本机对外 IP，失败时回退 "0.0.0.0"。
 func (s *Server) listenAddr() string {
@@ -183,36 +265,46 @@ func (s *Server) listenAddr() string {
 
 // ---- 静态资源 ----
 
+// handleStatic 处理入口内的静态资源。
+//
+// 未登录时只允许拿到登录页与它依赖的样式/脚本；面板本体（index.html、app.js）
+// 必须认证后才返回，避免未认证者拿到完整前端从而确认这是 NFT Forward 面板。
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, route string) {
-	// healthz 无需认证（监控探针），只返回存活标记，不含任何配置信息。
-	if route == "/healthz" {
-		s.sendJSON(w, r, http.StatusOK, M{"ok": true})
-		return
-	}
 	switch route {
 	case "/", "/index.html":
-		s.serveAsset(w, "index.html", "text/html; charset=utf-8")
-	case "/app.js":
-		s.serveAsset(w, "app.js", "application/javascript; charset=utf-8")
+		if !s.authorized(r) {
+			s.serveAsset(w, r, "login.html", "text/html; charset=utf-8")
+			return
+		}
+		s.serveAsset(w, r, "index.html", "text/html; charset=utf-8")
+	case "/login":
+		if s.authorized(r) {
+			s.redirect(w, s.entry+"/")
+			return
+		}
+		s.serveAsset(w, r, "login.html", "text/html; charset=utf-8")
+	case "/login.js":
+		s.serveAsset(w, r, "login.js", "application/javascript; charset=utf-8")
 	case "/style.css":
-		s.serveAsset(w, "style.css", "text/css; charset=utf-8")
+		s.serveAsset(w, r, "style.css", "text/css; charset=utf-8")
+	case "/app.js":
+		if !s.authorized(r) {
+			notFound(w, r)
+			return
+		}
+		s.serveAsset(w, r, "app.js", "application/javascript; charset=utf-8")
 	default:
-		s.sendJSON(w, r, http.StatusNotFound, M{"error": "not found"})
+		notFound(w, r)
 	}
 }
 
-func (s *Server) serveAsset(w http.ResponseWriter, name, ctype string) {
-	data, err := webui.FS().Open(strings.TrimLeft(name, "/"))
+func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, name, ctype string) {
+	b, err := assetBytes(name)
 	if err != nil {
-		http.Error(w, "not found", http.StatusNotFound)
+		notFound(w, r)
 		return
 	}
-	defer data.Close()
-	b, _ := io.ReadAll(data)
-	w.Header().Set("Content-Type", ctype)
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	_, _ = w.Write(b)
+	s.send(w, r, http.StatusOK, ctype, b)
 }
 
 // PublishSSE 向所有 SSE 订阅者广播一条事件（payload 已含 event/data）。
@@ -269,11 +361,10 @@ func (s *Server) PublishSnapshotTick() {
 }
 
 // handleEvents 是 SSE 端点：首包完整 snapshot，之后按变化推送。
+//
+// 认证已在 serveEntry 的 /api/ 分支统一完成 —— SSE 与其它 API 走同一道闸门，
+// 不存在「SSE 绕过认证」的旁路。
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
-		s.sendJSON(w, r, http.StatusUnauthorized, M{"error": "unauthorized"})
-		return
-	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		s.sendJSON(w, r, http.StatusInternalServerError, M{"error": "streaming unsupported"})
@@ -285,8 +376,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
 		slog.Debug("清除 SSE write deadline 失败", "err", err)
 	}
+	securityHeaders(w.Header())
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)

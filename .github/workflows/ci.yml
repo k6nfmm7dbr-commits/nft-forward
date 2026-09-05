@@ -44,8 +44,52 @@ jobs:
       - name: 安装/升级流程测试（提取 install.sh 真实实现）
         run: bash tests/installer_flow_test.sh
 
-      - name: v0.2.0 基线收口测试（监听地址移除 / nft 安全边界 / 统一变更入口）
+      - name: v0.3.1 基线收口测试（认证 / 暴露面 / fail-safe / 自愈 / 性能）
         run: bash tests/baseline_test.sh
+
+      # 真实 nftables + network namespace E2E。
+      #
+      # GitHub Hosted Runner（ubuntu-latest）确实提供 root(sudo)、nftables 内核模块
+      # 与 network namespace 能力，因此完整数据面 E2E 可以在 CI 里跑。
+      # 唯一的限制是 runner 上没有已安装的 nft-forward 服务，所以这里先用本地构建的
+      # 二进制做一次沙箱安装（NFF_CORE_BIN + NFF_ROOT 由安装器支持），再跑 E2E。
+      - name: 真实 nftables 能力探测
+        id: nftcap
+        run: |
+          sudo apt-get install -y -qq nftables conntrack >/dev/null 2>&1 || true
+          if sudo nft list tables >/dev/null 2>&1 && sudo ip netns add nff-cap-probe 2>/dev/null; then
+            sudo ip netns del nff-cap-probe
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::runner 缺少 nftables / netns 能力，跳过真实数据面 E2E"
+          fi
+
+      - name: 真实数据面 E2E（netns + nftables）
+        if: steps.nftcap.outputs.ok == 'true'
+        run: |
+          set -e
+          CGO_ENABLED=0 go build -o /tmp/nft-forward ./cmd/nft-forward
+          sudo mkdir -p /etc/nft-forward
+          sudo install -m 0600 /dev/null /etc/nft-forward/panel.json
+          echo '{}' | sudo tee /etc/nft-forward/panel.json >/dev/null
+          sudo install -m 0755 /tmp/nft-forward /usr/local/bin/nft-forward
+          # 首次初始化：随机五位数端口 + 令牌 + 入口路径
+          sudo /usr/local/bin/nft-forward config-ensure-all
+          sudo bash scripts/e2e_netns.sh setup
+          # 后台起服务（CI 没有 systemd 用户会话，直接跑 serve）
+          sudo sh -c 'NFT_FORWARD_CONF=/etc/nft-forward/panel.json \
+            /usr/local/bin/nft-forward serve > /tmp/nff-serve.log 2>&1 &'
+          for _ in $(seq 1 20); do
+            PORT=$(sudo /usr/local/bin/nft-forward config-get port)
+            if curl -fsS -m 2 "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          sudo bash scripts/e2e_fault.sh || { sudo tail -50 /tmp/nff-serve.log; exit 1; }
+          sudo bash scripts/e2e_full.sh  || { sudo tail -50 /tmp/nff-serve.log; exit 1; }
+          sudo bash scripts/e2e_netns.sh clean
+          sudo pkill -f 'nft-forward serve' || true
+          sudo /usr/local/bin/nft-forward clear || true
 
   # 二进制分发：main 全部测试通过后，把全架构产物发布到 dist 分支（rolling latest）。
   # dist 是普通分支，不是 Tag —— 安装器固定从 raw .../dist/<artifact> 下载。

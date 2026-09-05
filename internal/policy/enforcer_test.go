@@ -16,22 +16,18 @@ import (
 // 场景：本机 curl https://example.com，conntrack 里 src=本机地址、dport=443。
 // 若不排除，它会被当成「443 转发规则的客户端」，IP 限制开启时挤掉真实用户。
 func TestSelfOriginatedConnectionsIgnored(t *testing.T) {
-	rec := &applyRecorder{}
-	state := &nft.State{FilterTableExists: true, SetElements: map[string][]string{}}
-	svc, store := newTestService(t, rec, state)
+	svc, store, _ := newTestService(t)
 	id := addRule(t, store, &forward.Rule{
 		Name: "r1", Enabled: true, Protocol: "tcp",
 		ListenPort: 443, TargetAddress: "10.0.0.2", TargetPort: 443,
 		IPLimitEnabled: true, IPLimitMax: 1,
 	})
-	state.Counters = []string{nft.CounterUp(id), nft.CounterDown(id)}
-	state.Sets = []string{nft.AllowSetV4(id), nft.AllowSetV6(id), nft.SetQuotaBlock}
 
 	svc.SetLocalIPs(func() (map[string]bool, error) {
 		return map[string]bool{"192.0.2.10": true, "127.0.0.1": true}, nil
 	})
 	svc.SetConntrack(func(string) connection.Result {
-		return connection.Result{Available: true, Flows: []connection.Flow{
+		return connection.Result{Available: true, Entries: 2, Flows: []connection.Flow{
 			// 本机自己发起的出站（源=本机地址）—— 必须忽略。
 			{Proto: "tcp", State: "ESTABLISHED", OrigDstPort: 443, SrcIP: "192.0.2.10", SrcPort: 40000, Bytes: 500},
 			// 真实客户端。
@@ -68,9 +64,7 @@ func TestSelfOriginatedConnectionsIgnored(t *testing.T) {
 // 这是 rulesvc 的 candidate 语义基础：变更服务先用「候选规则集」应用 nft，
 // 成功后才落库。
 func TestApplyRulesUsedByMutationPath(t *testing.T) {
-	rec := &applyRecorder{}
-	state := &nft.State{SetElements: map[string][]string{}}
-	svc, _ := newTestService(t, rec, state)
+	svc, _, fake := newTestService(t)
 
 	cand := []*forward.Rule{{
 		ID: 42, Name: "cand", Enabled: true, Protocol: "tcp",
@@ -79,7 +73,7 @@ func TestApplyRulesUsedByMutationPath(t *testing.T) {
 	if err := svc.ApplyRules(context.Background(), cand); err != nil {
 		t.Fatalf("ApplyRules 失败: %v", err)
 	}
-	joined := strings.Join(rec.scripts, "\n")
+	joined := strings.Join(fake.allScripts(), "\n")
 	if !strings.Contains(joined, "dport 12345") {
 		t.Fatalf("候选规则未进入 nft 脚本:\n%s", joined)
 	}
@@ -92,9 +86,7 @@ func TestApplyRulesUsedByMutationPath(t *testing.T) {
 //
 // 这消除了「nft 已应用、DB 未提交」窗口里 reconcile 按旧数据重建 nft 的竞态。
 func TestHoldSerializesWithReconcile(t *testing.T) {
-	rec := &applyRecorder{}
-	state := &nft.State{FilterTableExists: true, SetElements: map[string][]string{}}
-	svc, _ := newTestService(t, rec, state)
+	svc, _, _ := newTestService(t)
 
 	release := svc.Hold()
 	done := make(chan struct{})
@@ -116,14 +108,12 @@ func TestHoldSerializesWithReconcile(t *testing.T) {
 	}
 }
 
-// TestCounterContinuityAfterDNSRefresh 域名解析结果变化只重写链，counter 声明保持幂等。
+// TestCounterContinuityAfterDNSRefresh 域名解析结果变化只重写链，counter 累计值保留。
 //
 // 「counter 不清零」的机制是：结构脚本永不 delete table，counter 用幂等
 // `table {...}` 声明；因此即使链被 flush 重建，累计字节也保留。
 func TestCounterContinuityAfterDNSRefresh(t *testing.T) {
-	rec := &applyRecorder{}
-	state := &nft.State{SetElements: map[string][]string{}}
-	svc, store := newTestService(t, rec, state)
+	svc, store, fake := newTestService(t)
 	id := addRule(t, store, &forward.Rule{
 		Name: "dom", Enabled: true, Protocol: "tcp",
 		ListenPort: 20000, TargetAddress: "hk.example.com", TargetPort: 443,
@@ -133,8 +123,9 @@ func TestCounterContinuityAfterDNSRefresh(t *testing.T) {
 	if err := svc.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	state.FilterTableExists = true
-	state.Counters = []string{nft.CounterUp(id), nft.CounterDown(id)}
+	// 灌入真实流量。
+	fake.bumpCounter(nft.CounterUp(id), 999)
+	fake.bumpCounter(nft.CounterDown(id), 111)
 
 	// DNS 目标变化。
 	r, _ := store.Get(ctx, id)
@@ -142,34 +133,35 @@ func TestCounterContinuityAfterDNSRefresh(t *testing.T) {
 	if err := store.Update(ctx, r); err != nil {
 		t.Fatal(err)
 	}
-	rec.scripts = nil
+	fake.resetScripts()
 	if err := svc.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if rec.structRebuilds() != 1 {
-		t.Fatalf("DNS 目标变化应触发 1 次链重写，实际 %d", rec.structRebuilds())
+	if fake.structRebuilds() != 1 {
+		t.Fatalf("DNS 目标变化应触发 1 次链重写，实际 %d", fake.structRebuilds())
 	}
-	joined := strings.Join(rec.scripts, "\n")
+	joined := strings.Join(fake.allScripts(), "\n")
 	if strings.Contains(joined, "delete table") {
 		t.Fatal("DNS 更新绝不能 delete table（会清零 counter）")
 	}
 	if !strings.Contains(joined, "dnat to 5.6.7.8:443") {
 		t.Fatalf("新目标未生效:\n%s", joined)
 	}
-	// counter 必须仍是幂等声明形态，不含 delete counter。
 	if strings.Contains(joined, "delete counter inet "+nft.TableFilter+" "+nft.CounterUp(id)) {
 		t.Fatal("DNS 更新不应删除本规则 counter")
 	}
-	if !strings.Contains(joined, "counter "+nft.CounterUp(id)) {
-		t.Fatal("counter 必须继续声明")
+	// 关键断言：累计字节必须原样保留。
+	if v := fake.counterOf(nft.CounterUp(id)); v != 999 {
+		t.Fatalf("DNS 更新后 upload counter 被清零/改动: %d", v)
+	}
+	if v := fake.counterOf(nft.CounterDown(id)); v != 111 {
+		t.Fatalf("DNS 更新后 download counter 被清零/改动: %d", v)
 	}
 }
 
 // TestUnresolvedDomainDoesNotBreakOtherRules 一条域名规则解析失败不得影响其它规则。
 func TestUnresolvedDomainDoesNotBreakOtherRules(t *testing.T) {
-	rec := &applyRecorder{}
-	state := &nft.State{SetElements: map[string][]string{}}
-	svc, store := newTestService(t, rec, state)
+	svc, store, fake := newTestService(t)
 	okID := addRule(t, store, &forward.Rule{
 		Name: "ip-rule", Enabled: true, Protocol: "tcp",
 		ListenPort: 20000, TargetAddress: "1.2.3.4", TargetPort: 443,
@@ -183,7 +175,7 @@ func TestUnresolvedDomainDoesNotBreakOtherRules(t *testing.T) {
 	if err := svc.Reconcile(ctx); err != nil {
 		t.Fatalf("解析失败的规则不应让整轮 reconcile 失败: %v", err)
 	}
-	joined := strings.Join(rec.scripts, "\n")
+	joined := strings.Join(fake.allScripts(), "\n")
 	if !strings.Contains(joined, "dnat to 1.2.3.4:443") {
 		t.Fatal("正常规则应继续工作")
 	}
@@ -193,13 +185,14 @@ func TestUnresolvedDomainDoesNotBreakOtherRules(t *testing.T) {
 	if svc.StateOf(okID) == nil {
 		t.Fatal("正常规则状态缺失")
 	}
+	if fake.counterOf(nft.CounterUp(badID)) < 0 {
+		t.Fatal("解析失败的规则 counter 应真实存在")
+	}
 }
 
 // TestHealthSnapshot 健康快照反映 apply / reconcile / conntrack 状态。
 func TestHealthSnapshot(t *testing.T) {
-	rec := &applyRecorder{}
-	state := &nft.State{FilterTableExists: true, SetElements: map[string][]string{}}
-	svc, _ := newTestService(t, rec, state)
+	svc, _, _ := newTestService(t)
 	h := svc.HealthSnapshot()
 	if h.Ready {
 		t.Fatal("首轮前不应 ready")
@@ -217,13 +210,14 @@ func TestHealthSnapshot(t *testing.T) {
 	if !h.ConntrackOK {
 		t.Fatal("conntrack 可用时应报告 OK")
 	}
+	if h.IPStateFrozen {
+		t.Fatal("conntrack 可用时不应处于冻结")
+	}
 }
 
 // TestConntrackInactiveReported conntrack 未激活时健康快照给出说明。
 func TestConntrackInactiveReported(t *testing.T) {
-	rec := &applyRecorder{}
-	state := &nft.State{FilterTableExists: true, SetElements: map[string][]string{}}
-	svc, _ := newTestService(t, rec, state)
+	svc, _, _ := newTestService(t)
 	svc.SetConntrack(func(string) connection.Result {
 		return connection.Result{Available: false, Inactive: true}
 	})
@@ -236,5 +230,8 @@ func TestConntrackInactiveReported(t *testing.T) {
 	}
 	if h.ConntrackNote == "" {
 		t.Fatal("应给出 conntrack 说明")
+	}
+	if !h.IPStateFrozen {
+		t.Fatal("conntrack 未激活时在线 IP 状态应冻结")
 	}
 }

@@ -29,6 +29,12 @@ func Serve() int {
 		slog.Error(err.Error())
 		return 1
 	}
+	// fail-closed：令牌 / 端口 / 入口路径三项缺一不可。
+	// 宁可不启动，也不能带着「无认证 / 固定端口 / 固定入口」的状态对外监听。
+	if err := cfg.ValidateServe(); err != nil {
+		slog.Error("配置未完成初始化，拒绝启动", "err", err)
+		return 1
+	}
 
 	db, err := database.Open(cfg.DB)
 	if err != nil {
@@ -42,6 +48,9 @@ func Serve() int {
 
 	pol := policy.New(db.DB, store, runner, cfg.NftConf, "")
 	collect := traffic.NewCollector(db, runner, cfg.TZ)
+	// 配额实时判定：policy 用 collector 的「已落库累计 + counter 基线」快照，
+	// 配合自己那轮 nft 读数算出未落库增量，无需额外系统调用。
+	pol.SetQuotaSource(collect.LiveSnapshot)
 
 	// 统一规则变更服务：Web API 与后台 DNS worker 共用它，
 	// 因此不存在「两套 nft 修改逻辑」。
@@ -70,6 +79,12 @@ func Serve() int {
 		slog.Info("策略系统就绪")
 	}
 
+	// 首轮采集立即执行一次：让 collector 的 LiveDelta 尽快就绪，
+	// 否则最初几百毫秒内配额判定只能退回纯 SQLite 口径。
+	if err := collect.Tick(ctx); err != nil {
+		slog.Debug("首次采集失败", "err", err)
+	}
+
 	// 采集循环。
 	collectCtx, collectCancel := context.WithCancel(ctx)
 	defer collectCancel()
@@ -89,9 +104,11 @@ func Serve() int {
 	go runDNS(dnsCtx, rules, srv, time.Duration(cfg.DNSRefresh)*time.Second)
 
 	// SSE 快照推送由变更服务在状态变化时主动 Publish；这里定期兜底广播。
-	go runSnapshotPublisher(ctx, srv, 2*time.Second)
+	snapCtx, snapCancel := context.WithCancel(ctx)
+	defer snapCancel()
+	go runSnapshotPublisher(snapCtx, srv, 2*time.Second)
 
-	slog.Info("面板已启动 http://" + addr)
+	slog.Info("面板已启动", "listen", addr, "entry", cfg.EntryRoute()+"/")
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- hs.Serve(ln) }()
@@ -105,9 +122,13 @@ func Serve() int {
 		}
 	}
 
+	// 关闭顺序：先停所有后台 worker（DNS / policy / collector / SSE 广播），
+	// 再优雅关闭 HTTP。全部 goroutine 都绑定在可取消的 ctx 上，
+	// 因此进程退出前不会留下悬挂 goroutine。
 	dnsCancel()
 	polCancel()
 	collectCancel()
+	snapCancel()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := hs.Shutdown(shutdownCtx); err != nil {

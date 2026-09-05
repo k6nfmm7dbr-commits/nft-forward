@@ -277,6 +277,18 @@ func (st *NodeIPState) touchObserved(ip string, a IPActivity, now time.Time) {
 	}
 }
 
+// AllowSet 返回当前所有 slot（含 provisional）构成的 allow set 副本。
+//
+// 用途：conntrack 不可用时冻结在线 IP 状态 —— 直接重放上一轮 allow set，
+// 既不新增也不清空，避免把在用客户端从 nft allow set 里踢掉。
+func (st *NodeIPState) AllowSet() map[string]bool {
+	out := make(map[string]bool, len(st.Slots))
+	for ip := range st.Slots {
+		out[ip] = true
+	}
+	return out
+}
+
 // grantedCount 返回持有 slot 的 IP 数（含 provisional）。
 func (st *NodeIPState) grantedCount() int { return len(st.Slots) }
 

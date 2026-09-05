@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # 验证配额：超限后阻断转发，提高额度/重置后自动恢复（且不重建结构、不丢累计）
 set -u
-API="http://127.0.0.1:8090"
+. "$(dirname "$0")/e2e_common.sh"
+nff_api_init || exit 2
 PORT=29900
 
-rid=$(curl -s -X POST "$API/api/rules" \
+rid=$(curl -s -H "$AUTH_HDR" -X POST "$API/api/rules" \
   -H "Content-Type: application/json" \
   -d "{\"name\":\"quota\",\"enabled\":true,\"protocol\":\"tcp\",\"listen_port\":${PORT},\"target_address\":\"10.203.0.100\",\"target_port\":80}" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
@@ -16,17 +17,17 @@ echo "--- 先跑一次 10MiB 产生用量 ---"
 ip netns exec nff-client1 curl -s -o /dev/null -w "  下载 %{size_download} bytes\n" --max-time 60 "http://10.203.0.1:${PORT}/"
 sleep 6
 
-used=$(curl -s "$API/api/rules/$rid" \
+used=$(curl -s -H "$AUTH_HDR" "$API/api/rules/$rid" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("quota") or {}).get("quota_used_bytes",0))')
 echo "  当前用量 = $used"
 
 echo "--- 设额度 1MiB（远小于已用）应立即阻断 ---"
-curl -s -X PUT "$API/api/rules/$rid/policy" \
+curl -s -H "$AUTH_HDR" -X PUT "$API/api/rules/$rid/policy" \
   -H "Content-Type: application/json" \
   -d '{"quota_enabled":true,"quota_limit_bytes":1048576}' >/dev/null
 sleep 3
 
-curl -s "$API/api/rules/$rid" | python3 -c '
+curl -s -H "$AUTH_HDR" "$API/api/rules/$rid" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 q = d.get("quota") or {}
@@ -43,14 +44,14 @@ else
   rcA=0
 fi
 
-total_before=$(curl -s "$API/api/rules/$rid" \
+total_before=$(curl -s -H "$AUTH_HDR" "$API/api/rules/$rid" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("total_up",0)+d.get("total_down",0))')
 
 echo "--- 重置用量（应恢复且保留历史累计）---"
-curl -s -X POST "$API/api/rules/$rid/quota/reset" >/dev/null
+curl -s -H "$AUTH_HDR" -X POST "$API/api/rules/$rid/quota/reset" >/dev/null
 sleep 3
 
-curl -s "$API/api/rules/$rid" | python3 -c '
+curl -s -H "$AUTH_HDR" "$API/api/rules/$rid" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 q = d.get("quota") or {}
@@ -67,7 +68,7 @@ else
   rcB=1
 fi
 
-total_after=$(curl -s "$API/api/rules/$rid" \
+total_after=$(curl -s -H "$AUTH_HDR" "$API/api/rules/$rid" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("total_up",0)+d.get("total_down",0))')
 echo "  历史累计: 重置前=$total_before 重置后=$total_after"
 if [ "$total_after" -ge "$total_before" ]; then
@@ -79,5 +80,5 @@ else
 fi
 
 echo "--- 清理 ---"
-curl -s -X DELETE "$API/api/rules/$rid" >/dev/null
+curl -s -H "$AUTH_HDR" -X DELETE "$API/api/rules/$rid" >/dev/null
 exit $((rcA + rcB + rcC))

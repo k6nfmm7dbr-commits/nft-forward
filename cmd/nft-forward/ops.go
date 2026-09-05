@@ -5,10 +5,12 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/config"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/database"
@@ -46,6 +48,33 @@ func runClear() int {
 	return 0
 }
 
+// panelInfo 打印用户真正需要的两行：面板地址与访问令牌。
+//
+// 刻意 **不打印** 配置文件路径、数据库路径、sysctl 路径、安装目录 ——
+// 那些是实现细节，用户运维不需要，写在屏幕上只会增加令牌所在位置的暴露面。
+func panelInfo() int {
+	c, err := config.LoadStrict()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "读取配置失败:", err)
+		return 1
+	}
+	if c.Port == 0 || c.Token == "" || c.EntryPath == "" {
+		fmt.Fprintln(os.Stderr, "面板尚未完成初始化，请重新运行安装脚本")
+		return 1
+	}
+	host := publicIP()
+	if host == "" {
+		host = "<本机IP>"
+	}
+	fmt.Printf("面板地址: http://%s:%d%s/\n", host, c.Port, c.EntryRoute())
+	fmt.Printf("访问令牌: %s\n", c.Token)
+	return 0
+}
+
+// selfTest 输出各子系统状态。
+//
+// 输出刻意只给「项目 + 状态 + 简短说明」，正常情况下不打印任何文件路径
+// （配置 / 数据库 / sysctl）。只有失败时才在说明里带上定位问题必需的技术信息。
 func selfTest() int {
 	cfg := config.Load()
 	fail := 0
@@ -56,10 +85,11 @@ func selfTest() int {
 		}
 	}
 
-	if _, err := database.Open(cfg.DB); err != nil {
+	if db, err := database.Open(cfg.DB); err != nil {
 		check("SQLite", "FAIL", "无法打开数据库: "+err.Error())
 	} else {
-		check("SQLite", "OK", cfg.DB)
+		db.Close()
+		check("SQLite", "OK", "可读写")
 	}
 
 	if _, err := exec.LookPath("nft"); err != nil {
@@ -97,28 +127,40 @@ func selfTest() int {
 			check("ip_forward", "WARN", "未启用（转发将不工作）")
 		}
 	} else {
-		check("ip_forward", "WARN", "无法读取 /proc/sys/net/ipv4/ip_forward")
+		check("ip_forward", "WARN", "无法读取内核转发开关")
 	}
 
 	if _, err := os.Stat("/proc/net/nf_conntrack"); err == nil {
-		check("conntrack", "OK", "/proc/net/nf_conntrack 可读")
+		check("conntrack", "OK", "可读")
 	} else {
-		check("conntrack", "WARN", "不可用（在线 IP 将回退）")
+		check("conntrack", "WARN", "不可用（在线 IP 判活将冻结）")
 	}
 
 	acct := strings.TrimSpace(string(mustRead("/proc/sys/net/netfilter/nf_conntrack_acct")))
 	if acct == "1" {
-		check("ct_acct", "OK", "nf_conntrack_acct=1")
+		check("ct_acct", "OK", "已开启字节计费")
 	} else if acct != "" {
-		check("ct_acct", "WARN", "nf_conntrack_acct="+acct+"（在线 IP 判活将降级）")
+		check("ct_acct", "WARN", "未开启字节计费（在线 IP 判活将降级）")
 	}
 
-	addr := net.JoinHostPort(cfg.Listen, strconv.Itoa(cfg.Port))
-	if conn, err := net.Dial("tcp", addr); err == nil {
+	// web server：只探本机回环，不依赖公网可达性。
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.Port))
+	if cfg.Port == 0 {
+		check("web server", "FAIL", "面板端口尚未初始化")
+	} else if conn, err := net.Dial("tcp", addr); err == nil {
 		conn.Close()
-		check("web server", "OK", addr+" 可连接")
+		check("web server", "OK", "本机可连接")
 	} else {
-		check("web server", "WARN", addr+" 未监听（服务可能未运行）")
+		check("web server", "WARN", "未监听（服务可能未运行）")
+	}
+
+	switch {
+	case cfg.Token == "" || cfg.EntryPath == "":
+		check("authentication", "FAIL", "访问令牌或入口路径尚未初始化")
+	case !localAuthWorks(cfg):
+		check("authentication", "WARN", "无法在本机验证登录（服务可能未运行）")
+	default:
+		check("authentication", "OK", "令牌校验通过")
 	}
 
 	if fail > 0 {
@@ -127,6 +169,36 @@ func selfTest() int {
 	}
 	fmt.Println("自检通过")
 	return 0
+}
+
+// localAuthWorks 用本机回环验证认证链路：
+// 无凭据访问入口应返回登录页(200)，带 Bearer 访问 /api/healthz 应 200，
+// 错误令牌应 401。三者都符合才算认证工作正常。
+func localAuthWorks(cfg *config.Config) bool {
+	base := "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.Port)) + cfg.EntryRoute()
+	client := &http.Client{
+		Timeout:       4 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	get := func(path, token string) int {
+		req, err := http.NewRequest(http.MethodGet, base+path, nil)
+		if err != nil {
+			return 0
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+	if get("/api/healthz", cfg.Token) != http.StatusOK {
+		return false
+	}
+	return get("/api/healthz", "0000000000000000000000000000dead") == http.StatusUnauthorized
 }
 
 func mustRead(path string) []byte {
@@ -146,7 +218,7 @@ func menu() {
 		fmt.Println("  3. 停止服务")
 		fmt.Println("  4. 重启服务")
 		fmt.Println("  5. 查看日志")
-		fmt.Println("  6. 查看面板地址")
+		fmt.Println("  6. 查看面板信息")
 		fmt.Println("  7. 检查更新")
 		fmt.Println("  8. 自检")
 		fmt.Println("  a. 清理自有表")
@@ -167,12 +239,7 @@ func menu() {
 		case "5":
 			runCmd("journalctl", "-u", "nft-forward", "-n", "50", "--no-pager")
 		case "6":
-			c := config.Load()
-			host := publicIP()
-			if host == "" {
-				host = c.Listen
-			}
-			fmt.Printf("面板地址: http://%s:%d/\n", host, c.Port)
+			_ = panelInfo()
 		case "7":
 			runUpdate()
 		case "8":
