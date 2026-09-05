@@ -42,14 +42,22 @@ sleep 2
 
 echo "--- 限速下载直到被阻断（最多 8 轮 × 10MiB @ $RATE）---"
 TOTAL=0
+# ★ 取值必须把 curl 的 -w 输出与退出码分开处理。
+# 曾经写成 `got=$(curl ... || echo 0)`：curl 被阻断时**仍然**会通过 -w 打印
+# 已传字节数，随后 `|| echo 0` 再追加一个 "0"，两段拼成一个巨大的假数字
+# （1694960 + 0 → "16949600"），把 11MiB 误读成 26MiB。
 for i in $(seq 1 8); do
-  got=$(ip netns exec nff-client1 curl -s --limit-rate "$RATE" -o /dev/null \
-    -w '%{size_download}' --max-time 40 "http://${HOST_IP}:${PORT}/" 2>/dev/null || echo 0)
+  ip netns exec nff-client1 curl -s --limit-rate "$RATE" -o /dev/null \
+    -w '%{size_download}' --max-time 40 "http://${HOST_IP}:${PORT}/" \
+    > /tmp/nff-quota-size 2>/dev/null
+  got=$(tr -dc '0-9' < /tmp/nff-quota-size)
+  [ -z "$got" ] && got=0
   TOTAL=$((TOTAL + got))
   echo "  第 $i 轮: $got bytes（累计 $TOTAL）"
   # 被阻断的表现：本轮拿到的字节数明显不足一个完整响应
   [ "$got" -lt $((9 * 1024 * 1024)) ] && { echo "  已被阻断"; break; }
 done
+rm -f /tmp/nff-quota-size
 
 sleep 3
 RV=$(nff_curl "$API/api/rules/$ID")

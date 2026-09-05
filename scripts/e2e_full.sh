@@ -292,7 +292,8 @@ timeout 70 curl -sN -H "$AUTH_HDR" "$API/api/events" >/tmp/nff-sse.out 2>/dev/nu
 SP=$!
 sleep 68
 kill $SP 2>/dev/null
-LINES=$(grep -c 'event: snapshot\|: ping' /tmp/nff-sse.out 2>/dev/null || echo 0)
+LINES=$(grep -c 'event: snapshot\|: ping' /tmp/nff-sse.out 2>/dev/null | tr -dc '0-9')
+[ -z "$LINES" ] && LINES=0
 echo "  SSE 行数=$LINES"
 ck "SSE 存活 >60s 且有心跳/快照" 1 "$([ "$LINES" -ge 4 ] && echo 1 || echo 0)"
 
