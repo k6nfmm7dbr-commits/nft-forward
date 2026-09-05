@@ -123,6 +123,10 @@ ck "「安装完成」只在健康确认通过后打印" 0 "$rc"
 sed -n '/^# >>> do-update/,/^# <<< do-update/p' "$TPL" > "$TMPD/du.sh"
 grep -q '检查后端二进制是否同步' "$TMPD/du.sh"; ck "do_update 脚本相同时仍检查二进制" 0 $?
 grep -q 'CORE_REPLACED' "$TMPD/du.sh"; ck "do_update 依据 CORE_REPLACED 决定是否重启" 0 $?
+# 二进制被替换时必须走配置迁移（新版本可能需要新配置字段）
+grep -q 'ensure_panel_conf' "$TMPD/du.sh"; ck "do_update 二进制更新后做配置迁移" 0 $?
+grep -q 'PANEL_CONF.bak' "$TMPD/du.sh"; ck "do_update 快速路径也备份 panel.json" 0 $?
+grep -q 'core_rollback' "$TMPD/du.sh"; ck "do_update 快速路径失败可回滚" 0 $?
 grep -q 'bash -n "\$tmp"' "$TMPD/du.sh"; ck "do_update 下载后做语法校验" 0 $?
 grep -q 'SELF_PATH.bak' "$TMPD/du.sh"; ck "do_update 升级前备份本体" 0 $?
 grep -q '回滚失败' "$TMPD/du.sh"; ck "do_update 回滚失败不被吞掉" 0 $?

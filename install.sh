@@ -662,6 +662,22 @@ do_update() {
     CORE_REPLACED=0
     install_core || die "后端二进制检查/更新失败，已保留现有安装"
     if [[ "${CORE_REPLACED:-0}" == "1" ]]; then
+      # ★ 二进制换了就必须走完整的「配置迁移 + 服务确认」流程。
+      # 只替换二进制然后 restart 是错的：新版本可能需要新配置字段
+      # （v0.3.1 的 token / entry_path / 随机端口就是），缺字段时 serve
+      # 会按设计 fail-closed 拒绝启动，于是健康检查失败、白白回滚一次。
+      CONF_BACKUP=""
+      if [[ -f "$PANEL_CONF" ]]; then
+        cp -p "$PANEL_CONF" "$PANEL_CONF.bak" \
+          || { core_rollback "panel.json 备份失败"; die "升级前备份失败，已回滚"; }
+        chmod 600 "$PANEL_CONF.bak"
+        CONF_BACKUP="$PANEL_CONF.bak"
+      fi
+      if ! ensure_panel_conf; then
+        core_rollback "配置迁移失败"
+        die "配置迁移失败，已回滚到旧版本"
+      fi
+      setup_services
       if start_service; then
         core_backup_commit
         ok "后端二进制已更新"
