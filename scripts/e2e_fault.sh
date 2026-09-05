@@ -155,7 +155,17 @@ RID=$(nff_curl -X POST "$API/api/rules" -H 'Content-Type: application/json' \
 [ -z "$RID" ] && { echo "创建自愈测试规则失败"; exit 1; }
 nff_curl -X PUT "$API/api/rules/$RID/policy" -H 'Content-Type: application/json' \
   -d '{"ip_limit_enabled":true,"ip_limit_max":2}' >/dev/null
+
+# 再建一条 IPv6 目标规则：nff_nat6 只有在存在 IPv6 目标时才会承载真实 DNAT，
+# 否则 desired state 按设计不要求它（删掉也不该重建）。有了这条规则才能
+# 真正验证「删除 nff_nat6 → 下一轮恢复 IPv6 转发」。
+RID6=$(nff_curl -X POST "$API/api/rules" -H 'Content-Type: application/json' \
+  -d '{"name":"heal-v6","protocol":"tcp","listen_port":0,"target_address":"2001:db8::1","target_port":443}' \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))')
+[ -z "$RID6" ] && { echo "创建 IPv6 目标规则失败"; exit 1; }
 sleep 2
+nft list table ip6 nff_nat6 2>/dev/null | grep -q dport
+ck "IPv6 目标规则产生 nff_nat6 DNAT" 0 $?
 
 heal_check() {  # heal_check <描述> <破坏命令> <验证命令>
   local desc="$1" break_cmd="$2" verify_cmd="$3"
@@ -171,14 +181,9 @@ heal_check() {  # heal_check <描述> <破坏命令> <验证命令>
 heal_check "删除 nff_nat4" \
   "nft delete table ip nff_nat4" \
   "nft list table ip nff_nat4 | grep -q 'dport'"
-# nff_nat6 只在存在 IPv6 目标的规则时才会被创建；本机没有 IPv6 目标规则时跳过。
-if nft list tables 2>/dev/null | grep -q 'ip6 nff_nat6'; then
-  heal_check "删除 nff_nat6" \
-    "nft delete table ip6 nff_nat6" \
-    "nft list table ip6 nff_nat6 | grep -q dport"
-else
-  echo "  [SKIP] 自愈: 删除 nff_nat6（本机无 IPv6 目标规则，该表按设计不存在）"
-fi
+heal_check "删除 nff_nat6" \
+  "nft delete table ip6 nff_nat6" \
+  "nft list table ip6 nff_nat6 | grep -q dport"
 heal_check "删除 nff_filter" \
   "nft delete table inet nff_filter" \
   "nft list table inet nff_filter | grep -q nff_filter_up_$RID"
@@ -223,6 +228,8 @@ if nft list table ip nff_nat4 2>/dev/null | grep -q "dport $PORT2"; then rc=1; e
 ck "删除规则后 DNAT 真的撤销（API 成功 == nft 一致）" 0 "$rc"
 if nft list table inet nff_filter 2>/dev/null | grep -q "nff_filter_up_$RID"; then rc=1; else rc=0; fi
 ck "删除规则后遗留 counter 已清理" 0 "$rc"
+# 清理 IPv6 测试规则
+nff_curl -X DELETE "$API/api/rules/$RID6" >/dev/null
 
 echo
 echo "== E. 重启后端口 / 入口 / 令牌不变 =="
