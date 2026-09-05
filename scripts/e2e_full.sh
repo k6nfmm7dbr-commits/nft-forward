@@ -124,43 +124,84 @@ echo "== 5. IP 限制 max=2：第三个 IP 被拒（无超卖）=="
 curl -s -H "$AUTH_HDR" -X PUT "$API/api/rules/$ID/policy" -H 'Content-Type: application/json' \
   -d '{"ip_limit_enabled":true,"ip_limit_max":2}' >/dev/null
 sleep 2
-hold() {
-  ip netns exec "$1" setsid python3 -c "
-import socket,time
+
+# 长连接保持器写成独立脚本文件，不用 python -c 内联：
+# 内联字符串要同时穿过 shell 双引号插值与 python 引号，非常容易在不同环境下
+# 静默失败（表现为结果文件根本没生成，无法区分「脚本没跑」与「连接失败」）。
+# 独立文件 + 参数传递 + stderr 落盘，任何失败都能定位。
+cat > /tmp/nff-hold.py <<'PY'
+import socket, sys, time
+
+host, port, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+
+
 def once():
-    s=socket.socket(); s.settimeout(10); s.connect(('$HOST_IP',$PORT))
-    s.sendall(b'GET /small HTTP/1.1\r\nHost: x\r\n\r\n')
-    d=s.recv(200)
-    if b'BACKEND_OK' not in d:
-        s.close(); raise RuntimeError('bad response')
+    s = socket.socket()
+    s.settimeout(10)
+    s.connect((host, port))
+    s.sendall(b"GET /small HTTP/1.1\r\nHost: x\r\n\r\n")
+    data = s.recv(200)
+    if b"BACKEND_OK" not in data:
+        s.close()
+        raise RuntimeError("bad response: %r" % data[:60])
     return s
-# IP 限制的授予存在毫秒级竞态（放行 SYN → 准入循环授予 slot → established 放行），
-# 首次尝试可能恰好落在窗口内被 drop。这是已知设计限制，因此重试 3 次。
-s=None
-for i in range(3):
+
+
+# IP 限制的授予存在毫秒级竞态（放行 SYN → 准入循环 500ms 授予 slot →
+# established 放行），首次尝试可能恰好落在窗口内被 drop。重试 3 次。
+sock = None
+last = None
+for _ in range(3):
     try:
-        s=once(); break
-    except Exception as e:
-        last=e; time.sleep(1.5)
-if s is None:
-    open('/tmp/hold_$1','w').write('FAIL:'+str(last))
-else:
-    open('/tmp/hold_$1','w').write('OK')
+        sock = once()
+        break
+    except Exception as exc:  # noqa: BLE001 - 需要保留原始错误文本
+        last = exc
+        time.sleep(1.5)
+
+with open(out, "w") as f:
+    f.write("OK" if sock is not None else "FAIL:%s" % last)
+    f.flush()
+
+if sock is not None:
     time.sleep(45)
-" >/dev/null 2>&1 &
+PY
+
+hold() {  # hold <netns>
+  ip netns exec "$1" setsid python3 /tmp/nff-hold.py "$HOST_IP" "$PORT" "/tmp/hold_$1" \
+    > "/tmp/hold_err_$1" 2>&1 &
 }
-rm -f /tmp/hold_nff-client*
+rm -f /tmp/hold_nff-client* /tmp/hold_err_nff-client*
 hold nff-client1
 sleep 3
 hold nff-client2
 # 等两个 hold 都写出结果（内部各自最多重试 3 次 × 1.5s，故上限约 12s）
-for _ in $(seq 1 16); do
+for _ in $(seq 1 20); do
   [ -s /tmp/hold_nff-client1 ] && [ -s /tmp/hold_nff-client2 ] && break
   sleep 1
 done
 echo "  c1=$(cat /tmp/hold_nff-client1 2>/dev/null) c2=$(cat /tmp/hold_nff-client2 2>/dev/null)"
+for c in nff-client1 nff-client2; do
+  if [ ! -s "/tmp/hold_$c" ] && [ -s "/tmp/hold_err_$c" ]; then
+    echo "  [$c stderr] $(head -3 "/tmp/hold_err_$c")"
+  fi
+done
 ck "前两个 IP 获得授权" "OKOK" \
   "$(cat /tmp/hold_nff-client1 2>/dev/null)$(cat /tmp/hold_nff-client2 2>/dev/null)"
+
+# ★ 必须等策略层真的记满 2 个 granted 才让 client3 尝试。
+# 否则 client3 可能抢在 client2 被授予之前发起连接 —— 那时只有 1 个 granted，
+# 它会合法地拿到第 2 个名额（先到先得，不是超卖），断言就会假失败。
+granted_count() {
+  curl -s -H "$AUTH_HDR" "$API/api/rules/$ID/ips" |
+    python3 -c 'import json,sys;print(len(json.load(sys.stdin).get("ips") or []))'
+}
+for _ in $(seq 1 20); do
+  [ "$(granted_count)" = "2" ] && break
+  sleep 1
+done
+echo "  当前 granted 数 = $(granted_count)（应为 2，名额已占满）"
+ck "名额已被前两个 IP 占满" 2 "$(granted_count)"
 OK3=0
 for _ in 1 2 3; do
   R3=$(ip netns exec nff-client3 curl -s --max-time 6 "http://$HOST_IP:$PORT/small" 2>/dev/null | tr -d '\r\n')
@@ -168,7 +209,13 @@ for _ in 1 2 3; do
   sleep 2
 done
 ck "第三个 IP 被拒" 0 "$OK3"
-pkill -f 'socket.socket' 2>/dev/null
+# 拒绝必须体现在策略状态里（而不是仅仅连接超时）
+REJ=$(curl -s -H "$AUTH_HDR" "$API/api/rules/$ID/ips" |
+  python3 -c 'import json,sys;print(len(json.load(sys.stdin).get("rejected") or []))')
+ck "被拒 IP 记入 rejected 列表" 1 "$([ "$REJ" -ge 1 ] && echo 1 || echo 0)"
+# 无超卖：granted 数不得超过 max_ips
+ck "granted 未超卖（<=2）" 1 "$([ "$(granted_count)" -le 2 ] && echo 1 || echo 0)"
+pkill -f 'nff-hold.py' 2>/dev/null
 curl -s -H "$AUTH_HDR" -X PUT "$API/api/rules/$ID/policy" -H 'Content-Type: application/json' \
   -d '{"ip_limit_enabled":false}' >/dev/null
 sleep 3
