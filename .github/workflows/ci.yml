@@ -57,6 +57,18 @@ jobs:
         id: nftcap
         run: |
           sudo apt-get install -y -qq nftables conntrack >/dev/null 2>&1 || true
+          # conntrack 是在线 IP / IP 限制的事实来源：先尽力加载模块并开启字节计费。
+          sudo modprobe nf_conntrack 2>/dev/null || true
+          sudo sysctl -w net.netfilter.nf_conntrack_acct=1 >/dev/null 2>&1 || true
+          echo "--- conntrack 探测 ---"
+          if sudo test -r /proc/net/nf_conntrack; then
+            echo "ct=true" >> "$GITHUB_OUTPUT"
+            echo "可读，当前条目数：$(sudo wc -l < /proc/net/nf_conntrack)"
+            echo "nf_conntrack_acct=$(sudo sysctl -n net.netfilter.nf_conntrack_acct 2>/dev/null || echo '?')"
+          else
+            echo "ct=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::runner 上 /proc/net/nf_conntrack 不可读，在线 IP / IP 限制无法在 CI 验证"
+          fi
           if sudo nft list tables >/dev/null 2>&1 && sudo ip netns add nff-cap-probe 2>/dev/null; then
             sudo ip netns del nff-cap-probe
             echo "ok=true" >> "$GITHUB_OUTPUT"
