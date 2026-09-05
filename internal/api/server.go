@@ -337,18 +337,26 @@ func (s *Server) PublishSSE(event string, payload any) {
 // snapshotStructKey 计算快照的结构哈希（清零时间与速率，只比较规则结构 / 在线 IP / 配额）。
 // 速率和采集时间每个周期都在变，但不应触发 SSE 重播；只有结构性变化
 // （IP 上下线、配额状态、规则增删改、DNS 目标变化）才推送。
-func (s *Server) snapshotStructKey() string {
-	snap := s.buildFullSnapshot()
+//
+// 传入已构建好的快照，避免为了算 key 再查一次库。
+func snapshotStructKey(snap FullSnapshot) string {
 	snap.Now = 0
 	snap.Rate = traffic.Rate{}
-	for i := range snap.Rules {
-		snap.Rules[i].Rate = traffic.Rate{}
+	// Rules 是切片，需要深拷贝一层再清零速率，否则会改到调用方要发布的那份。
+	rules := make([]RuleView, len(snap.Rules))
+	copy(rules, snap.Rules)
+	for i := range rules {
+		rules[i].Rate = traffic.Rate{}
 	}
+	snap.Rules = rules
 	b, _ := json.Marshal(snap)
 	return string(b)
 }
 
 // PublishSnapshotTick 周期兜底广播：仅在有订阅者且结构发生变化时推送。
+//
+// 快照只构建一次（含两条批量 SQL）：先用它算结构 key，变化时直接发布同一份。
+// 旧实现调用 buildFullSnapshot 两次，等于每 2s 白查一遍库。
 func (s *Server) PublishSnapshotTick() {
 	s.subsMu.Lock()
 	n := len(s.subs)
@@ -356,7 +364,8 @@ func (s *Server) PublishSnapshotTick() {
 	if n == 0 {
 		return
 	}
-	key := s.snapshotStructKey()
+	snap := s.buildFullSnapshot()
+	key := snapshotStructKey(snap)
 	s.lastSnapMu.Lock()
 	changed := key != s.lastSnapKey
 	if changed {
@@ -366,7 +375,7 @@ func (s *Server) PublishSnapshotTick() {
 	if !changed {
 		return
 	}
-	s.PublishSSE("snapshot", s.buildFullSnapshot())
+	s.PublishSSE("snapshot", snap)
 }
 
 // handleEvents 是 SSE 端点：首包完整 snapshot，之后按变化推送。

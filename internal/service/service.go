@@ -91,7 +91,9 @@ func Serve() int {
 	// conntrack 不可用**不影响**这里：结构 enforcement（DNAT/counter/quota）
 	// 不依赖 conntrack，只有 IP slot 会进入冻结状态。
 	if reconcileWithRetry(ctx, pol) {
-		slog.Info("数据面就绪（首轮 nft enforcement 成功）", "entry", cfg.EntryRoute()+"/")
+		// 入口路径不写日志：journald 通常对所有用户可读，
+		// 把随机入口写进日志等于削弱它的作用。要看地址用 `nff` 菜单。
+		slog.Info("数据面就绪（首轮 nft enforcement 成功）")
 	} else {
 		slog.Error("首轮 nft enforcement 失败：数据面未就绪，/healthz 将返回 503；" +
 			"周期 reconcile 会继续尝试恢复")

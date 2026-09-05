@@ -288,11 +288,6 @@ func (st *Store) ListEnabled(ctx context.Context) ([]*Rule, error) {
 	return out, nil
 }
 
-// Begin 开启事务（供 RuleMutationService 做 candidate → commit）。
-func (st *Store) Begin(ctx context.Context) (*sql.Tx, error) {
-	return st.db.BeginTx(ctx, nil)
-}
-
 func b2i(b bool) int {
 	if b {
 		return 1

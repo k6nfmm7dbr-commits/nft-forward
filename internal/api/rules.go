@@ -231,8 +231,16 @@ func (s *Server) sendRuleErr(w http.ResponseWriter, r *http.Request, err error) 
 }
 
 // publishSnapshot 向所有 SSE 订阅者广播最新全量快照。
+//
+// 顺带刷新 lastSnapKey：否则「变更后立即广播」与「2s 周期广播」会各自算 key，
+// 周期广播会因为 key 未更新而重复发一遍同样的快照。
 func (s *Server) publishSnapshot() {
-	s.PublishSSE("snapshot", s.buildFullSnapshot())
+	snap := s.buildFullSnapshot()
+	key := snapshotStructKey(snap)
+	s.lastSnapMu.Lock()
+	s.lastSnapKey = key
+	s.lastSnapMu.Unlock()
+	s.PublishSSE("snapshot", snap)
 }
 
 // PublishSnapshotNow 立即广播全量快照（供规则变更服务在提交成功后调用）。
