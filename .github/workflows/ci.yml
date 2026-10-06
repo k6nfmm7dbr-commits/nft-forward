@@ -18,7 +18,7 @@ jobs:
       # actions/setup-go@v5
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: "1.23"
+          go-version: "1.27.1"
 
       - name: gofmt
         run: |
@@ -164,7 +164,7 @@ jobs:
   # 时区等与 libc 相关的路径。不跑 -race（race 需要 cgo + gcc，与分发形态不同）。
   test-alpine:
     runs-on: ubuntu-latest
-    container: golang:1.23-alpine
+    container: golang:1.27-alpine
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
@@ -192,12 +192,12 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: "1.23"
+          go-version: "1.27.1"
 
       - name: govulncheck
         run: |
           # 固定版本，避免 @latest 引入未经评审的工具链变更
-          go install golang.org/x/vuln/cmd/govulncheck@v1.1.3
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
           "$(go env GOPATH)/bin/govulncheck" ./...
 
   # 二进制分发：main 全部测试通过后，把全架构产物发布到 dist 分支（rolling latest）。
@@ -218,7 +218,7 @@ jobs:
       # actions/setup-go@v5
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: "1.23"
+          go-version: "1.27.1"
 
       - name: 判断是否影响产物/安装器（纯 docs 跳过）
         id: changed

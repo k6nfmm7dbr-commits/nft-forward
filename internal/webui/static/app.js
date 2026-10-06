@@ -167,15 +167,12 @@ function statusOf(st) { return STATUS[st] || STATUS.normal; }
 
 var PROTO_LABEL = { tcp: 'TCP', udp: 'UDP', 'tcp+udp': 'TCP + UDP' };
 
-// forwardAddr 返回「可直接复制给客户端使用」的转发地址：当前访问面板所用的主机
-// 加上该规则的监听端口。面板既然能被你打开，这个主机名/IP 就一定是可达的。
+// addrHost 返回「可直接复制给客户端使用」的转发主机（IP 或域名）：就是你当前
+// 访问面板用的那个主机。面板既然能被你打开，它就一定是可达的。
 function addrHost() {
   var host = location.hostname || location.host || '';
   return host.indexOf(':') >= 0 ? '[' + host + ']' : host;
 }
-
-// forwardAddr 返回可直接粘贴使用的「主机:端口」形式（复制按钮用）。
-function forwardAddr(port) { return addrHost() + ':' + port; }
 
 // copyText 复制到剪贴板。面板通常是纯 HTTP（非安全上下文），此时
 // navigator.clipboard 不可用，必须回退到 textarea + execCommand。
@@ -248,7 +245,7 @@ function ruleCard(r) {
         '<b data-copy-val="' + esc(addrHost()) + '" title="点按复制 IP">' + esc(addrHost()) + '</b>' +
         ' <b data-copy-val="' + esc(r.listen_port) + '" title="点按复制端口">' + esc(r.listen_port) + '</b>' +
       '</div>' +
-      '<button class="mini-btn" data-copy-addr="' + r.id + '" title="复制 IP:端口">复制</button>' +
+      '<button class="mini-btn" data-copy-addr="' + r.id + '" title="复制 IP">复制 IP</button>' +
     '</div>' +
     '<div class="rule-target"><span>目标</span><b data-rule-target>' + esc(target) + '</b></div>' +
     '<div class="node-stats">' +
@@ -621,12 +618,11 @@ function showPolicy(id) {
   sect.classList.toggle('hidden', !isDomain);
   if (isDomain) {
     document.getElementById('pol-dns-host').textContent = r.target_address || '—';
-    var addr = forwardAddr(r.listen_port);
-  setKV('pol-addr-ip', addrHost(), '—');
+    setKV('pol-addr-ip', addrHost(), '—');
   setKV('pol-addr-port', String(r.listen_port), '—');
   document.getElementById('pol-addr-ip').onclick = function () { copyText(addrHost(), '已复制 ' + addrHost()); };
   document.getElementById('pol-addr-port').onclick = function () { copyText(String(r.listen_port), '已复制端口 ' + r.listen_port); };
-  document.getElementById('pol-copy-addr').onclick = function () { copyText(addr, '已复制 ' + addr); };
+  document.getElementById('pol-copy-addr').onclick = function () { copyText(addrHost(), '已复制 IP ' + addrHost()); };
   setKV('pol-dns-v4', r.resolved_ipv4, '（无 A 记录）');
     setKV('pol-dns-v6', r.resolved_ipv6 ? '[' + r.resolved_ipv6 + ']' : '', '（无 AAAA 记录）');
     var stEl = document.getElementById('pol-dns-status');
@@ -859,7 +855,7 @@ document.getElementById('rule-cards').addEventListener('click', function (e) {
   if (cp) {
     var rid = cp.getAttribute('data-copy-addr');
     var rule = (state.summary && state.summary.rules || []).filter(function (x) { return String(x.id) === String(rid); })[0];
-    if (rule) copyText(forwardAddr(rule.listen_port), '已复制转发地址 ' + forwardAddr(rule.listen_port));
+    if (rule) copyText(addrHost(), '已复制 IP ' + addrHost());
     return;
   }
   var ips = e.target.closest('[data-view-ips]');

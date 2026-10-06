@@ -434,6 +434,17 @@ grep -qx 'install.sh' "$ROOT/scripts/dist-manifest.txt"; ck "分发清单含 ins
 grep -qx 'install.sh.sha256' "$ROOT/scripts/dist-manifest.txt"; ck "分发清单含 install.sh.sha256" 0 $?
 grep -q 'install.sh.sha256' "$ROOT/scripts/artifact_check.sh"; ck "产物自检校验安装器哈希" 0 $?
 
+# M-4b Go 工具链与依赖：与 SBX 一致的 1.27.1（Go 1.23 的标准库带已知 CVE，
+# govulncheck 曾报出 10 条 net/http / crypto/tls / crypto/x509 / net/url 漏洞）。
+GOMOD="$ROOT/go.mod"
+grep -qE '^go 1\.27' "$GOMOD"; ck "go.mod 使用 Go 1.27 工具链" 0 $?
+grep -q 'x/sys v0.44.0' "$GOMOD"; ck "x/sys 已升到修复版（v0.44.0）" 0 $?
+grep -q 'go-version: "1.27.1"' "$ROOT/.github/workflows/ci.yml"; ck "CI 使用 Go 1.27.1" 0 $?
+grep -q 'golang:1.27-alpine' "$ROOT/.github/workflows/ci.yml"; ck "musl 任务用 1.27 镜像" 0 $?
+
+# M-4c 单规则趋势必须有覆盖索引（否则每次都是全表扫描）。
+grep -q 'idx_daily_rule' "$ROOT/internal/database/db.go"; ck "traffic_daily 有单规则覆盖索引" 0 $?
+
 # M-5 CI 覆盖：musl 与供应链漏洞扫描。
 CI="$ROOT/.github/workflows/ci.yml"
 grep -q 'test-alpine:' "$CI"; ck "CI 含 Alpine/musl 任务" 0 $?

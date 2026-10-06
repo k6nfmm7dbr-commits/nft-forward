@@ -67,6 +67,11 @@ CREATE TABLE IF NOT EXISTS traffic_daily (
     PRIMARY KEY (day, rule_id)
 );
 CREATE INDEX IF NOT EXISTS idx_daily_day ON traffic_daily(day);
+-- 单规则趋势查询（WHERE rule_id=? ORDER BY day DESC LIMIT ?）无法用主键 (day, rule_id)
+-- 的前缀，没有这条索引就只能全表扫描；规则详情页与 60s 轮询都会走它。
+-- 覆盖索引：查询只取 day/upload/download，索引本身即可满足，不回表。
+CREATE INDEX IF NOT EXISTS idx_daily_rule
+    ON traffic_daily(rule_id, day, upload_bytes, download_bytes);
 CREATE TABLE IF NOT EXISTS traffic_totals (
     rule_id        INTEGER PRIMARY KEY,
     upload_bytes   INTEGER NOT NULL DEFAULT 0,

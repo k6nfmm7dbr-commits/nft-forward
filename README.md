@@ -4,7 +4,7 @@
 
 <p>
   <img alt="version" src="https://img.shields.io/badge/version-v0.4.0-blue">
-  <img alt="go" src="https://img.shields.io/badge/Go-1.23%2B-00ADD8">
+  <img alt="go" src="https://img.shields.io/badge/Go-1.27.1%2B-00ADD8">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
   <img alt="backend" src="https://img.shields.io/badge/dataplane-nftables--only-orange">
   <img alt="cgo" src="https://img.shields.io/badge/CGO-disabled-lightgrey">

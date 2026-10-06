@@ -26,7 +26,7 @@
 - **规则卡片去掉「监听端口」一行**：端口已在转发地址里，重复展示只占地方；
   卡片元信息只保留协议标签。
 - **规则卡片新增「转发地址」行与复制**：显示 `IP 端口`（空格分隔，两个 token
-  各自可点按复制），右侧「复制」按钮复制可直接粘贴的 `IP:端口`。刻意不用后端
+  各自可点按复制），右侧「复制 IP」按钮只复制 IP（不含端口）。刻意不用后端
   探测的「本机 IP」—— 那是主机属性而不是规则属性，多网卡/多 IP 时必然误导
   （后端已因此删掉 `listen_addr`）；用当前访问面板的主机则永远等于你实际能连通
   的那条路径。规则详情抽屉里也有同一份地址与复制按钮。
@@ -60,6 +60,26 @@
   SHA256：取到校验和就必须匹配（fail-closed），取不到才降级为告警 + 语法检查。
 - 升级路径改为从**同一个 immutable dist revision** 取「脚本 + 校验和 + 二进制」，
   消除发布窗口内「新脚本 + 旧二进制」的错位组合（旧行为会白失败一次升级）。
+
+### 安全：工具链升级到 Go 1.27.1
+
+- 项目此前固定在 Go 1.23。`govulncheck` 报出 **10 条标准库漏洞**（`net/http`、
+  `crypto/tls`、`crypto/x509`、`net/url`、`net/textproto`、`net`），修复版本在
+  Go 1.25.x 以上 —— 也就是说旧工具链构建出来的面板带着已知 CVE。
+- 现在与 SBX 一致使用 **Go 1.27.1**（`go.mod` / CI / musl 镜像 / README 徽章），
+  `govulncheck` 复查：**影响代码的漏洞 0 条**。
+- 顺带把间接依赖 `golang.org/x/sys` 从 v0.22.0 升到 v0.44.0（清掉最后一条
+  仅 Windows 平台、且代码未调用的告警）。这是本轮唯一的依赖变更。
+
+### 性能：单规则趋势补上覆盖索引
+
+- `traffic_daily` 的主键是 `(day, rule_id)`，而规则详情页查的是
+  `WHERE rule_id=? ORDER BY day DESC LIMIT ?` —— 无法命中主键前缀，只能全表扫描。
+  新增覆盖索引 `idx_daily_rule(rule_id, day, upload_bytes, download_bytes)`。
+- 真机实测（50 规则 × 1095 天 = 54,750 行）：**0.475 ms → 0.134 ms**（3.5×），
+  执行计划从全表扫描变为 `SEARCH traffic_daily USING COVERING INDEX idx_daily_rule`。
+- 索引在 `Schema` 里用 `CREATE INDEX IF NOT EXISTS` 声明，老库在下次启动时自动补建，
+  不重写任何数据。
 
 ### CI
 
