@@ -406,7 +406,8 @@ grep -q 'id="status-txt"' "$ROOT/internal/webui/static/index.html"; ck "连接�
 
 # M-1c 规则卡片：端口并入转发地址（IP 空格 端口），不再单列「监听端口」。
 # 只允许「添加成功」的提示语里出现端口字样；卡片 DOM 里不得再有监听端口行。
-CARD=$(sed -n '/^function ruleCard/,/^}/p' "$ROOT/internal/webui/static/app.js")
+# 剥掉 // 注释再查：注释里解释「为什么不再单列」是有效文档，不是回归。
+CARD=$(sed -n '/^function ruleCard/,/^}/p' "$ROOT/internal/webui/static/app.js" | sed 's|//.*$||')
 if printf '%s' "$CARD" | grep -q '监听端口'; then rc=1; else rc=0; fi
 ck "规则卡片不再单列监听端口" 0 "$rc"
 grep -q 'data-copy-val' "$ROOT/internal/webui/static/app.js"; ck "地址 token 可点按复制" 0 $?
