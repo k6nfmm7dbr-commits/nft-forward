@@ -3,34 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="light">
 <title>NFT Forward · 端口转发面板</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
-<header class="topbar">
-  <div class="brand">
-    <span class="logo" aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11l-3-3M20 17H9l3 3"/></svg>
-    </span>
-    <div class="brand-txt">
-      <strong>NFT Forward 面板</strong>
-      <small>nftables 端口转发 · 流量监控</small>
-    </div>
-  </div>
-  <div class="topbar-right">
-    <div class="conn-chip">
-      <span id="pulse"></span>
-      <em id="status-txt">连接中…</em>
-    </div>
-    <form class="logout-form" method="post" action="logout">
-      <button type="submit" class="icon-btn" id="btn-logout" aria-label="退出登录" title="退出登录">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>
-      </button>
-    </form>
-  </div>
-</header>
 
 <main class="wrap">
 
@@ -38,9 +16,15 @@
   <section class="view on" id="view-home">
 
     <div class="hero glass">
-      <div class="hero-label">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
-        <span>实时速率</span>
+      <div class="hero-head">
+        <div class="hero-label">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+          <span>实时速率</span>
+        </div>
+        <div class="conn-chip">
+          <span id="pulse"></span>
+          <em id="status-txt">连接中…</em>
+        </div>
       </div>
       <div id="hero-rate" class="hero-rate">—</div>
       <div class="hero-pair">
@@ -126,6 +110,13 @@
     </div>
   </section>
 
+  <!-- 面板底部：低频操作（退出登录）。顶部品牌/状态栏已按 SBX 的设计移除。 -->
+  <footer class="panel-foot">
+    <form class="logout-form" method="post" action="logout">
+      <button type="submit" class="mini-btn" id="btn-logout">退出登录</button>
+    </form>
+  </footer>
+
 </main>
 
 <!-- ===== 底部导航 ===== -->
@@ -207,6 +198,15 @@
   </header>
 
   <div class="drawer-body">
+    <section class="sect">
+      <div class="sect-title">转发地址（复制给客户端）</div>
+      <div class="rule-addr">
+        <div class="addr-text"><span>转发地址（IP 端口）</span><br>
+          <b id="pol-addr-ip" title="点按复制 IP">—</b> <b id="pol-addr-port" title="点按复制端口">—</b>
+        </div>
+        <button type="button" class="mini-btn" id="pol-copy-addr" title="复制 IP:端口">复制</button>
+      </div>
+    </section>
     <section class="sect">
       <div class="sect-title">转发设置</div>
       <div class="field">

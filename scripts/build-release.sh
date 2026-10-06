@@ -33,6 +33,21 @@ build_one riscv64 riscv64
 
 cd "$OUT" || exit 1
 sha256sum nft-forward-linux-* > SHA256SUMS
+
+# 安装器自校验清单：发布版 install.sh 的 SHA256。
+#
+# 为什么需要它：`nff --update` 会下载新的 install.sh 并**执行**它。此前对新脚本
+# 只有 `bash -n`（语法）与 APP_VERSION 存在性两项检查 —— 一个被篡改/损坏的脚本
+# 只要语法正确就能在 root 下执行。这里把「发布版安装器」与它的哈希一并发布，
+# 让升级路径能在执行前做密码学校验（与二进制同等对待）。
+#
+# 同时把 install.sh 本身也放进 dist：升级路径从**同一个 immutable revision**
+# 取脚本 + 校验和 + 二进制，三者必然同源（对齐 SBX 的 dist 布局）。
+cp -f ../install.sh ./install.sh
+chmod 0644 ./install.sh
+sha256sum install.sh > install.sh.sha256
+cat install.sh.sha256
+
 echo "---- 产物 ----"
 ls -la
 echo "---- SHA256SUMS ----"

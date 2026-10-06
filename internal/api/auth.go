@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/webui"
 )
@@ -19,14 +20,34 @@ const cookieMaxAge = 604800
 
 // ---- 静态资源读取 ----
 
-// assetBytes 从内嵌前端读取文件。
+// assetCache 缓存内嵌前端资源的字节内容（name -> []byte）。
+//
+// 为什么可以永久缓存：资源经 go:embed 编进二进制，进程生命周期内**不可能变化**
+// （升级 = 换二进制 = 换进程）。旧实现每次请求都 Open + io.ReadAll 拷贝一份新副本
+// （app.js 31KB / style.css 22KB / index.html 13KB），每次页面加载或刷新都要多分配
+// 一份；`?v=` 之类的查询串不影响缓存键（按文件名缓存）。
+//
+// 返回值是只读共享切片：调用方只把它写进 HTTP 响应，绝不修改。
+var assetCache sync.Map
+
+// assetBytes 从内嵌前端读取文件（结果进程内缓存）。
 func assetBytes(name string) ([]byte, error) {
-	f, err := webui.FS().Open(strings.TrimLeft(name, "/"))
+	name = strings.TrimLeft(name, "/")
+	if v, ok := assetCache.Load(name); ok {
+		return v.([]byte), nil
+	}
+	f, err := webui.FS().Open(name)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	return io.ReadAll(f)
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
+	// 并发首读可能重复读取同一资源，结果逐字节相同，无害。
+	assetCache.Store(name, b)
+	return b, nil
 }
 
 // ---- 响应输出 ----

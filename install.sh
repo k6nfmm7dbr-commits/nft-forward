@@ -13,7 +13,7 @@
 set -Eeuo pipefail
 
 APP_NAME="NFT Forward"
-APP_VERSION="0.3.2"
+APP_VERSION="0.4.0"
 REPO="k6nfmm7dbr-commits/nft-forward"
 RAW_URL="${NFF_RAW_URL:-https://raw.githubusercontent.com/${REPO}/main/install.sh}"
 # 二进制走 dist 分支（rolling latest，与 Git Tag 无关）。raw 对同一路径总返回
@@ -238,6 +238,43 @@ EOF
 # 更新判断基于「代码内容」而非版本号：dist 是 rolling latest，二进制内容会变
 # 而版本号可能不变。先取 SHA256SUMS 与本地二进制做 sha256 比较，一致则跳过，
 # 不一致才下载替换。绝不能用「版本号相等」判断跳过（旧二进制会永远刷不掉）。
+# resolve_dist_sha 解析 dist 分支当前的 commit SHA。
+#
+# 为什么需要：dist 是 rolling latest（force-push 重建），两次下载之间它可能变化。
+# 用 immutable revision 取「同一份发布」的脚本、校验和与二进制，才能保证三者
+# 互相一致；否则可能出现「脚本来自新发布、二进制来自旧发布」的错位组合
+# （有 SHA256 兜底不会装错，但会白白失败一次升级）。
+# 解析失败返回空串，调用方回退到 RAW_BASE（仍有 SHA256 fail-closed 兜底）。
+resolve_dist_sha() {
+  local sha=""
+  if command -v git >/dev/null 2>&1; then
+    sha=$(git ls-remote "https://github.com/${REPO}.git" refs/heads/dist 2>/dev/null | awk '{print $1}')
+  else
+    local refs_json
+    refs_json=$(curl -fsSL -m 15 "https://api.github.com/repos/${REPO}/git/ref/heads/dist" 2>/dev/null) || refs_json=""
+    sha=$(grep -m1 '"sha"' <<< "$refs_json" | sed -E 's/.*"sha"[[:space:]]*:[[:space:]]*"([0-9a-f]+)".*/\1/')
+  fi
+  # 只接受 40 位十六进制：防止把错误信息/HTML 当成 revision 拼进 URL
+  if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+    printf '%s' "$sha"
+  fi
+  return 0
+}
+
+# verify_script_checksum <脚本文件> <校验和文件> <脚本名>
+#
+# 校验和文件格式兼容两种：`<sha>  <name>`（sha256sum 输出）与仅 `<sha>`。
+# 找不到对应条目时返回 2（调用方决定是 fail-closed 还是仅告警），
+# 校验不匹配返回 1。
+verify_script_checksum() {
+  local file="$1" sums="$2" name="${3:-install.sh}" want got
+  want=$(awk -v x="$name" 'NF>=2 && $2==x {print $1; found=1; exit} NF==1 && !found {print $1; found=1}' "$sums" 2>/dev/null)
+  [[ -z "$want" ]] && return 2
+  got=$(sha256_of "$file" 2>/dev/null || true)
+  [[ -n "$got" && "$got" == "$want" ]] && return 0
+  return 1
+}
+
 install_core() {
   install -d -m 0755 "$BIN_DIR"
   CORE_REPLACED=0
@@ -265,17 +302,7 @@ install_core() {
   dl="$BIN_DIR/.nft-forward.dl.$$"
   cleanup_dl() { rm -rf "$tmp" "$dl" 2>/dev/null || true; }
 
-  # 解析 dist 分支当前 commit，用 immutable revision 下载 binary 与 SHA256SUMS，
-  # 避免两次下载之间 dist 被 force-push 导致版本错位。解析失败回退 RAW_BASE
-  # （仍有 SHA256 校验 fail-closed 兜底，错位只会失败、不会装错）。
-  dist_sha=""
-  if command -v git >/dev/null 2>&1; then
-    dist_sha=$(git ls-remote "https://github.com/${REPO}.git" refs/heads/dist 2>/dev/null | awk '{print $1}')
-  else
-    local refs_json
-    refs_json=$(curl -fsSL -m 15 "https://api.github.com/repos/${REPO}/git/ref/heads/dist" 2>/dev/null) || refs_json=""
-    dist_sha=$(grep -m1 '"sha"' <<< "$refs_json" | sed -E 's/.*"sha"[[:space:]]*:[[:space:]]*"([0-9a-f]+)".*/\1/')
-  fi
+  dist_sha="$(resolve_dist_sha)"
   if [[ -n "$dist_sha" ]]; then
     base="https://raw.githubusercontent.com/${REPO}/$dist_sha"
   else
@@ -413,6 +440,10 @@ setup_services() {
 Description=NFT Forward panel (nftables port forwarding + traffic stats)
 After=network-online.target nss-lookup.target
 Wants=network-online.target
+# 面板是运维入口：宁可一直重试，也不要被 systemd 的默认启动次数限制
+# （10 秒内 5 次）判死 —— 那会让面板「突然打不开」且必须人工 start 才能恢复。
+# RestartSec=3 已提供退避，这里把限制彻底关掉。
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -725,12 +756,43 @@ do_update() {
   require_root
   detect_platform
 
-  local tmp new_ver current_sha remote_sha same_content="no"
+  local tmp new_ver current_sha remote_sha same_content="no" dist_sha script_url sums_url sums rc
   tmp=$(mktemp)
+  sums="$(mktemp)"
   info "从 GitHub 拉取最新版本..."
-  if ! curl -fsSL -m 60 -o "$tmp" "$(gh_url "$RAW_URL")"; then
-    rm -f "$tmp"; die "下载失败，可设置 NFF_GH_PROXY 使用镜像后重试"
+
+  # 脚本与校验和都从**同一个 immutable dist revision** 取（与二进制同源），
+  # 避免发布窗口内「新脚本 + 旧二进制」的错位组合。dist 解析失败时回退 main。
+  dist_sha="$(resolve_dist_sha)"
+  if [[ -n "$dist_sha" ]]; then
+    script_url="https://raw.githubusercontent.com/${REPO}/${dist_sha}/install.sh"
+    sums_url="https://raw.githubusercontent.com/${REPO}/${dist_sha}/install.sh.sha256"
+  else
+    script_url="$RAW_URL"
+    sums_url="$RAW_BASE/install.sh.sha256"
   fi
+
+  if ! curl -fsSL -m 60 -o "$tmp" "$(gh_url "$script_url")"; then
+    rm -f "$tmp" "$sums"; die "下载失败，可设置 NFF_GH_PROXY 使用镜像后重试"
+  fi
+
+  # 安装器自校验：在执行**任何**新脚本之前先验证它的 SHA256。
+  #
+  # 此前对新脚本只有 `bash -n` 与 APP_VERSION 存在性两项检查 —— 一个语法正确的
+  # 被篡改/损坏脚本会在 root 下直接执行。取到校验和就必须匹配（fail-closed）；
+  # 取不到（例如更早的 dist 还没有该文件）才退化为告警 + 语法/版本检查。
+  if curl -fsSL -m 30 -o "$sums" "$(gh_url "$sums_url")" 2>/dev/null && [[ -s "$sums" ]]; then
+    rc=0; verify_script_checksum "$tmp" "$sums" install.sh || rc=$?
+    case "$rc" in
+      0) info "安装器 SHA256 校验通过" ;;
+      2) warn "校验和文件不含 install.sh 条目，已跳过脚本完整性校验" ;;
+      *) rm -f "$tmp" "$sums"; die "安装器 SHA256 校验失败，已放弃升级（未改动现有安装）" ;;
+    esac
+  else
+    warn "未取到 install.sh.sha256，已跳过脚本完整性校验（仍做语法与版本标记检查）"
+  fi
+  rm -f "$sums"
+
   # 基本完整性校验：语法 + 版本标记（避免把 404 页面当脚本装上）
   if ! bash -n "$tmp" 2>/dev/null; then
     rm -f "$tmp"; die "下载的脚本语法校验失败，已放弃升级（未改动现有安装）"

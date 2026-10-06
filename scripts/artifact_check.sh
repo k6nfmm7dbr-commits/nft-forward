@@ -33,6 +33,16 @@ while read -r _ name; do
   esac
 done < SHA256SUMS
 
+# 安装器自校验清单：必须存在，且与仓库内的 install.sh 完全一致。
+#
+# 用途：`nff --update` 在执行新下载的 install.sh 之前用它做密码学校验。
+# 清单与脚本不同步 = 升级路径会对所有人 fail-closed，因此必须在发布前拦住。
+[[ -s "install.sh.sha256" ]] || fail "install.sh.sha256 缺失或为空"
+exp_inst="$(awk 'NF{print $1; exit}' install.sh.sha256)"
+got_inst="$(sha256sum "$ROOT/install.sh" | awk '{print $1}')"
+[[ "$exp_inst" == "$got_inst" ]] || fail "install.sh.sha256($exp_inst) 与仓库 install.sh($got_inst) 不一致"
+echo "  [OK] install.sh.sha256 与仓库安装器一致"
+
 GO_VER="$(grep '^const Version' "$ROOT/internal/version/version.go" | sed 's/.*"\(.*\)".*/\1/')"
 APP_VER="$(grep -m1 '^APP_VERSION=' "$ROOT/install.sh" | sed -E 's/^APP_VERSION="?([^"]+)"?.*/\1/')"
 BIN_VER="$(./nft-forward-linux-amd64 version | sed -E 's/^NFT Forward v//')"

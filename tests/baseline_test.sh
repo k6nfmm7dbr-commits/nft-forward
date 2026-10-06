@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# baseline_test.sh — v0.3.2 基线收口防回归。
+# baseline_test.sh — v0.4.0 基线收口防回归。
 #
 # 这些是硬约束，任何一条被打破都说明出现了功能退化：
 #   A. 版本一致性：install.sh APP_VERSION == Go Version == README == CHANGELOG
@@ -16,7 +16,7 @@
 #   L. 无 N+1 查询 / 锁内 DNS
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VER="0.3.2"
+VER="0.4.0"
 PASS=0; FAIL=0
 ck() { if [[ "$3" == "$2" ]]; then PASS=$((PASS+1)); echo "  [PASS] $1"; else FAIL=$((FAIL+1)); echo "  [FAIL] $1 (期望 $2 实得 $3)"; fi; }
 # nocomment <file> —— 剥掉 // 注释后的源码（避免注释里的说明文字误命中）
@@ -38,7 +38,7 @@ echo "== baseline_test (v$VER) =="
 APP_VER=$(grep -m1 '^APP_VERSION=' "$ROOT/install.sh" | sed -E 's/^APP_VERSION="?([^"]+)"?.*/\1/')
 GO_VER=$(grep '^const Version' "$ROOT/internal/version/version.go" | sed 's/.*"\(.*\)".*/\1/')
 README_VER=$(grep -m1 -oE 'v[0-9]+\.[0-9]+\.[0-9]+' "$ROOT/README.md" | tr -d 'v')
-CHANGELOG_VER=$(grep -m1 -oE '^## v[0-9]+\.[0-9]+\.[0-9]+' "$ROOT/cmd/nft-forward/CHANGELOG.md" | sed 's/^## v//')
+CHANGELOG_VER=$(grep -m1 -oE '^## v[0-9]+\.[0-9]+\.[0-9]+' "$ROOT/CHANGELOG.md" | sed 's/^## v//')
 ck "install.sh APP_VERSION == $VER" "$VER" "$APP_VER"
 ck "Go Version == $VER" "$VER" "$GO_VER"
 ck "README 版本 == $VER" "$VER" "$README_VER"
@@ -385,6 +385,61 @@ if grep -q '"\$CORE_BIN" panel-info' "$ROOT/install.sh"; then rc=0; else rc=1; f
 ck "安装器复用 panel-info 输出" 0 "$rc"
 if grep -q '令牌在 /etc' "$ROOT/install.sh"; then rc=1; else rc=0; fi
 ck "安装输出不提示令牌文件位置" 0 "$rc"
+
+# ---- M. v0.4.0：浅色主题 / 安装器自校验 / 热路径不再重复解析 ----
+
+# M-1 面板必须是浅色主题（v0.4.0 从暗色 Graphite 改写）。
+CSS="$ROOT/internal/webui/static/style.css"
+grep -q 'color-scheme: light' "$CSS"; ck "样式表声明浅色配色" 0 $?
+grep -q -- '--bg: #f3f5f9' "$CSS"; ck "浅色调色板已生效" 0 $?
+if grep -qE '#0c0e11|#15181d|#1a1e24|#20252d|color-scheme: dark' "$CSS"; then rc=1; else rc=0; fi
+ck "样式表无暗色残留（调色板/配色声明）" 0 "$rc"
+grep -q 'content="light"' "$ROOT/internal/webui/static/index.html"; ck "首页声明浅色配色" 0 $?
+grep -q 'content="light"' "$ROOT/internal/webui/static/login.html"; ck "登录页声明浅色配色" 0 $?
+
+# M-1b 首屏不得有顶部品牌/状态栏与纯装饰条（与 SBX 一致）。
+if grep -q 'class="topbar"' "$ROOT/internal/webui/static/index.html"; then rc=1; else rc=0; fi
+ck "首页无顶部品牌/状态栏" 0 "$rc"
+if grep -q 'hero::after' "$ROOT/internal/webui/static/style.css"; then rc=1; else rc=0; fi
+ck "速率卡片无顶部装饰条" 0 "$rc"
+grep -q 'id="status-txt"' "$ROOT/internal/webui/static/index.html"; ck "连接状态仍可见（移入速率卡片）" 0 $?
+
+# M-1c 规则卡片：端口并入转发地址（IP 空格 端口），不再单列「监听端口」。
+# 只允许「添加成功」的提示语里出现端口字样；卡片 DOM 里不得再有监听端口行。
+CARD=$(sed -n '/^function ruleCard/,/^}/p' "$ROOT/internal/webui/static/app.js")
+if printf '%s' "$CARD" | grep -q '监听端口'; then rc=1; else rc=0; fi
+ck "规则卡片不再单列监听端口" 0 "$rc"
+grep -q 'data-copy-val' "$ROOT/internal/webui/static/app.js"; ck "地址 token 可点按复制" 0 $?
+grep -q 'function addrHost()' "$ROOT/internal/webui/static/app.js"; ck "转发地址取当前访问主机" 0 $?
+grep -q 'navigator.clipboard' "$ROOT/internal/webui/static/app.js"; ck "复制带剪贴板回退" 0 $?
+
+# M-2 前端热路径：规则卡片按结构签名重建、趋势按规则缓存、轮询按页签节流。
+APP="$ROOT/internal/webui/static/app.js"
+grep -q 'host._structure !== signature' "$APP"; ck "规则卡片按结构签名决定是否重建" 0 $?
+grep -q 'data-rule-today' "$APP"; ck "卡片流量走定点更新" 0 $?
+grep -qF 'cache.ruleDaily[id] = { days:' "$APP"; ck "单规则趋势按 ID 缓存" 0 $?
+grep -q 'ruleDailyEpoch' "$APP"; ck "趋势响应有代次防过期覆盖" 0 $?
+grep -q "activeView === 'home') loadLive()" "$APP"; ck "实时轮询按页签节流" 0 $?
+
+# M-3 安装器：脚本自身完整性校验 + 同源 revision 下载。
+grep -q 'verify_script_checksum()' "$ROOT/install.sh"; ck "安装器提供脚本校验函数" 0 $?
+grep -q 'verify_script_checksum "$tmp" "$sums" install.sh' "$ROOT/install.sh"; ck "升级前校验新脚本 SHA256" 0 $?
+grep -q 'resolve_dist_sha()' "$ROOT/install.sh"; ck "安装器提供 dist revision 解析" 0 $?
+grep -q 'install.sh.sha256' "$ROOT/install.sh"; ck "升级路径引用脚本校验和文件" 0 $?
+
+# M-4 发布链路：dist 必须同时含 install.sh 与它的校验和。
+grep -q 'install.sh.sha256' "$ROOT/scripts/build-release.sh"; ck "构建脚本生成 install.sh.sha256" 0 $?
+grep -qx 'install.sh' "$ROOT/scripts/dist-manifest.txt"; ck "分发清单含 install.sh" 0 $?
+grep -qx 'install.sh.sha256' "$ROOT/scripts/dist-manifest.txt"; ck "分发清单含 install.sh.sha256" 0 $?
+grep -q 'install.sh.sha256' "$ROOT/scripts/artifact_check.sh"; ck "产物自检校验安装器哈希" 0 $?
+
+# M-5 CI 覆盖：musl 与供应链漏洞扫描。
+CI="$ROOT/.github/workflows/ci.yml"
+grep -q 'test-alpine:' "$CI"; ck "CI 含 Alpine/musl 任务" 0 $?
+grep -q 'govulncheck' "$CI"; ck "CI 含 govulncheck" 0 $?
+
+# M-6 内嵌前端资源必须进程内缓存（不得每请求重新读取拷贝）。
+grep -q 'assetCache' "$ROOT/internal/api/auth.go"; ck "内嵌资源进程内缓存" 0 $?
 
 echo
 echo "  PASS=$PASS FAIL=$FAIL"

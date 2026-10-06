@@ -2,10 +2,18 @@
 
 基于 **nftables** 的端口转发 + 流量监控面板。Go 单二进制、原生 Web UI、SQLite 持久化。
 
+<p>
+  <img alt="version" src="https://img.shields.io/badge/version-v0.4.0-blue">
+  <img alt="go" src="https://img.shields.io/badge/Go-1.23%2B-00ADD8">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+  <img alt="backend" src="https://img.shields.io/badge/dataplane-nftables--only-orange">
+  <img alt="cgo" src="https://img.shields.io/badge/CGO-disabled-lightgrey">
+</p>
+
 ## 当前版本
 
 ```text
-v0.3.2
+v0.4.0
 ```
 
 ## 定位
@@ -26,7 +34,8 @@ SQLite     = 永久统计与配置持久化
 - **流量统计**：上传/下载分方向，counter 挂在 **FORWARD** 链（非 NAT 链），用 `ct mark` 归属多规则同目标场景。
 - **在线 IP 限制**：Slot Manager（observed/candidate/active/granted/rejected），基于 conntrack 生命周期判活。
 - **流量配额**：实时判定（已落库累计 + 未落库 nft counter 增量），超出阻断该规则转发，提高/重置即恢复，历史统计不丢。
-- **实时面板**：SSE 推送 + 局部 DOM 更新，原生 HTML/CSS/JS，无框架、无构建链。
+- **实时面板**：SSE 推送 + 局部 DOM 更新，原生 HTML/CSS/JS，无框架、无构建链；浅色主题（与 SBX 面板一致的视觉语言）。
+- **安装器自身可校验**：发布产物同时提供 `install.sh` 与 `install.sh.sha256`，`nff --update` 在执行新脚本**之前**校验其 SHA256（fail-closed），并且脚本、校验和与二进制都取自同一个 immutable dist revision，三者必然同源。
 - **Token 登录**：与 SBX 对齐的访问令牌认证（Bearer 头或 HttpOnly Cookie），常量时间比较 + 登录失败节流。
 - **低暴露面**：面板使用随机五位数端口 + 随机入口路径，未命中入口的请求统一返回极简 404。
 - **内容级 nft 自愈**：不只检查对象存在，还逐条比对规则内容（DNAT 目标/协议/端口、`ct mark`、counter 与 allow set 引用、链 hook/priority/policy），等数量篡改也能发现并修复。
@@ -194,7 +203,7 @@ go test -race ./...  # 竞态检测（需 CGO/gcc）
 go test -run XXX -bench=ParseConntrack -benchmem ./internal/connection/
 
 bash tests/installer_flow_test.sh   # 安装/升级流程（提取 install.sh 真实实现）
-bash tests/baseline_test.sh         # v0.3.2 基线收口防回归
+bash tests/baseline_test.sh         # v0.4.0 基线收口防回归
 ```
 
 真实环境端到端验证（需 root + nftables，会创建 network namespace）：
