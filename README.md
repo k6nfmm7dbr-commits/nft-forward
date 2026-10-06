@@ -10,6 +10,20 @@
   <img alt="cgo" src="https://img.shields.io/badge/CGO-disabled-lightgrey">
 </p>
 
+## 目录
+
+- [定位](#定位)
+- [特性](#特性)
+- [安装](#安装)
+- [面板访问与认证](#面板访问与认证)
+- [用法](#用法)
+- [数据模型](#数据模型)
+- [设计要点](#设计要点)
+- [安全承诺](#安全承诺)
+- [已知限制](#已知限制)
+- [构建](#构建)
+- [测试](#测试)
+
 ## 当前版本
 
 ```text
@@ -36,6 +50,7 @@ SQLite     = 永久统计与配置持久化
 - **流量配额**：实时判定（已落库累计 + 未落库 nft counter 增量），超出阻断该规则转发，提高/重置即恢复，历史统计不丢。
 - **实时面板**：SSE 推送 + 局部 DOM 更新，原生 HTML/CSS/JS，无框架、无构建链；浅色主题（与 SBX 面板一致的视觉语言）。
 - **安装器自身可校验**：发布产物同时提供 `install.sh` 与 `install.sh.sha256`，`nff --update` 在执行新脚本**之前**校验其 SHA256（fail-closed），并且脚本、校验和与二进制都取自同一个 immutable dist revision，三者必然同源。
+- **转发地址一键复制**：规则卡片直接显示「你访问面板用的主机 + 该规则端口」（IP 空格 端口，两个 token 各自可点按复制），右侧按钮复制 IP；纯 HTTP 下面板拿不到剪贴板 API，因此带 textarea 回退，真实部署形态下可用。
 - **Token 登录**：与 SBX 对齐的访问令牌认证（Bearer 头或 HttpOnly Cookie），常量时间比较 + 登录失败节流。
 - **低暴露面**：面板使用随机五位数端口 + 随机入口路径，未命中入口的请求统一返回极简 404。
 - **内容级 nft 自愈**：不只检查对象存在，还逐条比对规则内容（DNAT 目标/协议/端口、`ct mark`、counter 与 allow set 引用、链 hook/priority/policy），等数量篡改也能发现并修复。
@@ -184,6 +199,11 @@ conntrack 的状态被显式分成四种，只有第一种允许做在线判定�
 - 面板是 HTTP 明文服务，不内置 TLS。需要传输加密请自行前置反代并设置 `secure_cookie=true`。
 
 ## 构建
+
+要求 **Go 1.27.1+**（与 CI、musl 任务、发布产物使用同一版本）。固定在更早的
+Go 1.23 会让标准库带着已知 CVE（`govulncheck` 曾报出 10 条 `net/http` /
+`crypto/tls` / `crypto/x509` / `net/url` 漏洞），因此工具链版本属于安全约束。
+
 
 ```bash
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o nft-forward ./cmd/nft-forward
