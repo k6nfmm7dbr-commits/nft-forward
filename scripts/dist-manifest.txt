@@ -1,0 +1,10 @@
+SHA256SUMS
+install.sh
+install.sh.sha256
+nft-forward-linux-386
+nft-forward-linux-amd64
+nft-forward-linux-arm64
+nft-forward-linux-armv6
+nft-forward-linux-armv7
+nft-forward-linux-riscv64
+nft-forward-linux-s390x
