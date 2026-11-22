@@ -108,8 +108,11 @@ type RuleState struct {
 
 // GenInput 是生成脚本的输入。Rules 应只含未删除的规则。
 type GenInput struct {
-	Rules  []*forward.Rule
-	States map[int64]*RuleState // rule id -> 状态；可为 nil（默认全部不限）
+	// KeepCounters leaves inactive counters for the collector to account for,
+	// including any bytes between its last poll and a rule disable/delete.
+	KeepCounters bool
+	Rules        []*forward.Rule
+	States       map[int64]*RuleState // rule id -> 状态；可为 nil（默认全部不限）
 }
 
 func (g *GenInput) stateOf(id int64) *RuleState {
@@ -320,10 +323,12 @@ func genFilterStruct(g *GenInput, ex *Existing) string {
 				want[AllowSetV6(r.ID)] = true
 			}
 		}
-		stale := append([]string{}, staleNames(ex.Counters, want)...)
-		sort.Strings(stale)
-		for _, name := range stale {
-			fmt.Fprintf(&b, "delete counter inet %s %s\n", TableFilter, name)
+		if !g.KeepCounters {
+			stale := append([]string{}, staleNames(ex.Counters, want)...)
+			sort.Strings(stale)
+			for _, name := range stale {
+				fmt.Fprintf(&b, "delete counter inet %s %s\n", TableFilter, name)
+			}
 		}
 		want[SetQuotaBlock] = true // qblock 永久保留
 		staleSets := append([]string{}, staleNames(ex.Sets, want)...)

@@ -1,219 +1,413 @@
 #!/usr/bin/env bash
-# installer_flow_test.sh — 从 install.sh 提取真实实现做流程测试：
-#   1. checksum 校验 fail-closed（不匹配/缺失/重复条目一律拒绝）
-#   2. prepare_dirs 敏感文件 0600（首次创建 + 已存在收紧，umask 000 下也成立）
-#   3. install_core 按内容(sha256)判断是否跳过，绝不按版本号跳过
-#   4. do_update 在脚本内容相同时仍检查后端二进制
-#   5. 安全边界静态检查：绝不 flush ruleset / 不动系统链 / 只删 nff_* 表
-set -u
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TPL="$ROOT/install.sh"
-PASS=0; FAIL=0
-ck() { if [[ "$3" == "$2" ]]; then PASS=$((PASS+1)); echo "  [PASS] $1"; else FAIL=$((FAIL+1)); echo "  [FAIL] $1 (期望 $2 实得 $3)"; fi; }
+# Run the actual install.sh dispatcher/lifecycle against a private fake host.
+# Curl, init managers, sysctl, nft, and package commands cannot reach the host.
+set -euo pipefail
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+TPL="$HERE/install.sh"
+WORK=$(mktemp -d)
+trap 'rm -rf -- "$WORK"' EXIT
+export TPL WORK
+export REF=1234567890abcdef1234567890abcdef12345678
+export R2=876543210fedcba9876543210fedcba987654321
+export REPO=k6nfmm7dbr-commits/nft-forward
+export ORIGIN="https://raw.githubusercontent.com/$REPO"
+export BINARY=nft-forward-linux-amd64
+export PATH="$WORK/bin:$PATH"
+export NO_COLOR=1
+unset NFF_CORE_BIN NFF_RAW_BASE NFF_RAW_URL NFF_GH_PROXY NFF_DIST_SHA NFF_NO_SERVICE NFF_ROOT
+mkdir "$WORK/bin"
+PASS=0
+pass() { PASS=$((PASS+1)); printf '  [PASS] %s\n' "$*"; }
+fail() { printf '  [FAIL] %s\n' "$*" >&2; [[ ! -f "${OUT:-}" ]] || cat "$OUT" >&2; exit 1; }
+check() { local message="$1"; shift; "$@" || fail "$message"; pass "$message"; }
+not() { if "$@"; then return 1; fi; }
 
-TMPD=$(mktemp -d)
-trap 'rm -rf "$TMPD"' EXIT
+cat > "$WORK/bin/curl" <<'MOCK'
+#!/usr/bin/env bash
+set -eu
+out=''; url=''
+while (( $# )); do
+  case "$1" in
+    -o) out="$2"; shift ;;
+    http://*|https://*) url="$1" ;;
+  esac
+  shift
+ done
+printf '%s\n' "$url" >> "$FAKE/urls"
+case "$url" in
+  "https://api.github.com/repos/$REPO/git/ref/heads/dist")
+    [[ ! -f "$FAKE/no-ref" ]] || exit 22
+    read -r rev < "$FAKE/ref"
+    printf '{\n  "ref": "refs/heads/dist",\n  "object": {\n    "sha": "%s",\n    "type": "commit"\n  }\n}\n' "$rev" > "$out"
+    # Simulate rolling dist moving immediately after resolving the ref.
+    printf '%s\n' "$R2" > "$FAKE/ref"
+    ;;
+  http://127.0.0.1:*/healthz)
+    [[ $(cat "$FAKE/active") == 1 ]] || exit 22
+    if [[ -f "$FAKE/no-health" ]] && grep -q 'candidate-core' "$NFF_ROOT/usr/local/bin/nft-forward"; then
+      printf '{"ok":false,"error":"data plane not ready"}'
+      exit 22
+    fi
+    printf '{"ok":true}\n200'
+    ;;
+  "$ORIGIN/"*/install.sh|"$ORIGIN/"*/install.sh.sha256|"$ORIGIN/"*/SHA256SUMS|"$ORIGIN/"*/"$BINARY"|"https://proxy.invalid/https://mirror.invalid/repo/"*/"$BINARY")
+    name=${url##*/}
+    rev=${url%/*}; rev=${rev##*/}
+    [[ "$rev" == "$REF" || "$rev" == "$R2" ]] || exit 22
+    if [[ "$url" == 'https://proxy.invalid/'* && -f "$FAKE/mirror-binary" ]]; then cp "$FAKE/mirror-binary" "$out"
+    else cp "$FAKE/$rev/$name" "$out"; fi
+    ;;
+  *) echo "unexpected download: $url" >&2; exit 88 ;;
+esac
+MOCK
 
-echo "== installer_flow_test =="
+cat > "$WORK/bin/manager" <<'MOCK'
+#!/usr/bin/env bash
+set -eu
+manager=${0##*/}
+printf '%s %s\n' "$manager" "$*" >> "$FAKE/actions"
+action=${1:-}
+if [[ "$manager" == rc-service ]]; then action=${2:-}; fi
+case "$manager:$action" in
+  systemctl:show)
+    [[ ! -f "$FAKE/bad-inventory" ]] || exit 2
+    load=not-found
+    [[ ! -f "$NFF_ROOT/etc/systemd/system/nft-forward.service" ]] || load=loaded
+    if [[ $(cat "$FAKE/active") == 1 ]]; then state=active; else state=inactive; fi
+    printf 'LoadState=%s\nActiveState=%s\nUnitFileState=%s\n' "$load" "$state" "$(cat "$FAKE/boot")"
+    ;;
+  rc-update:show)
+    if [[ $(cat "$FAKE/boot") == enabled ]]; then printf '            nft-forward | default\n'; fi
+    printf '            another-app | default\n';
+    ;;
+  systemctl:is-active|rc-service:status)
+    [[ $(cat "$FAKE/active") == 1 ]] || exit 3
+    ;;
+  systemctl:start|rc-service:start|systemctl:restart|rc-service:restart)
+    if [[ -f "$FAKE/no-start" ]] && grep -q 'candidate-core' "$NFF_ROOT/usr/local/bin/nft-forward"; then exit 1; fi
+    if [[ -f "$FAKE/no-restore-start" ]] && grep -q 'previous-core' "$NFF_ROOT/usr/local/bin/nft-forward"; then exit 1; fi
+    printf '1\n' > "$FAKE/active"
+    ;;
+  systemctl:stop|rc-service:stop)
+    [[ ! -f "$FAKE/no-stop" ]] || exit 1
+    printf '0\n' > "$FAKE/active"
+    ;;
+  systemctl:daemon-reload)
+    if [[ -f "$FAKE/no-reload-once" ]]; then rm "$FAKE/no-reload-once"; exit 1; fi
+    ;;
+  systemctl:enable|rc-update:add)
+    printf 'enabled\n' > "$FAKE/boot"
+    [[ ! -f "$FAKE/bad-enable" ]]
+    ;;
+  systemctl:disable|rc-update:del) printf 'disabled\n' > "$FAKE/boot" ;;
+  *) exit 88 ;;
+esac
+MOCK
+cat > "$WORK/bin/sysctl" <<'MOCK'
+#!/usr/bin/env bash
+set -eu
+arg="$2"; name=${arg%=*}
+printf 'sysctl %s %s\n' "$1" "$arg" >> "$FAKE/actions"
+case "$1:$name" in
+  -n:net.*) cat "$FAKE/$name" ;;
+  -w:net.*) printf '%s\n' "${arg##*=}" > "$FAKE/$name" ;;
+  *) exit 88 ;;
+esac
+MOCK
+cat > "$WORK/bin/nft" <<'MOCK'
+#!/usr/bin/env bash
+printf 'nft %s\n' "$*" >> "$FAKE/actions"
+[[ "$*" == 'list tables' && ! -f "$FAKE/no-nft" ]]
+MOCK
+cat > "$WORK/bin/deny-package" <<'MOCK'
+#!/usr/bin/env bash
+printf 'UNEXPECTED %s\n' "$0" >> "$FAKE/actions"
+exit 88
+MOCK
+cat > "$WORK/bin/uname" <<'MOCK'
+#!/usr/bin/env bash
+[[ "$*" == '-m' ]] && echo x86_64
+MOCK
+chmod +x "$WORK/bin/"*
+for cmd in systemctl rc-service rc-update; do ln -s manager "$WORK/bin/$cmd"; done
+for cmd in apk apt-get dnf yum modprobe; do ln -s deny-package "$WORK/bin/$cmd"; done
 
-# ---- 0. 语法 ----
-bash -n "$TPL" 2>/dev/null; ck "install.sh 语法正确" 0 $?
+cat > "$WORK/core" <<'MOCK'
+#!/usr/bin/env bash
+# candidate-core
+set -eu
+case "$1" in
+  version) printf 'NFT Forward v%s\n' 0.4.0 ;;
+  config-get|config-set|config-ensure-all|config-migrate)
+    python3 - "$@" <<'PY'
+import json, os, sys
+p = os.environ['NFT_FORWARD_CONF']
+assert p.startswith(os.environ['NFF_ROOT'] + '/')
+with open(p) as f:
+    cfg = json.load(f)
+cmd = sys.argv[1]
+app = os.environ['NFT_FORWARD_DIR']
+if cmd == 'config-get':
+    defaults = {'db': app+'/traffic.db', 'nft_conf': app+'/nft.conf', 'listen':'0.0.0.0'}
+    k = sys.argv[2]; print(cfg.get(k, defaults.get(k, '')))
+    sys.exit(0)
+if cmd == 'config-set':
+    cfg[sys.argv[2]] = sys.argv[3]
+elif cmd == 'config-ensure-all':
+    cfg.setdefault('port', 42317)
+    cfg.setdefault('token', 'a'*32)
+    cfg.setdefault('entry_path', 'c'*24)
+else:
+    cfg.pop('obsolete_key', None)
+with open(p, 'w') as f:
+    json.dump(cfg, f)
+PY
+    ;;
+  selftest)
+    printf '%s\n' selftest >> "$FAKE/actions"
+    [[ ! -f "$FAKE/no-selftest" ]]
+    ;;
+  clear) printf '%s\n' clear-owned >> "$FAKE/actions" ;;
+  panel-info) printf '%s\n' 'fake panel info' ;;
+  *) exit 88 ;;
+esac
+MOCK
+chmod +x "$WORK/core"
 
-# ---- 1. checksum fail-closed（提取真实 helpers 区块）----
-sed -n '/^# >>> checksum-helpers/,/^# <<< checksum-helpers/p' "$TPL" > "$TMPD/helpers.sh"
-grep -q 'verify_core_checksum()' "$TMPD/helpers.sh"; ck "提取到 checksum helpers" 0 $?
-cat >> "$TMPD/helpers.sh" <<'STUBS'
-warn() { echo "[warn] $*" >&2; }
-STUBS
+# Source safely without dispatching; root and manager detection are the only
+# overrides. Everything after detection, including the subprocesses' argv,
+# snapshots, rollback trap and status, is the production implementation.
+cat > "$WORK/run" <<'MOCK'
+#!/usr/bin/env bash
+# shellcheck source=../install.sh
+source "$TPL"
+require_root() { :; }
+if [[ "${TEST_MANAGER:-none}" != none ]]; then
+  detect_platform() {
+    [[ -d "$ROOT" && "$ROOT" == "$WORK/"* ]] || { echo 'not a test root' >&2; exit 89; }
+    INIT_SYS=$TEST_MANAGER
+    case "$INIT_SYS" in
+      systemd) SERVICE_FILE="$ROOT/etc/systemd/system/nft-forward.service"; SERVICE_MODE=0644 ;;
+      openrc) SERVICE_FILE="$ROOT/etc/init.d/nft-forward"; SERVICE_MODE=0755 ;;
+      *) exit 89 ;;
+    esac
+  }
+fi
+# Retry logic stays real, but no waiting for fake manager state changes.
+sleep() { :; }
+# This sandbox does not exercise OS timeouts or wait on real daemons.
+timeout() {
+  [[ "$1" == -k && "$2" == 2 && "$3" =~ ^[0-9]+$ ]] || return 89
+  shift 3
+  "$@"
+}
+main "$@"
+MOCK
 
-printf 'fake-binary' > "$TMPD/dl"
-GOOD=$(sha256sum "$TMPD/dl" | awk '{print $1}')
-BIN=nft-forward-linux-amd64
+new_case() {
+  export FAKE="$WORK/$1" NFF_ROOT="$WORK/$1/root" TEST_MANAGER="${2:-none}"
+  export OUT="$FAKE/out"
+  APP="$NFF_ROOT/etc/nft-forward"
+  CORE="$NFF_ROOT/usr/local/bin/nft-forward"
+  WRAPPER="$NFF_ROOT/usr/local/bin/nff"
+  SELF="$APP/nft-forward.sh"
+  PANEL="$APP/panel.json"
+  TX="$APP/.install-transaction"
+  UNIT="$NFF_ROOT/etc/systemd/system/nft-forward.service"
+  if [[ "$TEST_MANAGER" == openrc ]]; then UNIT="$NFF_ROOT/etc/init.d/nft-forward"; fi
+  FWD="$NFF_ROOT/etc/sysctl.d/90-nft-forward.conf"
+  CT="$NFF_ROOT/etc/sysctl.d/99-nft-forward-conntrack.conf"
+  mkdir -p "$NFF_ROOT" "$FAKE/$REF" "$FAKE/$R2"
+  printf '%s\n' "$REF" > "$FAKE/ref"
+  printf '0\n' > "$FAKE/active"
+  printf 'disabled\n' > "$FAKE/boot"
+  for k in net.ipv4.ip_forward net.ipv6.conf.all.forwarding net.netfilter.nf_conntrack_acct; do printf '0\n' > "$FAKE/$k"; done
+  : > "$FAKE/actions"; : > "$FAKE/urls"
+  cp "$TPL" "$FAKE/$REF/install.sh"
+  cp "$WORK/core" "$FAKE/$REF/$BINARY"
+  rehash
+  # No assets exist at the later ref; every mixed-revision attempt must fail.
+  unset NFF_GH_PROXY NFF_RAW_BASE NFF_DIST_SHA NFF_CORE_BIN
+}
 
-printf '%s  %s\n' "0000000000000000000000000000000000000000000000000000000000000000" "$BIN" > "$TMPD/SHA256SUMS"
-( set +u; source "$TMPD/helpers.sh"; verify_core_checksum "$TMPD/dl" "$TMPD/SHA256SUMS" "$BIN" ) >/dev/null 2>&1
-ck "checksum mismatch → 拒绝" 1 "$([ $? != 0 ] && echo 1 || echo 0)"
+rehash() (
+  cd "$FAKE/$REF"
+  sha256sum install.sh > install.sh.sha256
+  sha256sum "$BINARY" > SHA256SUMS
+)
 
-printf '%s  %s\n' "$GOOD" "$BIN" > "$TMPD/SHA256SUMS"
-( set +u; source "$TMPD/helpers.sh"; verify_core_checksum "$TMPD/dl" "$TMPD/SHA256SUMS" "$BIN" ) >/dev/null 2>&1
-ck "checksum 匹配 → 通过" 0 $?
+install_legacy() {
+  mkdir -p "$APP" "${CORE%/*}" "${UNIT%/*}" "${FWD%/*}" "$NFF_ROOT/old-data"
+  sed 's/candidate-core/previous-core/' "$WORK/core" > "$CORE"
+  printf '#!/usr/bin/env bash\n# old installer\n' > "$SELF"
+  printf '#!/usr/bin/env bash\n# old wrapper\n' > "$WRAPPER"
+  chmod 755 "$CORE" "$WRAPPER" "$SELF"
+  printf 'legacy unit\n' > "$UNIT"; chmod 640 "$UNIT"
+  printf 'old forward\n' > "$FWD"
+  printf 'old conntrack\n' > "$CT"
+  printf '{"port":42424,"token":"0123456789abcdef0123456789abcdef","entry_path":"legacy-entry-path-value","obsolete_key":1,"db":"%s","nft_conf":"%s"}\n' \
+    "$NFF_ROOT/old-data/existing.sqlite" "$NFF_ROOT/old-data/rules.nft" > "$PANEL"
+  chmod 640 "$PANEL"
+  # A genuine SQLite file with a persistent rule, plus a generated cache.
+  python3 - "$NFF_ROOT/old-data/existing.sqlite" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as conn:
+    conn.execute('create table rules (id integer, target text)')
+    conn.execute('insert into rules values (1, ?)', ('test-forward',))
+PY
+  printf 'legacy rule cache\n' > "$NFF_ROOT/old-data/rules.nft"
+  printf 'legacy default path DB\n' > "$APP/traffic.db"
+  chmod 644 "$APP/traffic.db"
+  mkdir "$FAKE/original"
+  cp -p "$CORE" "$SELF" "$WRAPPER" "$PANEL" "$UNIT" "$FWD" "$CT" "$APP/traffic.db" "$NFF_ROOT/old-data/"* "$FAKE/original"
+}
 
-printf '%s  nft-forward-linux-arm64\n' "$GOOD" > "$TMPD/SHA256SUMS"
-( set +u; source "$TMPD/helpers.sh"; verify_core_checksum "$TMPD/dl" "$TMPD/SHA256SUMS" "$BIN" ) >/dev/null 2>&1
-ck "缺失本架构条目 → 拒绝" 1 "$([ $? != 0 ] && echo 1 || echo 0)"
+run() { bash "$WORK/run" "$@" > "$OUT" 2>&1 </dev/null; }
+rollback_files() {
+  local f
+  for f in "$CORE" "$SELF" "$WRAPPER" "$PANEL" "$UNIT" "$FWD" "$CT" "$APP/traffic.db" "$NFF_ROOT/old-data/"*; do
+    cmp -s "$FAKE/original/${f##*/}" "$f" && [[ $(stat -c %a "$FAKE/original/${f##*/}") == "$(stat -c %a "$f")" ]] || return 1
+  done
+}
 
-printf '%s  %s\n%s  %s\n' "$GOOD" "$BIN" "$GOOD" "$BIN" > "$TMPD/SHA256SUMS"
-( set +u; source "$TMPD/helpers.sh"; verify_core_checksum "$TMPD/dl" "$TMPD/SHA256SUMS" "$BIN" ) >/dev/null 2>&1
-ck "重复条目 → 拒绝" 1 "$([ $? != 0 ] && echo 1 || echo 0)"
+matches() { grep -qF -- "$1" "$2"; }
+state() { [[ $(cat "$FAKE/active") == "$1" && $(cat "$FAKE/boot") == "$2" ]]; }
+restored_sysctls() {
+  local f
+  for f in "$FAKE"/net.*; do [[ $(cat "$f") == 0 ]] || return 1; done
+}
 
-printf '%s  %s\n' "$GOOD" "$BIN" > "$TMPD/SHA256SUMS"
-: > "$TMPD/empty"
-( set +u; source "$TMPD/helpers.sh"; verify_core_checksum "$TMPD/empty" "$TMPD/SHA256SUMS" "$BIN" ) >/dev/null 2>&1
-ck "空二进制 → 拒绝" 1 "$([ $? != 0 ] && echo 1 || echo 0)"
+printf '== installer_flow_test ==\n'
+check 'installer parses as Bash' bash -n "$TPL"
+new_case fresh
+check 'fresh install succeeds against one discovered dist commit' run
+check 'fresh install persisted distribution script' cmp -s "$FAKE/$REF/install.sh" "$SELF"
+check 'fresh panel has mode 0600' test "$(stat -c %a "$PANEL")" = 600
+check 'sandbox install does not call host commands' test ! -s "$FAKE/actions"
+check 'sandbox status honestly reports no runtime check' run --status
+check 'sandbox status output' matches '仅配置模式' "$OUT"
+check 'every release asset uses the single old revision' not matches "$R2" "$FAKE/urls"
+check 'ref discovery happens once' test "$(grep -c 'api.github.com' "$FAKE/urls")" = 1
+check 'sandbox clear is refused' not run --clear-firewall
 
-# ---- 2. prepare_dirs 权限（提取真实实现）----
-sed -n '/^# >>> prepare-dirs/,/^# <<< prepare-dirs/p' "$TPL" > "$TMPD/pd.sh"
-grep -q 'install -m 0600' "$TMPD/pd.sh"; ck "prepare_dirs 用 install -m 0600 预创建" 0 $?
-cat >> "$TMPD/pd.sh" <<'STUBS'
-APP_DIR="$T/etc/nft-forward"
-PANEL_CONF="$APP_DIR/panel.json"
-DB_FILE="$APP_DIR/traffic.db"
-NFT_CONF="$APP_DIR/nft.conf"
-STUBS
+new_case pinned
+export NFF_DIST_SHA="$REF" NFF_RAW_BASE='https://mirror.invalid/repo/dist' NFF_GH_PROXY='https://proxy.invalid'
+touch "$FAKE/no-ref"
+install_legacy
+check 'pinned bootstrap migrates existing legacy install without its updater' run
+check 'explicit bootstrap bypasses branch discovery' not matches api.github.com "$FAKE/urls"
+check 'candidate script comes from canonical commit' matches "$ORIGIN/$REF/install.sh" "$FAKE/urls"
+check 'script checksum comes from canonical commit' matches "$ORIGIN/$REF/install.sh.sha256" "$FAKE/urls"
+check 'binary manifest comes from canonical commit' matches "$ORIGIN/$REF/SHA256SUMS" "$FAKE/urls"
+check 'proxy supplies pinned binary bytes only' matches "https://proxy.invalid/https://mirror.invalid/repo/$REF/$BINARY" "$FAKE/urls"
+check 'legacy panel token unchanged' matches '0123456789abcdef0123456789abcdef' "$PANEL"
+check 'legacy panel entry unchanged' matches legacy-entry-path-value "$PANEL"
+check 'configured SQLite path unchanged' matches "$NFF_ROOT/old-data/existing.sqlite" "$PANEL"
+check 'existing SQLite contents unchanged' cmp -s "$FAKE/original/existing.sqlite" "$NFF_ROOT/old-data/existing.sqlite"
+check 'existing generated nft file unchanged' cmp -s "$FAKE/original/rules.nft" "$NFF_ROOT/old-data/rules.nft"
+check 'legacy permission tightened without copying DB data' test "$(stat -c %a "$APP/traffic.db")" = 600
+check 'no obsolete config key' not matches obsolete_key "$PANEL"
+check 'legacy internal apply-update command honors pin' run --apply-update
+check 'identical script and binary are a no-op' matches '无需升级' "$OUT"
+check 'explicit pinned update still verifies artifacts' run --update
+cat "$WORK/core" > "$FAKE/$REF/$BINARY"
+printf '# binary-only update, version unchanged\n' >> "$FAKE/$REF/$BINARY"
+rehash
+check 'same-script same-version binary update is not skipped' run update
+check 'updated binary bytes are installed' cmp -s "$FAKE/$REF/$BINARY" "$CORE"
+check 'force avoids short circuit' run upgrade --force
+check 'force actually commits' matches '升级完成' "$OUT"
 
-T="$TMPD/case1"; export T
-( set +u; umask 000; source "$TMPD/pd.sh"; prepare_dirs ) >/dev/null 2>&1
-ck "首次创建(umask 000) panel.json == 600" "600" "$(stat -c %a "$T/etc/nft-forward/panel.json" 2>/dev/null)"
+for failure in no-ref invalid-pin missing-script-checksum bad-script-hash duplicate-script-hash bad-syntax missing-bin-manifest duplicate-bin-hash malformed-bin-hash bad-bin-hash wrong-version bad-mirror broken-config; do
+  new_case "$failure" systemd
+  install_legacy
+  printf '1\n' > "$FAKE/active"
+  printf 'enabled\n' > "$FAKE/boot"
+  case "$failure" in
+    no-ref) touch "$FAKE/no-ref" ;;
+    invalid-pin) export NFF_DIST_SHA="${REF^^}" ;;
+    missing-script-checksum) rm "$FAKE/$REF/install.sh.sha256" ;;
+    bad-script-hash) printf '# changed\n' >> "$FAKE/$REF/install.sh" ;;
+    duplicate-script-hash) cat "$FAKE/$REF/install.sh.sha256" >> "$FAKE/second"; cat "$FAKE/second" >> "$FAKE/$REF/install.sh.sha256" ;;
+    bad-syntax) printf '\nif then\n' >> "$FAKE/$REF/install.sh"; rehash ;;
+    missing-bin-manifest) rm "$FAKE/$REF/SHA256SUMS" ;;
+    duplicate-bin-hash) cat "$FAKE/$REF/SHA256SUMS" >> "$FAKE/second"; cat "$FAKE/second" >> "$FAKE/$REF/SHA256SUMS" ;;
+    malformed-bin-hash) printf '%064d %s extra\n' 0 "$BINARY" > "$FAKE/$REF/SHA256SUMS" ;;
+    bad-bin-hash) printf '# changed\n' >> "$FAKE/$REF/$BINARY" ;;
+    wrong-version) sed -i 's/0\.4\.0/0.4.1/' "$FAKE/$REF/$BINARY"; rehash ;;
+    bad-mirror)
+      export NFF_RAW_BASE='https://mirror.invalid/repo/dist' NFF_GH_PROXY='https://proxy.invalid'
+      printf '#!/usr/bin/env bash\ntouch "$FAKE/unverified-code-ran"\n' > "$FAKE/mirror-binary" ;;
+    broken-config) printf '{bad' > "$PANEL"; cp -p "$PANEL" "$FAKE/original/panel.json" ;;
+  esac
+  run --update && fail "$failure unexpectedly succeeded"
+  rollback_files && state 1 enabled && [[ ! -s "$FAKE/actions" && ! -e "$TX" && ! -e "$FAKE/unverified-code-ran" ]] || fail "$failure changed installation"
+  pass "$failure fails before live writes or actions"
+done
 
-T="$TMPD/case2"; export T
-mkdir -p "$T/etc/nft-forward"
-printf '{"token":"secret"}' > "$T/etc/nft-forward/panel.json"; chmod 644 "$T/etc/nft-forward/panel.json"
-printf 'db' > "$T/etc/nft-forward/traffic.db"; chmod 644 "$T/etc/nft-forward/traffic.db"
-( set +u; source "$TMPD/pd.sh"; prepare_dirs ) >/dev/null 2>&1
-ck "已存在 0644 panel.json → 收紧 600" "600" "$(stat -c %a "$T/etc/nft-forward/panel.json")"
-ck "已存在 0644 traffic.db → 收紧 600" "600" "$(stat -c %a "$T/etc/nft-forward/traffic.db")"
+for failure in no-start no-health no-selftest no-reload-once; do
+  new_case "$failure" systemd
+  install_legacy
+  printf '1\n' > "$FAKE/active"
+  printf 'enabled\n' > "$FAKE/boot"
+  touch "$FAKE/$failure"
+  if run --update; then fail "$failure unexpectedly succeeded"; fi
+  rollback_files && restored_sysctls && state 1 enabled && matches '已回滚' "$OUT" && [[ ! -e "$TX" ]] || fail "$failure did not roll back"
+  pass "$failure restores all prior files, modes, sysctls and active/enabled service"
+done
 
-# 已有配置绝不能被覆盖（token 丢失 = 用户登录不进面板）
-grep -q 'token' "$T/etc/nft-forward/panel.json"; ck "prepare_dirs 不覆盖已有 panel.json" 0 $?
+new_case no-old-service systemd
+install_legacy
+rm "$UNIT"
+touch "$FAKE/bad-enable"
+check 'partial boot registration failure makes install fail' not run --update
+check 'new boot links are removed on rollback' state 0 disabled
+check 'prior unit absence is restored' test ! -e "$UNIT"
+check 'boot registration failure leaves original wrapper' cmp -s "$FAKE/original/nff" "$WRAPPER"
 
-# ---- 3. install_core：按内容判断，不按版本号跳过 ----
-sed -n '/^# >>> install-core/,/^# <<< install-core/p' "$TPL" > "$TMPD/ic.sh"
-grep -q 'sha256_of "\$CORE_BIN"' "$TMPD/ic.sh"; ck "install_core 按二进制 sha256 判断是否跳过" 0 $?
-grep -q 'expect_sum' "$TMPD/ic.sh"; ck "install_core 提取 SHA256SUMS 期望哈希" 0 $?
-grep -q 'CORE_REPLACED=1' "$TMPD/ic.sh"; ck "install_core 替换后置 CORE_REPLACED 信号" 0 $?
-if grep -q 'core_version_of "\$CORE_BIN"' "$TMPD/ic.sh"; then rc=1; else rc=0; fi
-ck "install_core 不按已装版本号跳过下载" 0 "$rc"
-grep -q 'cand_ver.*APP_VERSION\|"\$cand_ver" != "\$APP_VERSION"' "$TMPD/ic.sh"
-ck "install_core 校验 candidate 版本与 APP_VERSION 一致" 0 $?
-grep -q '现有安装未被改动' "$TMPD/ic.sh"; ck "install_core 失败路径明示未改动现有安装" 0 $?
-grep -q 'CORE_BIN.bak' "$TMPD/ic.sh"; ck "install_core 替换前备份旧二进制" 0 $?
-grep -q 'mv -f "\$dl" "\$CORE_BIN"' "$TMPD/ic.sh"; ck "install_core 原子 rename 替换" 0 $?
-# ★ 备份不得在替换成功后立即删除：升级要到健康检查全过才允许删（可回滚的前提）
-if grep -q 'rm -f "\$CORE_BIN.bak"' "$TMPD/ic.sh"; then rc=1; else rc=0; fi
-ck "install_core 不提前删除旧二进制备份" 0 "$rc"
-grep -q 'CORE_BACKUP=' "$TMPD/ic.sh"; ck "install_core 导出备份路径供回滚使用" 0 $?
+new_case first-failure openrc
+touch "$FAKE/no-health"
+check 'failed OpenRC first install reports failure' not run
+check 'failed first install does not print success' not matches '安装完成' "$OUT"
+check 'failed first install removes its binary' test ! -e "$CORE"
+check 'failed first install removes its management script' test ! -e "$SELF"
+check 'failed first install removes its unit' test ! -e "$UNIT"
+check 'failed first install restores sysctls' restored_sysctls
+check 'failed first install restores absent/inactive service' state 0 disabled
 
-# ---- 3b. start_service：三重健康确认，绝不假成功 ----
-sed -n '/^# >>> start-service/,/^# <<< start-service/p' "$TPL" > "$TMPD/ss.sh"
-grep -q 'panel_running' "$TMPD/ss.sh"; ck "start_service 检查服务 active" 0 $?
-grep -q 'health_check' "$TMPD/ss.sh"; ck "start_service 做本机 HTTP 健康检查" 0 $?
-grep -q '127.0.0.1' "$TMPD/ss.sh"; ck "健康检查走 127.0.0.1（healthz 仅 loopback）" 0 $?
-grep -q 'config_ready' "$TMPD/ss.sh"; ck "提供配置就绪校验" 0 $?
-grep -q 'entry_path' "$TMPD/ss.sh"; ck "配置校验含随机入口路径" 0 $?
-grep -q 'token' "$TMPD/ss.sh"; ck "配置校验含访问令牌" 0 $?
-CODE_SS="$TMPD/ss_code.sh"
-sed -e 's/#.*$//' "$TMPD/ss.sh" > "$CODE_SS"
-# `curl ... || true` 是有意为之：健康检查要在循环里重试，单次失败不能让
-# `set -e` 直接终止脚本。真正禁止的是「服务启动/回滚等关键动作被 || true 吞掉」。
-if grep -vE 'curl ' "$CODE_SS" | grep -qE '\|\| *true'; then rc=1; else rc=0; fi
-ck "start_service 关键动作无 || true 吞错" 0 "$rc"
+new_case openrc-success openrc
+check 'fresh OpenRC install starts and adds default runlevel' run
+check 'OpenRC start and registration verified' state 1 enabled
+check 'OpenRC unit preserves legacy boot contract' matches '#!/sbin/openrc-run' "$UNIT"
+check 'healthy service status successfully verifies OpenRC and HTTP' run --status
+printf '0\n' > "$FAKE/active"
+printf 'disabled\n' > "$FAKE/boot"
+printf '%s\n' "$REF" > "$FAKE/ref"
+check 'forced OpenRC update of stopped instance succeeds' run --update --force
+check 'stopped and disabled state preserved on successful upgrade' state 0 disabled
+check 'explicit stopped status is nonzero' not run --status
 
-# ---- 3c. do_install：失败不打印「安装完成」 ----
-sed -n '/^# >>> do-install/,/^# <<< do-install/p' "$TPL" > "$TMPD/di.sh"
-grep -q 'ensure_panel_conf || die' "$TMPD/di.sh"; ck "do_install 配置初始化失败即中止" 0 $?
-grep -q 'if ! start_service; then' "$TMPD/di.sh"; ck "do_install 检查服务启动结果" 0 $?
-grep -q '安装未完成' "$TMPD/di.sh"; ck "do_install 失败时明确报错" 0 $?
-if grep -qE 'start_service *\|\| *true' "$TMPD/di.sh"; then rc=1; else rc=0; fi
-ck "do_install 无 start_service || true" 0 "$rc"
-# 「安装完成」必须出现在 start_service 检查之后
-if awk '/if ! start_service; then/{seen=1} /ok "安装完成"/{if(!seen) bad=1} END{exit bad?1:0}' "$TMPD/di.sh"; then rc=0; else rc=1; fi
-ck "「安装完成」只在健康确认通过后打印" 0 "$rc"
+new_case retained-backup systemd
+install_legacy
+printf '1\n' > "$FAKE/active"
+printf 'enabled\n' > "$FAKE/boot"
+touch "$FAKE/no-start" "$FAKE/no-restore-start"
+check 'unrecoverable start failure is reported' not run --update
+check 'incomplete rollback keeps a private snapshot' test -d "$TX/snapshot"
+check 'explicit incomplete rollback message' matches '回滚未完成' "$OUT"
+check 'status reports retained lock' not run --status
+printf '%s\n' "$REF" > "$FAKE/ref"
+check 'new attempts cannot overwrite retained backup' not run --update
+check 'backup remains after second attempt' test -s "$TX/snapshot/0"
 
-# ---- 3d. change_panel_port：手工改端口必须走安全校验 + 事务回滚 ----
-sed -n '/^# >>> change-port/,/^# <<< change-port/p' "$TPL" > "$TMPD/cp.sh"
-grep -q 'change_panel_port()' "$TMPD/cp.sh"; ck "提取到 change_panel_port" 0 $?
-grep -q 'panel-port-set' "$TMPD/cp.sh"; ck "改端口走后端安全校验（panel-port-set）" 0 $?
-if grep -qE 'panel_set port' "$TMPD/cp.sh"; then rc=1; else rc=0; fi
-ck "改端口不直接写配置（必须先校验）" 0 "$rc"
-grep -q 'old_port=' "$TMPD/cp.sh"; ck "改端口记录旧端口（供回滚）" 0 $?
-grep -q 'start_service' "$TMPD/cp.sh"; ck "改端口后做三重健康确认" 0 $?
-grep -q 'port_listening' "$TMPD/cp.sh"; ck "改端口后确认新端口真的在监听" 0 $?
-grep -q 'config-set port "\$oldp"' "$TMPD/cp.sh"; ck "失败时写回旧端口" 0 $?
-grep -q '已回滚到原端口' "$TMPD/cp.sh"; ck "确认恢复成功才提示已回滚" 0 $?
-grep -q '服务未能恢复' "$TMPD/cp.sh"; ck "旧端口也恢复失败时明确报错" 0 $?
-if grep -qE 'restart[^|]*\|\| *true' "$TMPD/cp.sh"; then rc=1; else rc=0; fi
-ck "改端口不 || true 吞错" 0 "$rc"
-
-# ---- 3e. health_check：必须识别数据面未就绪（503）----
-grep -q '"ok":true' "$TMPD/ss.sh"; ck "健康检查要求 ok:true" 0 $?
-grep -q 'data plane not ready' "$TMPD/ss.sh"; ck "健康检查识别数据面未就绪(503)" 0 $?
-grep -q 'healthz' "$TMPD/ss.sh"; ck "健康检查走 /healthz" 0 $?
-
-# ---- 4. do_update：脚本相同也检查二进制 ----
-sed -n '/^# >>> do-update/,/^# <<< do-update/p' "$TPL" > "$TMPD/du.sh"
-grep -q '检查后端二进制是否同步' "$TMPD/du.sh"; ck "do_update 脚本相同时仍检查二进制" 0 $?
-grep -q 'CORE_REPLACED' "$TMPD/du.sh"; ck "do_update 依据 CORE_REPLACED 决定是否重启" 0 $?
-# 二进制被替换时必须走配置迁移（新版本可能需要新配置字段）
-grep -q 'ensure_panel_conf' "$TMPD/du.sh"; ck "do_update 二进制更新后做配置迁移" 0 $?
-grep -q 'PANEL_CONF.bak' "$TMPD/du.sh"; ck "do_update 快速路径也备份 panel.json" 0 $?
-grep -q 'core_rollback' "$TMPD/du.sh"; ck "do_update 快速路径失败可回滚" 0 $?
-grep -q 'bash -n "\$tmp"' "$TMPD/du.sh"; ck "do_update 下载后做语法校验" 0 $?
-grep -q 'SELF_PATH.bak' "$TMPD/du.sh"; ck "do_update 升级前备份本体" 0 $?
-grep -q '回滚失败' "$TMPD/du.sh"; ck "do_update 回滚失败不被吞掉" 0 $?
-# 回滚后必须重新确认服务健康，而不是无条件宣称「已恢复」
-grep -q 'panel_running && health_check' "$TMPD/du.sh"; ck "do_update 回滚后验证服务健康" 0 $?
-if grep -qE 'apply-update[^|]*\|\| *true' "$TMPD/du.sh"; then rc=1; else rc=0; fi
-ck "do_update 回滚不 || true 吞错" 0 "$rc"
-
-# ---- 5. apply_update：保留用户数据 + nft 硬依赖 + 真正可回滚 ----
-sed -n '/^# >>> apply-update/,/^# <<< apply-update/p' "$TPL" > "$TMPD/au.sh"
-grep -q 'nft list tables' "$TMPD/au.sh"; ck "apply_update 探测 nft 真实可用性" 0 $?
-grep -q 'ensure_panel_conf' "$TMPD/au.sh"; ck "apply_update 迁移/补齐配置" 0 $?
-if grep -qE 'rm -[rf]+ .*(traffic\.db|panel\.json)' "$TMPD/au.sh"; then rc=1; else rc=0; fi
-ck "apply_update 绝不删除 traffic.db / panel.json" 0 "$rc"
-grep -q 'PANEL_CONF.bak' "$TMPD/au.sh"; ck "apply_update 备份 panel.json" 0 $?
-grep -q 'core_rollback' "$TMPD/au.sh"; ck "apply_update 失败调用回滚" 0 $?
-grep -q 'core_backup_commit' "$TMPD/au.sh"; ck "apply_update 成功后才提交（删备份）" 0 $?
-grep -q 'selftest' "$TMPD/au.sh"; ck "apply_update 升级后跑 selftest" 0 $?
-# 备份提交必须在健康检查与 selftest 之后
-if awk '/selftest/{seen=1} /core_backup_commit/{if(!seen) bad=1} END{exit bad?1:0}' "$TMPD/au.sh"; then rc=0; else rc=1; fi
-ck "备份仅在 selftest 通过后删除" 0 "$rc"
-# 回滚实现：恢复二进制 + 恢复配置 + 重启并验证
-grep -q 'mv -f "\$CORE_BACKUP" "\$CORE_BIN"' "$TMPD/au.sh"; ck "回滚恢复旧二进制" 0 $?
-grep -q 'cp -p "\$CONF_BACKUP" "\$PANEL_CONF"' "$TMPD/au.sh"; ck "回滚恢复旧配置（端口/令牌/入口）" 0 $?
-grep -q 'if start_service; then' "$TMPD/au.sh"; ck "回滚后重启并验证旧服务" 0 $?
-grep -q '已回滚到升级前版本' "$TMPD/au.sh"; ck "确认恢复成功才提示已回滚" 0 $?
-grep -q '回滚未完成' "$TMPD/au.sh"; ck "回滚失败明确报错" 0 $?
-if grep -qE 'core_rollback[^|]*\|\| *true' "$TMPD/au.sh"; then rc=1; else rc=0; fi
-ck "回滚不被 || true 吞掉" 0 "$rc"
-
-# ---- 5b. ensure_panel_conf：三项安全字段 fail-closed ----
-grep -q 'config-ensure-all' "$TPL"; ck "安装器调用 config-ensure-all" 0 $?
-if grep -qE 'config-ensure-(all|token|port|entry)[^|]*\|\| *true' "$TPL"; then rc=1; else rc=0; fi
-ck "config-ensure 错误不被吞掉" 0 "$rc"
-sed -n '/^ensure_panel_conf()/,/^}/p' "$TPL" > "$TMPD/epc.sh"
-grep -q '配置已损坏' "$TMPD/epc.sh"; ck "配置损坏时明确报错" 0 $?
-grep -q '原文件未被改动' "$TMPD/epc.sh"; ck "配置损坏时不覆盖原文件" 0 $?
-grep -q 'chmod 600' "$TMPD/epc.sh"; ck "panel.json 收紧到 0600" 0 $?
-grep -q 'config_ready' "$TMPD/epc.sh"; ck "初始化后校验三项齐备" 0 $?
-
-# ---- 6. 安全边界（剥注释与字符串字面量后检查）----
-# 为什么要剥字符串：提示文案里会出现 "可手工执行: nft delete table ..." 这类
-# 帮助信息，它不是被执行的命令。只剥注释会误判。
-CODE="$TMPD/code.sh"
+# Keep firewall, sysctl, and version guardrails independent from subprocess mocks.
+CODE="$WORK/code"
 sed -e 's/#.*$//' -e 's/"[^"]*"//g' -e "s/'[^']*'//g" "$TPL" > "$CODE"
-if grep -q 'flush ruleset' "$CODE"; then rc=1; else rc=0; fi
-ck "安装器无 nft flush ruleset" 0 "$rc"
-if grep -qE 'iptables -F|iptables -X|nft flush table (ip|ip6|inet) filter' "$CODE"; then rc=1; else rc=0; fi
-ck "安装器不清空系统防火墙" 0 "$rc"
-if grep -qE 'policy drop' "$CODE"; then rc=1; else rc=0; fi
-ck "安装器不修改默认 policy" 0 "$rc"
-# 删表只能通过 nft-forward clear（Go 侧只删 nff_*）
-DELS=$(grep -cE 'nft delete table' "$CODE" || true)
-ck "安装器不直接 nft delete table（统一走 nft-forward clear）" 0 "$DELS"
-if grep -qE '(^|[^-])/etc/sysctl\.conf' "$CODE"; then rc=1; else rc=0; fi
-ck "不修改 /etc/sysctl.conf" 0 "$rc"
-# 这条查的是「写到哪个文件」，路径本身在字符串里，因此用只剥注释的版本
-sed 's/#.*$//' "$TPL" | grep -q '99-nft-forward-conntrack.conf'
-ck "conntrack sysctl 写独立文件" 0 $?
-sed 's/#.*$//' "$TPL" | grep -q '90-nft-forward.conf'
-ck "ip_forward sysctl 写独立文件" 0 $?
-
-# ---- 7. 版本一致性 ----
-APP_VER=$(grep -m1 '^APP_VERSION=' "$TPL" | sed -E 's/^APP_VERSION="?([^"]+)"?.*/\1/')
-GO_VER=$(grep '^const Version' "$ROOT/internal/version/version.go" | sed 's/.*"\(.*\)".*/\1/')
-ck "APP_VERSION == Go Version" "$GO_VER" "$APP_VER"
-
-echo
-echo "  PASS=$PASS FAIL=$FAIL"
-[[ "$FAIL" == 0 ]] || exit 1
+check 'installer has no global/unrelated firewall operations' not grep -qE 'flush ruleset|iptables -[FX]|nft flush table|nft delete table|policy drop' "$CODE"
+check 'installer does not modify global sysctl.conf' not grep -qF /etc/sysctl.conf "$CODE"
+check 'installer uses its own conntrack file' matches '99-nft-forward-conntrack.conf' "$TPL"
+check 'installer uses its own forwarding file' matches '90-nft-forward.conf' "$TPL"
+APP_VER=$(sed -nE 's/^APP_VERSION="([^"]+)"$/\1/p' "$TPL")
+GO_VER=$(sed -nE 's/^const Version = "([^"]+)"$/\1/p' "$HERE/internal/version/version.go")
+check 'installer and Go report the same version' test "$APP_VER" = "$GO_VER"
+printf '\nPASS=%s FAIL=0\n' "$PASS"

@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="color-scheme" content="light">
+<meta name="theme-color" content="#f3f5f9">
 <title>NFT Forward · 端口转发面板</title>
 <link rel="stylesheet" href="style.css">
 </head>
@@ -13,7 +14,7 @@
 <main class="wrap">
 
   <!-- ===== 总览 ===== -->
-  <section class="view on" id="view-home">
+  <section class="view on" id="view-home" aria-label="转发总览">
 
     <div class="hero glass">
       <div class="hero-head">
@@ -21,8 +22,8 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
           <span>实时速率</span>
         </div>
-        <div class="conn-chip">
-          <span id="pulse"></span>
+        <div class="conn-chip" role="status">
+          <span id="pulse" aria-hidden="true"></span>
           <em id="status-txt">连接中…</em>
         </div>
       </div>
@@ -84,7 +85,7 @@
     <div class="panel glass">
       <div class="panel-head">
         <h2>转发规则</h2>
-        <button class="mini-btn primary" id="btn-new-rule">＋ 添加规则</button>
+        <button class="mini-btn primary" id="btn-new-rule" type="button">＋ 添加规则</button>
       </div>
       <div id="rule-cards" class="node-list"></div>
     </div>
@@ -94,7 +95,7 @@
   <!-- ===== 每日趋势 ===== -->
   <section class="view" id="view-daily">
     <div class="panel glass">
-      <div class="panel-head"><h2>每日流量趋势</h2><span class="hint">最近 60 天 · 全部规则</span></div>
+      <div class="panel-head"><h2>每日流量</h2><span class="hint">最近 60 天 · 全部规则</span></div>
       <div id="daily-table"></div>
     </div>
   </section>
@@ -103,42 +104,42 @@
   <section class="view" id="view-rules">
     <div class="panel glass">
       <div class="panel-head">
-        <h2>规则详情</h2>
+        <h2>规则流量</h2>
         <select id="rule-select" aria-label="选择规则"></select>
       </div>
+      <div class="trend-caption">最近 60 天 · 所选规则</div>
       <div id="rule-daily-table"></div>
     </div>
   </section>
 
-  <!-- 面板底部：低频操作（退出登录）。顶部品牌/状态栏已按 SBX 的设计移除。 -->
-  <footer class="panel-foot">
-    <form class="logout-form" method="post" action="logout">
-      <button type="submit" class="mini-btn" id="btn-logout">退出登录</button>
-    </form>
-  </footer>
-
 </main>
 
 <!-- ===== 底部导航 ===== -->
-<nav class="dock glass">
-  <button class="tab on" data-view="home">
+<nav class="dock glass" aria-label="面板导航">
+  <button class="tab on" type="button" data-view="home" aria-current="page">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9 21v-6h6v6"/></svg>
     <span>总览</span>
   </button>
-  <button class="tab" data-view="daily">
+  <button class="tab" type="button" data-view="daily">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>
     <span>趋势</span>
   </button>
-  <button class="tab" data-view="rules">
+  <button class="tab" type="button" data-view="rules">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h11l-3-3M20 17H9l3 3"/><circle cx="19" cy="7" r="2"/><circle cx="5" cy="17" r="2"/></svg>
-    <span>规则</span>
+    <span>规则流量</span>
   </button>
+  <form class="logout-form" method="post" action="logout">
+    <button type="submit" class="tab" id="btn-logout">
+      <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 17l5-5-5-5M15 12H3"/><path d="M12 3h6a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-6"/></svg>
+      <span>退出</span>
+    </button>
+  </form>
 </nav>
 
-<div class="drawer-mask" id="drawer-mask"></div>
+<div class="drawer-mask" id="drawer-mask" aria-hidden="true"></div>
 
 <!-- ===== 添加规则（桌面右侧抽屉 / 移动底部 sheet） ===== -->
-<aside class="drawer" id="new-drawer" role="dialog" aria-modal="true" aria-labelledby="new-title">
+<aside class="drawer" id="new-drawer" role="dialog" aria-modal="true" aria-labelledby="new-title" aria-hidden="true" inert>
   <header class="drawer-head">
     <div>
       <small>转发规则</small>
@@ -151,45 +152,47 @@
 
   <div class="drawer-body">
     <section class="sect">
-      <div class="field">
-        <label for="new-name">名称</label>
-        <input type="text" id="new-name" placeholder="" autocomplete="off" maxlength="64">
-      </div>
-      <div class="field">
-        <label for="new-proto">协议</label>
-        <select id="new-proto">
-          <option value="tcp+udp" selected>TCP + UDP</option>
-          <option value="tcp">TCP</option>
-          <option value="udp">UDP</option>
-        </select>
-      </div>
-      <div class="field">
-        <label for="new-listen-port">监听端口</label>
-        <input type="number" id="new-listen-port" placeholder="留空则随机" min="1" max="65535" inputmode="numeric">
-      </div>
-      <div class="field">
-        <label for="new-target">目标地址</label>
-        <input type="text" id="new-target" placeholder="IP 或域名" autocomplete="off" spellcheck="false">
-      </div>
-      <div class="field">
-        <label for="new-target-port">目标端口</label>
-        <input type="number" id="new-target-port" placeholder="" min="1" max="65535" inputmode="numeric">
+      <div class="forward-fields">
+        <div class="field full">
+          <label for="new-name">名称</label>
+          <input type="text" id="new-name" autocomplete="off" maxlength="64">
+        </div>
+        <div class="field">
+          <label for="new-proto">协议</label>
+          <select id="new-proto">
+            <option value="tcp+udp" selected>TCP + UDP</option>
+            <option value="tcp">TCP</option>
+            <option value="udp">UDP</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="new-listen-port">监听端口</label>
+          <input type="number" id="new-listen-port" placeholder="留空则随机" min="1" max="65535" inputmode="numeric">
+        </div>
+        <div class="field full">
+          <label for="new-target">目标地址</label>
+          <input type="text" id="new-target" placeholder="IP 或域名" autocomplete="off" spellcheck="false" autocapitalize="none">
+        </div>
+        <div class="field">
+          <label for="new-target-port">目标端口</label>
+          <input type="number" id="new-target-port" min="1" max="65535" inputmode="numeric">
+        </div>
       </div>
     </section>
-    <div class="err hidden" id="new-error"></div>
   </div>
+  <div class="err drawer-error hidden" role="alert" id="new-error"></div>
 
   <footer class="drawer-foot">
-    <button class="btn" id="new-cancel">取消</button>
+    <button class="btn ghost" id="new-cancel">取消</button>
     <button class="btn primary" id="new-submit">添加</button>
   </footer>
 </aside>
 
 <!-- ===== 规则管理抽屉 ===== -->
-<aside class="drawer" id="policy-drawer" role="dialog" aria-modal="true">
+<aside class="drawer" id="policy-drawer" role="dialog" aria-modal="true" aria-labelledby="policy-title drawer-rule-name" aria-hidden="true" inert>
   <header class="drawer-head">
     <div>
-      <small>规则管理</small>
+      <small id="policy-title">规则管理</small>
       <h3 id="drawer-rule-name">—</h3>
     </div>
     <button class="icon-btn" id="drawer-close" aria-label="关闭">
@@ -198,50 +201,47 @@
   </header>
 
   <div class="drawer-body">
-    <section class="sect">
-      <div class="sect-title">转发地址（复制给客户端）</div>
-      <div class="rule-addr">
-        <div class="addr-text"><span>转发地址（IP 端口）</span><br>
-          <b id="pol-addr-ip" title="点按复制 IP">—</b> <b id="pol-addr-port" title="点按复制端口">—</b>
-        </div>
-        <button type="button" class="mini-btn" id="pol-copy-addr" title="复制 IP">复制 IP</button>
-      </div>
+    <section class="sect address-section">
+      <div class="sect-title">转发地址</div>
+      <div class="rule-addr tokens" id="pol-address"></div>
     </section>
     <section class="sect">
       <div class="sect-title">转发设置</div>
-      <div class="field">
-        <label for="pol-name">名称</label>
-        <input type="text" id="pol-name" maxlength="64" autocomplete="off">
-      </div>
-      <div class="field">
-        <label for="pol-proto">协议</label>
-        <select id="pol-proto">
-          <option value="tcp+udp">TCP + UDP</option>
-          <option value="tcp">TCP</option>
-          <option value="udp">UDP</option>
-        </select>
-      </div>
-      <div class="field">
-        <label for="pol-listen-port">监听端口</label>
-        <input type="number" id="pol-listen-port" min="1" max="65535" inputmode="numeric">
-      </div>
-      <div class="field">
-        <label for="pol-target">目标地址</label>
-        <input type="text" id="pol-target" autocomplete="off" spellcheck="false">
-      </div>
-      <div class="field">
-        <label for="pol-target-port">目标端口</label>
-        <input type="number" id="pol-target-port" min="1" max="65535" inputmode="numeric">
+      <div class="forward-fields">
+        <div class="field full">
+          <label for="pol-name">名称</label>
+          <input type="text" id="pol-name" maxlength="64" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="pol-proto">协议</label>
+          <select id="pol-proto">
+            <option value="tcp+udp">TCP + UDP</option>
+            <option value="tcp">TCP</option>
+            <option value="udp">UDP</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="pol-listen-port">监听端口</label>
+          <input type="number" id="pol-listen-port" min="1" max="65535" inputmode="numeric">
+        </div>
+        <div class="field full">
+          <label for="pol-target">目标地址</label>
+          <input type="text" id="pol-target" autocomplete="off" spellcheck="false" autocapitalize="none">
+        </div>
+        <div class="field">
+          <label for="pol-target-port">目标端口</label>
+          <input type="number" id="pol-target-port" min="1" max="65535" inputmode="numeric">
+        </div>
       </div>
       <label class="switch-row">
         <div><b>启用规则</b><small>停用后立即撤销转发，历史流量保留</small></div>
-        <input type="checkbox" id="pol-enable" class="sw-input"><span class="sw" aria-hidden="true"></span>
+        <input type="checkbox" role="switch" id="pol-enable" class="sw-input"><span class="sw" aria-hidden="true"></span>
       </label>
     </section>
 
     <!-- 域名规则才显示：当前解析结果（只读） -->
     <section class="sect hidden" id="pol-dns-sect">
-      <div class="sect-title">域名解析</div>
+      <div class="sect-title">域名解析 <span>只读</span></div>
       <div class="kv"><span>目标地址</span><b id="pol-dns-host">—</b></div>
       <div class="kv"><span>当前解析 IPv4</span><b id="pol-dns-v4">—</b></div>
       <div class="kv"><span>当前解析 IPv6</span><b id="pol-dns-v6">—</b></div>
@@ -252,68 +252,68 @@
       <div class="sect-title">流量配额</div>
       <label class="switch-row">
         <div><b>启用配额</b><small>超出后仅阻断该规则转发</small></div>
-        <input type="checkbox" id="pol-quota-enable" class="sw-input"><span class="sw" aria-hidden="true"></span>
+        <input type="checkbox" role="switch" id="pol-quota-enable" class="sw-input"><span class="sw" aria-hidden="true"></span>
       </label>
       <div class="field summary-field">
-        <small>当前已用</small>
+        <small>当前用量</small>
         <output id="pol-quota-used">—</output>
       </div>
       <div id="pol-quota-box" class="box hidden">
         <div class="field row">
-          <input type="number" id="pol-quota-val" min="1" step="1" inputmode="decimal" placeholder="500">
-          <select id="pol-quota-unit">
+          <input type="number" id="pol-quota-val" min="0" step="any" inputmode="decimal" aria-label="流量额度" placeholder="流量额度">
+          <select id="pol-quota-unit" aria-label="额度单位">
             <option value="GiB" selected>GiB</option>
             <option value="TiB">TiB</option>
           </select>
         </div>
       </div>
-      <button type="button" class="ghost-btn" id="pol-quota-reset">重置当前使用量（保留历史）</button>
+      <button type="button" class="ghost-btn" id="pol-quota-reset">重置用量（保留历史）</button>
     </section>
 
     <section class="sect">
       <div class="sect-title">IP 数量限制</div>
       <label class="switch-row">
         <div><b>启用限制</b><small>达上限后阻止新 IP 接入</small></div>
-        <input type="checkbox" id="pol-ip-enable" class="sw-input"><span class="sw" aria-hidden="true"></span>
+        <input type="checkbox" role="switch" id="pol-ip-enable" class="sw-input"><span class="sw" aria-hidden="true"></span>
       </label>
       <div class="field summary-field">
         <small>当前在线 IP</small>
         <output id="pol-ip-active">—</output>
       </div>
       <div id="pol-ip-box" class="box hidden">
-        <div class="field row">
-          <input type="number" id="pol-ip-max" min="1" step="1" inputmode="numeric" placeholder="最大同时在线数">
+        <div class="field">
+          <input type="number" id="pol-ip-max" min="1" step="1" inputmode="numeric" aria-label="最大同时在线 IP 数" placeholder="最大同时在线 IP 数">
         </div>
       </div>
     </section>
 
     <section class="danger-zone">
       <div class="sect-title">危险操作</div>
-      <small>删除后立即撤销转发；今日 / 累计 / 每日历史流量仍会保留可查。</small>
+      <small>删除会立即停止转发；历史流量记录保留。</small>
       <button type="button" class="btn danger" id="pol-delete">删除规则</button>
     </section>
 
-    <div class="err hidden" id="pol-error"></div>
   </div>
+  <div class="err drawer-error hidden" role="alert" id="pol-error"></div>
 
   <footer class="drawer-foot">
-    <button class="btn" id="pol-cancel">取消</button>
+    <button class="btn ghost" id="pol-cancel">取消</button>
     <button class="btn primary" id="pol-save">保存</button>
   </footer>
 </aside>
 
 <!-- ===== 在线 IP 抽屉 ===== -->
-<aside class="drawer" id="ips-drawer" role="dialog" aria-modal="true">
+<aside class="drawer" id="ips-drawer" role="dialog" aria-modal="true" aria-labelledby="ips-title ips-rule-name" aria-hidden="true" inert>
   <header class="drawer-head">
     <div>
-      <small>在线 IP</small>
+      <small id="ips-title">在线 IP</small>
       <h3 id="ips-rule-name">—</h3>
     </div>
     <button class="icon-btn" id="ips-close" aria-label="关闭">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
     </button>
   </header>
-  <div class="drawer-body"><div id="ips-list" class="ips-list"></div></div>
+  <div class="drawer-body"><div class="drawer-note">仅查看在线及因 IP 上限被拒绝的地址。</div><div id="ips-list" class="ips-list"></div></div>
 </aside>
 
 <div id="toast" role="status"></div>

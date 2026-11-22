@@ -7,6 +7,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -98,26 +99,79 @@ type DB struct {
 	path string
 }
 
-// Open 打开（必要时创建）数据库并执行迁移。
-func Open(path string) (*DB, error) {
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, fmt.Errorf("创建数据目录失败: %w", err)
+// Exists checks whether the configured SQLite file is present without
+// mistaking dangling links, empty files, or orphaned journals for first use.
+func Exists(path string) (bool, error) {
+	st, err := os.Stat(path)
+	if err == nil {
+		if !st.Mode().IsRegular() || st.Size() == 0 {
+			return false, fmt.Errorf("规则数据库不是非空普通文件: %s", path)
+		}
+		return true, nil
+	}
+	if !os.IsNotExist(err) {
+		return false, err
+	}
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		if _, err := os.Lstat(path + suffix); !os.IsNotExist(err) {
+			if err != nil {
+				return false, err
+			}
+			return false, fmt.Errorf("主数据库缺失但发现数据库路径或日志: %s", path+suffix)
 		}
 	}
-	db := sql.OpenDB(&pragmaConnector{dsn: "file:" + path})
+	return false, nil
+}
+
+func connect(path, mode string) (*DB, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	uri := url.URL{Scheme: "file", Path: abs, RawQuery: "mode=" + mode}
+	db := sql.OpenDB(&pragmaConnector{dsn: uri.String()})
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(0)
-	db.SetConnMaxIdleTime(0)
+	return &DB{DB: db, path: path}, nil
+}
 
-	d := &DB{DB: db, path: path}
-	if _, err := d.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		slog.Debug("WAL 不可用, 使用默认日志模式", "err", err)
+// OpenReadOnly never creates a database, changes its schema, or changes its
+// journal mode. SQLite still reads the WAL (unlike immutable mode).
+func OpenReadOnly(path string) (*DB, error) { return connect(path, "ro") }
+
+func Open(path string) (*DB, error) { return OpenConfigured(context.Background(), path, false) }
+
+// OpenConfigured refuses to initialize a missing database when this path
+// was previously known to contain service state.
+func OpenConfigured(ctx context.Context, path string, requireExisting bool) (*DB, error) {
+	if path == "" {
+		return nil, fmt.Errorf("数据库路径不能为空")
 	}
-	if err := d.migrate(); err != nil {
-		db.Close()
+	exists, err := Exists(path)
+	if err != nil {
 		return nil, err
+	}
+	mode := "rw"
+	if !exists {
+		if requireExisting {
+			return nil, fmt.Errorf("已初始化的数据库缺失: %s", path)
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return nil, err
+		}
+		mode = "rwc"
+	}
+	d, err := connect(path, mode)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.migrate(ctx, exists); err != nil {
+		d.Close()
+		return nil, err
+	}
+	var journal string
+	if err := d.QueryRowContext(ctx, "PRAGMA journal_mode=WAL").Scan(&journal); err != nil || journal != "wal" {
+		slog.Warn("WAL 不可用, 使用现有日志模式", "mode", journal, "err", err)
 	}
 	return d, nil
 }
@@ -125,53 +179,54 @@ func Open(path string) (*DB, error) {
 // Path 返回数据库文件路径。
 func (d *DB) Path() string { return d.path }
 
-func (d *DB) migrate() error {
-	tx, err := d.Begin()
+// Run schema creation and all additive migrations in one SQLite transaction.
+func (d *DB) migrate(ctx context.Context, existing bool) error {
+	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("开启迁移事务失败: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer tx.Rollback()
+	if existing {
+		var found int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name='rules'`).Scan(&found); err != nil {
+			return err
+		}
+		if found != 1 {
+			return fmt.Errorf("现有数据库缺少 rules 表，拒绝初始化: %s", d.path)
+		}
+	}
 	for _, stmt := range splitStatements(Schema) {
-		if _, err := tx.Exec(stmt); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("建表失败: %w", err)
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	return d.migrateRuleColumns()
-}
-
-// migrateRuleColumns 为老库补齐 rules 表新增列。
-//
-// 老库（v0.2 之前）的 rules 表带一个 listen_address 列。它的定义是
-// `TEXT NOT NULL DEFAULT '0.0.0.0'`，因此新代码的 INSERT 不写该列也能成功
-// —— 由默认值填充。策略是**保留列、永不读写、绝不 DROP**：
-// SQLite 的 DROP COLUMN 需要重写整表，中途失败可能丢数据，而留着它零成本。
-func (d *DB) migrateRuleColumns() error {
-	have, err := d.ruleColumns()
+	have, err := ruleColumns(ctx, tx)
 	if err != nil {
 		return err
 	}
-	if have["listen_address"] {
-		// 只记一次日志，便于排查「为什么这个库里有个没人用的列」。
-		slog.Debug("检测到历史 listen_address 列（保留不用，不会被删除）")
-	}
 	for _, c := range addColumns {
-		if have[c.col] {
-			continue
+		if !have[c.col] {
+			if _, err := tx.ExecContext(ctx, c.ddl); err != nil {
+				return fmt.Errorf("升级 rules 表失败(%s): %w", c.col, err)
+			}
 		}
-		if _, err := d.Exec(c.ddl); err != nil {
-			return fmt.Errorf("升级 rules 表失败(%s): %w", c.col, err)
-		}
-		slog.Info("数据库已升级", "column", c.col)
 	}
-	return nil
+	// Verify fields used by the backend before committing any migration.
+	const probe = `SELECT id,name,enabled,protocol,listen_port,target_address,target_port,created_at,updated_at,
+        deleted,deleted_at,quota_enabled,quota_limit_bytes,quota_reset_baseline,ip_limit_enabled,ip_limit_max,
+        resolved_ipv4,resolved_ipv6,resolved_at,resolve_status,resolve_error FROM rules LIMIT 0`
+	rows, err := tx.QueryContext(ctx, probe)
+	if err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// ruleColumns 返回 rules 表现有列集合。
-func (d *DB) ruleColumns() (map[string]bool, error) {
-	rows, err := d.Query("PRAGMA table_info(rules)")
+func ruleColumns(ctx context.Context, tx *sql.Tx) (map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx, "PRAGMA table_info(rules)")
 	if err != nil {
 		return nil, err
 	}

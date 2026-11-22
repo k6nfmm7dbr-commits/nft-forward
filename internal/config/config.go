@@ -15,6 +15,7 @@
 package config
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -25,6 +26,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/fsx"
 )
@@ -143,6 +145,14 @@ func load(path string, strict bool) (*Config, error) {
 	data, err := os.ReadFile(path)
 	switch {
 	case os.IsNotExist(err):
+		if strict {
+			if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
+				return nil, fmt.Errorf("配置路径存在但无法读取 (%s): %w", path, err)
+			}
+			if _, statErr := os.Lstat(path + ".last-good"); !os.IsNotExist(statErr) {
+				return nil, fmt.Errorf("配置缺失 (%s)；请检查或显式恢复最后一次健康配置", path)
+			}
+		}
 		slog.Info("配置不存在, 使用默认值", "path", path)
 	case err != nil:
 		if strict {
@@ -173,6 +183,9 @@ func decodeConfig(data []byte) (map[string]any, error) {
 	if err := dec.Decode(&file); err != nil {
 		return nil, err
 	}
+	if file == nil {
+		return nil, fmt.Errorf("配置必须是 JSON 对象")
+	}
 	var extra any
 	if err := dec.Decode(&extra); err != io.EOF {
 		if err == nil {
@@ -186,6 +199,25 @@ func decodeConfig(data []byte) (map[string]any, error) {
 // Validate 语义校验（允许「尚未初始化」的空 token / 0 端口 / 空入口路径，
 // 否则全新安装时连 ensure 流程都无法读取配置）。
 func (c *Config) Validate() error {
+	// Do not treat malformed persisted ports as uninitialized (which would rotate them).
+	if n, ok := c.raw["port"]; ok {
+		switch n.(type) {
+		case json.Number, string:
+			if _, err := strconv.ParseInt(strings.TrimSpace(c.Str("port")), 10, 32); err != nil {
+				return fmt.Errorf("port 必须是整数")
+			}
+		default:
+			return fmt.Errorf("port 必须是整数")
+		}
+	}
+	for _, key := range []string{"db", "nft_conf", "listen"} {
+		if v, ok := c.raw[key]; ok {
+			text, ok := v.(string)
+			if !ok || strings.ContainsRune(text, 0) {
+				return fmt.Errorf("%s 必须是有效字符串", key)
+			}
+		}
+	}
 	if c.Port != 0 && (c.Port < 1 || c.Port > 65535) {
 		return fmt.Errorf("port 必须在 1-65535: %d", c.Port)
 	}
@@ -387,143 +419,136 @@ const LegacyDefaultPort = 8090
 // 只认「恰好等于 v0.3.0 默认值」这一种情况 —— 用户自己设的其它端口一律不动。
 func (c *Config) MigratePort() bool { return c.Port == LegacyDefaultPort }
 
-// ClearPort 清空 port 配置（供迁移后重新随机）。
-//
-// 只删 port 键，其余配置（含令牌、入口路径、用户自定义键）原样保留。
-func ClearPort() error {
+// Lock serializes read/modify/write and the daemon's rule port decisions.
+func Lock(ctx context.Context) (*os.File, error) {
+	return fsx.Lock(ctx, ConfPath()+".lock")
+}
+
+// Change applies one validated config mutation under the file lock. Returning
+// false or an error from edit leaves the primary file untouched.
+func Change(edit func(*Config) (bool, error)) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	lock, err := Lock(ctx)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	c, err := LoadStrict()
 	if err != nil {
-		return fmt.Errorf("拒绝修改配置: %w", err)
+		return err
 	}
-	delete(c.raw, "port")
-	if err := c.write(); err != nil {
+	changed, err := edit(c)
+	if err != nil || !changed {
 		return err
 	}
 	c.normalize()
-	return nil
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	return writeConfig(ConfPath(), c)
 }
 
-// Migrate 清理废弃配置键（读取 → 改 → 原子写回）。
-// 返回被删除的键。配置损坏时 fail-closed，不写回。
+// Migrate removes obsolete keys without overwriting a concurrent change.
 func Migrate() ([]string, error) {
-	if _, err := os.Stat(ConfPath()); os.IsNotExist(err) {
-		return nil, nil
-	}
-	c, err := LoadStrict()
-	if err != nil {
-		return nil, fmt.Errorf("拒绝迁移配置: %w", err)
-	}
 	var dropped []string
-	for _, k := range legacyKeys {
-		if _, ok := c.raw[k]; ok {
-			delete(c.raw, k)
-			dropped = append(dropped, k)
+	err := Change(func(c *Config) (bool, error) {
+		for _, k := range legacyKeys {
+			if _, ok := c.raw[k]; ok {
+				delete(c.raw, k)
+				dropped = append(dropped, k)
+			}
 		}
-	}
-	if len(dropped) == 0 {
-		return nil, nil
-	}
-	if err := c.write(); err != nil {
-		return nil, err
-	}
-	return dropped, nil
+		return len(dropped) > 0, nil
+	})
+	return dropped, err
 }
 
-// write 原子写回当前配置（0600）。
-func (c *Config) write() error {
+func writeConfig(path string, c *Config) error {
 	data, err := fsx.MarshalIndent(c.raw)
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
-	return fsx.WriteFileAtomic(ConfPath(), data, 0o600)
+	return fsx.WriteFileAtomic(path, append(data, '\n'), 0o600)
 }
 
-// Set 写回单个配置项并原子落盘。
+// Set writes a single setting. Existing numeric string compatibility is
+// retained, without coercing credentials or path strings into JSON numbers.
 func Set(key, value string) error {
 	return SetAll(map[string]string{key: value})
 }
 
-// SetAll 一次写回多个配置项（单次原子写）。
-//
-// 读取阶段用 LoadStrict：panel.json 存在但损坏时拒绝修改并原样返回错误，
-// 绝不允许「损坏 → 回退 defaults → 把默认值写回正式文件」的覆盖路径。
 func SetAll(kv map[string]string) error {
-	c, err := LoadStrict()
-	if err != nil {
-		return fmt.Errorf("拒绝修改配置: %w", err)
-	}
-	for key, value := range kv {
-		var v any = value
-		trimmed := strings.TrimSpace(value)
-		if i, err := strconv.ParseInt(trimmed, 10, 64); err == nil && trimmed != "" {
-			v = json.Number(strconv.FormatInt(i, 10))
+	return Change(func(c *Config) (bool, error) {
+		for key, value := range kv {
+			var v any = value
+			switch key {
+			case "token", "entry_path", "db", "nft_conf", "sysctl_conf", "listen", "tz":
+			default:
+				if i, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil {
+					v = json.Number(strconv.FormatInt(i, 10))
+				}
+			}
+			c.raw[key] = v
 		}
-		c.raw[key] = v
-	}
-	if err := c.write(); err != nil {
-		return err
-	}
-	c.normalize()
-	return nil
+		return len(kv) > 0, nil
+	})
 }
 
-// EnsureToken 保证 token 非空；为空则生成 32 位十六进制随机令牌并原子写回。
-//
-// 语义与 SBX 的 config-ensure-token 完全一致：
-//   - crypto/rand 16 bytes → hex（禁止 math/rand，禁止 shell $RANDOM）；
-//   - 已存在则原样返回，绝不重新生成（升级不会重置令牌）；
-//   - 读取用 LoadStrict：panel.json 损坏时直接报错，绝不基于 defaults
-//     生成新文件覆盖原损坏文件（避免丢失用户已有配置）；
-//   - 写回走 fsx 原子写 + 0600。
+// Ensure completes initialization in one transaction. selectPort is called
+// under the lock and may retain the existing port or request a replacement.
+func Ensure(selectPort func(*Config) (int, error), token, entry bool) (port int, tok, path string, err error) {
+	err = Change(func(c *Config) (bool, error) {
+		changed := false
+		if selectPort != nil {
+			p, err := selectPort(c)
+			if err != nil {
+				return false, err
+			}
+			if p < 1 || p > 65535 {
+				return false, fmt.Errorf("端口必须在 1-65535")
+			}
+			if p != c.Port {
+				c.raw["port"] = json.Number(strconv.Itoa(p))
+				changed = true
+			}
+			port = p
+		}
+		tok, path = c.Token, c.EntryPath
+		if token && tok == "" {
+			var err error
+			if tok, err = randomHex(tokenBytes); err != nil {
+				return false, err
+			}
+			c.raw["token"] = tok
+			changed = true
+		}
+		if entry && path == "" {
+			var err error
+			if path, err = randomHex(entryPathBytes); err != nil {
+				return false, err
+			}
+			c.raw["entry_path"] = path
+			changed = true
+		}
+		return changed, nil
+	})
+	return
+}
+
 func EnsureToken() (string, error) {
-	c, err := LoadStrict()
-	if err != nil {
-		return "", fmt.Errorf("拒绝生成访问令牌: %w", err)
-	}
-	if c.Token != "" {
-		return c.Token, nil
-	}
-	tok, err := randomHex(tokenBytes)
-	if err != nil {
-		return "", err
-	}
-	c.raw["token"] = tok
-	if err := c.write(); err != nil {
-		return "", err
-	}
-	return tok, nil
+	_, token, _, err := Ensure(nil, true, false)
+	return token, err
 }
 
-// EnsureEntryPath 保证随机入口路径存在；为空则生成 96 bit 随机路径并写回。
-//
-// 与 token 完全独立：各自 crypto/rand 生成，不能互相推导，
-// 令牌本身绝不作为 URL 路径使用。
 func EnsureEntryPath() (string, error) {
-	c, err := LoadStrict()
-	if err != nil {
-		return "", fmt.Errorf("拒绝生成面板入口路径: %w", err)
-	}
-	if c.EntryPath != "" {
-		return c.EntryPath, nil
-	}
-	p, err := randomHex(entryPathBytes)
-	if err != nil {
-		return "", err
-	}
-	c.raw["entry_path"] = p
-	if err := c.write(); err != nil {
-		return "", err
-	}
-	return p, nil
+	_, _, path, err := Ensure(nil, false, true)
+	return path, err
 }
 
-// SetPort 持久化面板端口（供 ensure-port 与用户显式改端口共用）。
 func SetPort(port int) error {
-	if port < 1 || port > 65535 {
-		return fmt.Errorf("端口必须在 1-65535: %d", port)
-	}
-	return Set("port", strconv.Itoa(port))
+	_, _, _, err := Ensure(func(*Config) (int, error) { return port, nil }, false, false)
+	return err
 }
 
 // randomHex 返回 n 字节的密码学安全随机数据的十六进制串。

@@ -24,7 +24,9 @@ func runCmd(name string, args ...string) {
 	cmd := exec.Command(name, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	_ = cmd.Run()
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintln(os.Stderr, name, "执行失败:", err)
+	}
 }
 
 // runUpdate 把在线升级交给安装器脚本执行。
@@ -42,7 +44,15 @@ func runUpdate() {
 }
 
 func runClear() int {
-	if err := nft.ClearOwned(context.Background(), nft.ExecRunner{}); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	lock, err := config.Lock(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "清理失败:", err)
+		return 1
+	}
+	defer lock.Close()
+	if err := nft.ClearOwned(ctx, nft.ExecRunner{}); err != nil {
 		fmt.Println("清理失败:", err)
 		return 1
 	}
@@ -78,7 +88,15 @@ func panelInfo() int {
 // 输出刻意只给「项目 + 状态 + 简短说明」，正常情况下不打印任何文件路径
 // （配置 / 数据库 / sysctl）。只有失败时才在说明里带上定位问题必需的技术信息。
 func selfTest() int {
-	cfg := config.Load()
+	cfg, err := config.LoadStrict()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "读取配置失败:", err)
+		return 1
+	}
+	if err := cfg.ValidateServe(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
 	fail := 0
 	check := func(name, status, why string) {
 		fmt.Printf("%-4s %-16s %s\n", status, name, why)
@@ -87,11 +105,10 @@ func selfTest() int {
 		}
 	}
 
-	if db, err := database.Open(cfg.DB); err != nil {
+	if err := checkDatabase(cfg.DB); err != nil {
 		check("SQLite", "FAIL", "无法打开数据库: "+err.Error())
 	} else {
-		db.Close()
-		check("SQLite", "OK", "可读写")
+		check("SQLite", "OK", "可读")
 	}
 
 	if _, err := exec.LookPath("nft"); err != nil {
@@ -191,6 +208,18 @@ func selfTest() int {
 	}
 	fmt.Println("自检通过")
 	return 0
+}
+
+func checkDatabase(path string) error {
+	db, err := database.OpenReadOnly(path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	var n int
+	return db.QueryRowContext(ctx, "SELECT count(*) FROM rules").Scan(&n)
 }
 
 // 数据面状态。

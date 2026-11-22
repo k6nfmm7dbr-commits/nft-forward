@@ -19,10 +19,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/config"
 	"github.com/k6nfmm7dbr-commits/nft-forward/internal/provision"
@@ -48,7 +50,11 @@ func main() {
 			fmt.Println("用法: nft-forward config-get <key>")
 			os.Exit(1)
 		}
-		c := config.Load()
+		c, err := config.LoadStrict()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 		fmt.Println(c.Str(args[1]))
 	case "config-set":
 		if len(args) < 3 {
@@ -94,6 +100,15 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println(res.Port)
+	case "config-restore-last-good":
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := config.RestoreLastGood(ctx)
+		cancel()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "恢复配置失败:", err)
+			os.Exit(1)
+		}
+		fmt.Println("ok")
 	case "config-ensure-all":
 		os.Exit(ensureAll())
 	case "panel-port-set":
@@ -146,35 +161,16 @@ func main() {
 	default:
 		fmt.Println("未知命令:", args[0])
 		fmt.Println("可用: serve / selftest / config-get / config-set / config-migrate / " +
-			"config-ensure-token / config-ensure-port / config-ensure-entry / config-ensure-all / " +
+			"config-ensure-token / config-ensure-port / config-ensure-entry / config-ensure-all / config-restore-last-good / " +
 			"panel-port-check / panel-port-set / panel-info / clear / version")
 		os.Exit(1)
 	}
 }
 
-// ensureAll 一次完成三项初始化（端口 → 令牌 → 入口路径），任一失败即非零退出。
-//
-// 顺序无关紧要（三者互不依赖），但都必须成功：安装器据退出码决定是否继续。
+// ensureAll commits all three prerequisites together, or none on failure.
 func ensureAll() int {
-	if _, err := provision.EnsurePanelPort(); err != nil {
-		fmt.Fprintln(os.Stderr, "生成面板端口失败:", err)
-		return 1
-	}
-	if _, err := config.EnsureToken(); err != nil {
-		fmt.Fprintln(os.Stderr, "生成访问令牌失败:", err)
-		return 1
-	}
-	if _, err := config.EnsureEntryPath(); err != nil {
-		fmt.Fprintln(os.Stderr, "生成面板入口路径失败:", err)
-		return 1
-	}
-	c, err := config.LoadStrict()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "读取配置失败:", err)
-		return 1
-	}
-	if err := c.ValidateServe(); err != nil {
-		fmt.Fprintln(os.Stderr, "初始化未完成:", err)
+	if err := provision.EnsureAll(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	fmt.Println("ok")

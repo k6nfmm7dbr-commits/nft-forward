@@ -10,6 +10,7 @@
 'use strict';
 
 var state = { ruleId: null, summary: null, live: null };
+var dataEpoch = 0, summaryRevision = 0;
 // activeView 记录当前页签：轮询按它节流，隐藏视图不做无谓重画。
 var activeView = 'home';
 
@@ -29,7 +30,7 @@ var BASE = location.pathname.replace(/[^/]*$/, '');
 // url 把入口内的相对路径拼成绝对路径（'api/summary' → '/<entry>/api/summary'）。
 function url(path) { return BASE + String(path).replace(/^\/+/, ''); }
 
-var inflight = {};
+var inflight = Object.create(null);
 
 // 面板可达性：连续失败达到阈值就把状态条切成「连接异常」，恢复后自动切回。
 // 目的：网络/服务抖动时用户看到的是一句明确的「正在重试」，而不是页面像坏掉
@@ -54,17 +55,19 @@ function setConnState(text, stale) {
   if (p) p.className = 'pulse' + (stale ? ' stale' : '');
 }
 
-function api(path, params) {
-  var key = path + JSON.stringify(params || {});
+function api(path, params, freshness) {
+  // 请求只在同一数据代次内合并；写入后不能复用尚未返回的旧读取。
+  var epoch = dataEpoch;
+  var key = JSON.stringify([epoch, freshness, path, params]);
   if (inflight[key]) return inflight[key];
   var u = new URL(url(path), location.origin);
   if (params) Object.keys(params).forEach(function (k) { u.searchParams.set(k, params[k]); });
   var req = fetch(u, { cache: 'no-store', credentials: 'same-origin' }).then(function (r) {
     if (r.status === 401) { location.href = url('login'); throw new Error('未登录'); }
-    if (!r.ok) { noteAPIResult(false); throw new Error('请求失败 ' + r.status); }
-    noteAPIResult(true);
+    if (!r.ok) { if (epoch === dataEpoch) noteAPIResult(false); throw new Error('请求失败 ' + r.status); }
+    if (epoch === dataEpoch) noteAPIResult(true);
     return r.json();
-  }, function (e) { noteAPIResult(false); throw e; })
+  }, function (e) { if (epoch === dataEpoch) noteAPIResult(false); throw e; })
     .finally(function () { delete inflight[key]; });
   inflight[key] = req;
   return req;
@@ -167,27 +170,27 @@ function statusOf(st) { return STATUS[st] || STATUS.normal; }
 
 var PROTO_LABEL = { tcp: 'TCP', udp: 'UDP', 'tcp+udp': 'TCP + UDP' };
 
-// addrHost 返回「可直接复制给客户端使用」的转发主机（IP 或域名）：就是你当前
-// 访问面板用的那个主机。面板既然能被你打开，它就一定是可达的。
-function addrHost() {
-  var host = location.hostname || location.host || '';
-  return host.indexOf(':') >= 0 ? '[' + host + ']' : host;
-}
+// 用访问面板的主机作为转发地址示例。
+function addrHost() { return location.hostname.replace(/^\[|\]$/g, ''); }
 
 // copyText 复制到剪贴板。面板通常是纯 HTTP（非安全上下文），此时
 // navigator.clipboard 不可用，必须回退到 textarea + execCommand。
 function copyText(text, okMsg) {
   function fallback() {
+    var previous = document.activeElement;
     var ta = document.createElement('textarea');
     ta.value = text;
     ta.setAttribute('readonly', '');
     ta.style.position = 'fixed';
     ta.style.top = '-1000px';
     document.body.appendChild(ta);
+    ta.focus({ preventScroll: true });
     ta.select();
+    ta.setSelectionRange(0, text.length);
     var ok = false;
     try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
-    document.body.removeChild(ta);
+    ta.remove();
+    if (previous && previous.isConnected) previous.focus({ preventScroll: true });
     toast(ok ? (okMsg || '已复制') : '复制失败，请手动选择文本');
   }
   if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -200,7 +203,9 @@ function protoLabel(p) { return PROTO_LABEL[p] || String(p || '—'); }
 
 /* ---------- 概览 ---------- */
 function renderSummary(s) {
+  summaryRevision++;
   state.summary = s;
+  updatePolicyReadouts();
   easeTo('kpi-today-total', (s.today_up || 0) + (s.today_down || 0), fmtBytes);
   easeTo('kpi-all-total', (s.total_up || 0) + (s.total_down || 0), fmtBytes);
   var enabled = 0;
@@ -214,57 +219,62 @@ function renderSummary(s) {
 /* ---------- 规则卡片（视觉沿用 SBX node-card） ---------- */
 // quotaText 返回配额的纯文本（不带标签），供定点更新使用。
 function quotaText(r) {
-  var q = r.quota || {};
-  var used = fmtBytes(q.quota_used_bytes || 0);
-  if (!q.quota_enabled) return used + ' / 不限';
-  return used + ' / ' + fmtBytes(q.quota_limit_bytes || 0);
+  var q = r.quota;
+  if (!r.quota_enabled && !(q && q.quota_enabled)) return '不限';
+  var used = q ? fmtBytes(q.quota_used_bytes) : '—';
+  return used + ' / ' + fmtBytes((q && q.quota_limit_bytes) || r.quota_limit_bytes);
 }
-
-function ruleCard(r) {
-  var st = statusOf(r.status);
+function ipCountText(count, limited, max) {
+  return limited ? ((count || 0) + ' / ' + max) : String(count || 0);
+}
+function ruleIPCount(r) {
   var ips = r.ips || {};
-  var ipVal = ips.limited ? ((ips.granted_count || 0) + ' / ' + ips.max_ips) : String(ips.granted_count || 0);
+  return ipCountText(ips.granted_count ?? r.active_ip_count, ips.limited ?? r.ip_limit_enabled, ips.max_ips ?? r.ip_limit_max);
+}
+function addressButtons(port, label) {
+  var host = addrHost();
+  var address = esc(host + ' ' + port);
+  return '<div class="addr-group">' + (label ? '<span class="addr-label">转发地址</span>' : '') +
+    '<div class="addr-text">' +
+    '<button type="button" class="addr-token" data-copy-val="' + esc(host) + '" title="复制主机" aria-label="复制主机 ' + esc(host) + '">' + esc(host) + '</button> ' +
+    '<button type="button" class="addr-token" data-copy-val="' + esc(port) + '" title="复制端口" aria-label="复制端口 ' + esc(port) + '">' + esc(port) + '</button>' +
+    '</div></div><button type="button" class="mini-btn" data-copy-val="' + address + '" title="复制主机和端口" aria-label="复制地址 ' + address + '">复制地址</button>';
+}
+function ruleCard(r) {
+  var st = statusOf(r.status), id = esc(r.id);
   var target = r.target_text || hostPort(r.target_address, r.target_port);
-  // 卡片不再单列「监听端口」：转发地址行里的端口就是它（IP 端口 空格分隔，
-  // 两个 token 各自可点按复制），重复展示只会占地方。
-  return '<div class="node-card">' +
+  return '<article class="node-card' + (r.enabled ? '' : ' is-disabled') + '">' +
     '<div class="node-top">' +
       '<div class="node-title">' +
-        '<div class="node-name">' + esc(r.name) + '</div>' +
+        '<h3 class="node-name" title="' + esc(r.name) + '">' + esc(r.name) + '</h3>' +
         '<div class="node-meta-line">' +
           '<span class="chip">' + esc(protoLabel(r.protocol)) + '</span>' +
+          '<span class="status-pill ' + st[1] + '" data-status="' + id + '">' + st[0] + '</span>' +
         '</div>' +
       '</div>' +
       '<div class="node-rate">' +
-        '<b class="up" data-live="' + r.id + '" data-kind="rate-up">—</b>' +
-        '<b class="down" data-live="' + r.id + '" data-kind="rate-down">—</b>' +
+        '<b class="up" data-live="' + id + '" data-kind="rate-up">—</b>' +
+        '<b class="down" data-live="' + id + '" data-kind="rate-down">—</b>' +
       '</div>' +
     '</div>' +
-    '<div class="rule-addr">' +
-      '<div class="addr-text"><span>转发地址（IP 端口）</span><br>' +
-        '<b data-copy-val="' + esc(addrHost()) + '" title="点按复制 IP">' + esc(addrHost()) + '</b>' +
-        ' <b data-copy-val="' + esc(r.listen_port) + '" title="点按复制端口">' + esc(r.listen_port) + '</b>' +
-      '</div>' +
-      '<button class="mini-btn" data-copy-addr="' + r.id + '" title="复制 IP">复制 IP</button>' +
-    '</div>' +
-    '<div class="rule-target"><span>目标</span><b data-rule-target>' + esc(target) + '</b></div>' +
+    '<div class="rule-addr">' + addressButtons(r.listen_port, true) + '</div>' +
+    '<div class="rule-target"><span>转发目标</span><b data-rule-target>' + esc(target) + '</b></div>' +
     '<div class="node-stats">' +
       '<div class="node-stat"><span>今日流量</span><b data-rule-today>' + fmtBytes((r.today_up || 0) + (r.today_down || 0)) + '</b></div>' +
       '<div class="node-stat"><span>累计流量</span><b data-rule-total>' + fmtBytes((r.total_up || 0) + (r.total_down || 0)) + '</b></div>' +
-      '<div class="node-stat"><span>TCP 连接</span><b data-live="' + r.id + '" data-kind="conns">—</b></div>' +
-      '<div class="node-stat"><span>UDP 会话</span><b data-live="' + r.id + '" data-kind="conns-udp">—</b></div>' +
-      '<div class="node-stat wide"><span>流量配额</span><b data-rule-quota>' + quotaText(r) + '</b></div>' +
+      '<div class="node-stat"><span>TCP 连接</span><b data-live="' + id + '" data-kind="conns">—</b></div>' +
+      '<div class="node-stat"><span>UDP 会话</span><b data-live="' + id + '" data-kind="conns-udp">—</b></div>' +
+      '<div class="node-stat"><span>流量配额</span><b data-rule-quota>' + quotaText(r) + '</b></div>' +
     '</div>' +
-    '<button class="ip-strip" data-view-ips="' + r.id + '">' +
-      '<span class="ip-strip-label">在线 IP</span>' +
-      '<span class="ip-strip-val" data-rule-ips="' + r.id + '">' + esc(ipVal) + '</span>' +
-      '<span class="ip-strip-arrow">›</span>' +
-    '</button>' +
     '<div class="node-foot">' +
-      '<span class="status-pill ' + st[1] + '" data-status="' + r.id + '">' + st[0] + '</span>' +
-      '<div class="node-actions"><button class="mini-btn primary" data-manage="' + r.id + '">管理</button></div>' +
+      '<button type="button" class="ip-strip" data-view-ips="' + id + '" aria-haspopup="dialog">' +
+        '<span class="ip-strip-label">在线 IP</span>' +
+        '<span class="ip-strip-val" data-rule-ips="' + id + '">' + esc(ruleIPCount(r)) + '</span>' +
+        '<span class="ip-strip-arrow" aria-hidden="true">›</span>' +
+      '</button>' +
+      '<div class="node-actions"><button type="button" class="mini-btn primary" data-manage="' + id + '" aria-haspopup="dialog">管理</button></div>' +
     '</div>' +
-  '</div>';
+  '</article>';
 }
 
 // renderRuleCards 只在**结构**变化时重建卡片 DOM，其余情况定点更新字段。
@@ -272,11 +282,11 @@ function ruleCard(r) {
 // 为什么必须这样做：/api/summary 每 8 秒一次，旧实现每次都 `innerHTML = ...`
 // 把整组卡片销毁重建 —— 滚动位置丢失、正在看的详情被打断、重排开销随规则数
 // 线性增长（真机上表现为明显卡顿）。结构签名只包含「决定 DOM 形状」的字段
-// （id / 名称 / 协议 / 端口 / 目标地址 / 配额开关），流量数字、状态与在线 IP
+// （id / 名称 / 协议 / 端口 / 启停），流量数字、状态与在线 IP
 // 都走定点更新。
 function ruleStructureSignature(rules) {
   return JSON.stringify(rules.map(function (r) {
-    return [r.id, r.name, r.protocol, r.listen_port, r.target_address, r.target_port, r.enabled, r.quota_enabled];
+    return [r.id, r.name, r.protocol, r.listen_port, r.enabled];
   }));
 }
 
@@ -296,13 +306,11 @@ function renderRuleCards(s) {
   for (var i = 0; i < rules.length; i++) {
     var r = rules[i], card = host.children[i];
     if (!card) continue;
-    var ips = r.ips || {};
-    var ipVal = ips.limited ? ((ips.granted_count || 0) + ' / ' + ips.max_ips) : String(ips.granted_count || 0);
     setNodeText(card, '[data-rule-target]', r.target_text || hostPort(r.target_address, r.target_port));
     setNodeText(card, '[data-rule-today]', fmtBytes((r.today_up || 0) + (r.today_down || 0)));
     setNodeText(card, '[data-rule-total]', fmtBytes((r.total_up || 0) + (r.total_down || 0)));
     setNodeText(card, '[data-rule-quota]', quotaText(r));
-    setNodeText(card, '[data-rule-ips]', ipVal);
+    setNodeText(card, '[data-rule-ips]', ruleIPCount(r));
     var st = statusOf(r.status);
     var pill = card.querySelector('[data-status]');
     if (pill && pill.textContent !== st[0]) {
@@ -310,7 +318,7 @@ function renderRuleCards(s) {
       pill.textContent = st[0];
     }
   }
-  if (state.live) renderLive(state.live);
+  if (state.live) renderLiveCards(state.live, false);
 }
 
 // setNodeText 定点写文本（值未变时不触碰 DOM，避免无谓的重排/重绘）。
@@ -322,7 +330,7 @@ function setNodeText(root, sel, text) {
 function renderRuleSelect(s) {
   var sel = document.getElementById('rule-select');
   var rules = s.rules || [];
-  var sig = rules.map(function (r) { return r.id + ':' + r.name; }).join('|');
+  var sig = JSON.stringify(rules.map(function (r) { return [r.id, r.name]; }));
   if (sel._sig !== sig) {
     sel._sig = sig;
     sel.innerHTML = rules.map(function (r) {
@@ -333,14 +341,15 @@ function renderRuleSelect(s) {
   var prev = state.ruleId == null ? '' : String(state.ruleId);
   var exists = rules.some(function (r) { return String(r.id) === prev; });
   var want = exists ? prev : (rules.length ? String(rules[0].id) : '');
+  sel.disabled = !rules.length;
   if (want && sel.value !== want) sel.value = want;
   var changed = prev !== want;
   state.ruleId = want || null;
-  if (changed && want && activeView === 'rules') loadRuleDaily();
+  if (activeView === 'rules' && (changed || !want)) loadRuleDaily();
 }
 
 /* ---------- 实时 ---------- */
-function renderLive(v) {
+function renderLive(v, updatePolicy) {
   state.live = v;
   var known = (v.now || 0) > 0;
   if (!connDown) setConnState(known ? '实时监控中' : '等待采集', !known);
@@ -351,7 +360,14 @@ function renderLive(v) {
   setText('kpi-conns', String(v.conn_tcp || 0));
   setText('kpi-conns-udp', String(v.conn_udp || 0));
 
-  var byId = {};
+  if (activeView === 'home') renderLiveCards(v, updatePolicy);
+  if (updatePolicy && policyState.rule) {
+    var liveRule = (v.rules || []).find(function (r) { return String(r.id) === String(policyState.rule.id); });
+    if (liveRule) setText('pol-ip-active', ipCountText(liveRule.active_ip_count, liveRule.ip_limited, liveRule.max_ips));
+  }
+}
+function renderLiveCards(v, updatePolicy) {
+  var byId = Object.create(null);
   (v.rules || []).forEach(function (r) { byId[r.id] = r; });
   document.querySelectorAll('[data-live]').forEach(function (el) {
     var r = byId[el.getAttribute('data-live')];
@@ -362,11 +378,12 @@ function renderLive(v) {
     else if (kind === 'conns') el.textContent = String(r.conn_tcp || 0);
     else if (kind === 'conns-udp') el.textContent = String(r.conn_udp || 0);
   });
+  if (!updatePolicy) return;
   document.querySelectorAll('[data-rule-ips]').forEach(function (el) {
     var r = byId[el.getAttribute('data-rule-ips')];
     if (!r) return;
-    var val = r.active_ip_count || 0;
-    el.textContent = r.ip_limited ? (val + ' / ' + r.max_ips) : String(val);
+    var val = ipCountText(r.active_ip_count, r.ip_limited, r.max_ips);
+    if (el.textContent !== val) el.textContent = val;
   });
   document.querySelectorAll('[data-status]').forEach(function (el) {
     var r = byId[el.getAttribute('data-status')];
@@ -392,10 +409,10 @@ function renderTable(hostId, rows) {
   var host = document.getElementById(hostId);
   if (!host) return;
   if (!rows || !rows.length) { host.innerHTML = '<div class="empty">暂无数据</div>'; return; }
-  var html = '<div class="table-scroll"><table><thead><tr>' +
+  var html = '<div class="table-scroll" tabindex="0" role="region" aria-label="每日流量明细"><table><thead><tr>' +
     '<th>日期</th><th class="up">上传</th><th class="down">下载</th><th>合计</th>' +
     '</tr></thead><tbody>';
-  rows.slice().forEach(function (r) {
+  rows.forEach(function (r) {
     html += '<tr><td class="date">' + esc(r.day) + '</td>' +
       '<td class="up">' + fmtBytes(r.up) + '</td>' +
       '<td class="down">' + fmtBytes(r.down) + '</td>' +
@@ -410,40 +427,55 @@ function drawRuleDaily() {
   var entry = cache.ruleDaily[String(state.ruleId)];
   if (entry) renderTable('rule-daily-table', entry.days);
 }
+function trendMessage(id, msg) {
+  document.getElementById(id).innerHTML = '<div class="empty" role="status">' + esc(msg) + '</div>';
+}
 function loadDaily(force) {
+  var req = ++dailyReq, epoch = dailyEpoch;
   if (!force && cache.daily && Date.now() - cache.dailyAt < DAILY_TTL_MS) {
     if (activeView === 'daily') drawDaily();
     return Promise.resolve();
   }
-  var req = ++dailyReq, epoch = dailyEpoch;
+  if (!cache.daily) trendMessage('daily-table', '正在加载每日流量…');
   return api('/api/daily', { days: 60 }).then(function (d) {
-    if (epoch !== dailyEpoch) return;
+    if (epoch !== dailyEpoch || req !== dailyReq) return;
     cache.daily = d.days || []; cache.dailyAt = Date.now();
-    if (activeView === 'daily' && req === dailyReq) drawDaily();
-  }).catch(function (e) { if (e.message !== '未登录') toast(e.message); });
+    if (activeView === 'daily') drawDaily();
+  }).catch(function (e) {
+    if (epoch !== dailyEpoch || req !== dailyReq || activeView !== 'daily' || e.message === '未登录') return;
+    if (!cache.daily) trendMessage('daily-table', '每日流量加载失败 · ' + e.message);
+    else toast(e.message);
+  });
 }
 function loadRuleDaily(force) {
-  if (state.ruleId == null) return Promise.resolve();
-  var id = String(state.ruleId), cached = cache.ruleDaily[id];
-  if (!force && cached) {
-    drawRuleDaily();
-    if (Date.now() - cached.at < DAILY_TTL_MS) return Promise.resolve();
-  }
   var req = ++ruleDailyReq, epoch = ruleDailyEpoch;
-  if (!cached) {
-    var host = document.getElementById('rule-daily-table');
-    if (host) host.innerHTML = '<div class="empty">正在加载规则趋势…</div>';
+  if (state.ruleId == null) {
+    trendMessage('rule-daily-table', state.summary ? '暂无可选规则' : '正在加载规则…');
+    return Promise.resolve();
+  }
+  var id = String(state.ruleId), cached = cache.ruleDaily[id];
+  if (cached) drawRuleDaily();
+  if (!force && cached && Date.now() - cached.at < DAILY_TTL_MS) return Promise.resolve();
+  if (!cached) trendMessage('rule-daily-table', '正在加载规则流量…');
+  function isCurrent() {
+    return activeView === 'rules' && state.ruleId === id && req === ruleDailyReq && epoch === ruleDailyEpoch;
   }
   return api('/api/rules/' + id + '/daily', { days: 60 }).then(function (d) {
     if (epoch !== ruleDailyEpoch) return;
     cache.ruleDaily[id] = { days: d.days || [], at: Date.now() };
-    if (activeView === 'rules' && String(state.ruleId) === id && req === ruleDailyReq) drawRuleDaily();
-  }).catch(function (e) { if (e.message !== '未登录') toast(e.message); });
+    if (isCurrent()) drawRuleDaily();
+  }).catch(function (e) {
+    if (!isCurrent() || e.message === '未登录') return;
+    if (!cached) trendMessage('rule-daily-table', '规则流量加载失败 · ' + e.message);
+    else toast(e.message);
+  });
 }
 
 // refreshAfterRuleChange 在规则增删改后统一刷新：趋势缓存整体失效，
 // 概览重新拉取，当前所在页签立刻补一次自己的数据。
 function refreshAfterRuleChange() {
+  dataEpoch++;
+  state.live = null;
   cache.daily = null; cache.dailyAt = 0;
   cache.ruleDaily = Object.create(null);
   dailyReq++; dailyEpoch++; ruleDailyReq++; ruleDailyEpoch++;
@@ -455,43 +487,77 @@ function refreshAfterRuleChange() {
 }
 
 /* ---------- 底部导航 ---------- */
-(function initNav() {
-  var valid = { home: 1, daily: 1, rules: 1 }, positions = { home: 0, daily: 0, rules: 0 };
+function initNav() {
+  var valid = ['home', 'daily', 'rules'], positions = { home: 0, daily: 0, rules: 0 };
   var current = (location.hash || '#home').slice(1);
-  if (!valid[current]) current = 'home';
+  if (valid.indexOf(current) < 0) current = 'home';
   function show(name, push) {
-    if (!valid[name]) name = 'home';
+    if (valid.indexOf(name) < 0) name = 'home';
+    closeAllDrawers();
     positions[current] = window.scrollY || 0; current = name; activeView = name;
     document.querySelectorAll('.view').forEach(function (v) { v.classList.toggle('on', v.id === 'view-' + name); });
-    document.querySelectorAll('.tab').forEach(function (b) { b.classList.toggle('on', b.dataset.view === name); });
+    document.querySelectorAll('.tab[data-view]').forEach(function (b) {
+      var selected = b.dataset.view === name;
+      b.classList.toggle('on', selected);
+      if (selected) b.setAttribute('aria-current', 'page');
+      else b.removeAttribute('aria-current');
+    });
     if (push && location.hash !== '#' + name) history.pushState(null, '', '#' + name);
     requestAnimationFrame(function () { window.scrollTo(0, positions[name] || 0); });
     // 切回总览立刻补一次实时数据（离开总览时高频轮询是停的）。
-    if (name === 'home') { loadSummary(); loadLive(); }
+    if (name === 'home') {
+      if (state.summary) renderRuleCards(state.summary);
+      if (push || state.summary) { loadSummary(); loadLive(); }
+    }
     if (name === 'daily') loadDaily();
     if (name === 'rules') loadRuleDaily();
   }
-  document.querySelectorAll('.tab').forEach(function (b) {
+  document.querySelectorAll('.tab[data-view]').forEach(function (b) {
     b.addEventListener('click', function () { show(b.dataset.view, true); });
   });
   window.addEventListener('popstate', function () { show((location.hash || '#home').slice(1), false); });
   show(current, false);
-})();
+}
 
 /* ---------- 抽屉 ---------- */
-function openDrawer(id) {
+var drawer = null, drawerSession = 0, drawerOpener = null;
+function openDrawer(id, opener) {
+  if (drawer) closeDrawer(drawer.id);
+  drawer = document.getElementById(id);
+  drawerSession++;
+  drawerOpener = opener || document.activeElement;
+  drawer.querySelector('.drawer-body').scrollTop = 0;
+  drawer.removeAttribute('inert');
+  drawer.setAttribute('aria-hidden', 'false');
+  drawer.classList.add('on');
+  drawer.querySelector('.icon-btn').focus({ preventScroll: true });
   document.getElementById('drawer-mask').classList.add('on');
-  document.getElementById(id).classList.add('on');
+  document.body.classList.add('drawer-open');
+  document.querySelector('main').setAttribute('inert', '');
+  document.querySelector('.dock').setAttribute('inert', '');
+}
+function isDrawer(id, session) {
+  return drawer && drawer.id === id && (session == null || session === drawerSession);
 }
 function closeDrawer(id) {
-  document.getElementById(id).classList.remove('on');
-  var anyOpen = document.querySelector('.drawer.on');
-  if (!anyOpen) document.getElementById('drawer-mask').classList.remove('on');
-}
-function closeAllDrawers() {
-  document.querySelectorAll('.drawer.on').forEach(function (d) { d.classList.remove('on'); });
+  if (!isDrawer(id)) return;
+  drawer.classList.remove('on');
+  drawer.setAttribute('inert', '');
+  var closed = drawer;
+  drawer = null;
+  drawerSession++;
+  if (id === 'ips-drawer') ipsDrawerRuleId = null;
+  if (id === 'policy-drawer') policyState.rule = null;
   document.getElementById('drawer-mask').classList.remove('on');
+  document.body.classList.remove('drawer-open');
+  document.querySelector('main').removeAttribute('inert');
+  document.querySelector('.dock').removeAttribute('inert');
+  var focus = drawerOpener && drawerOpener.isConnected ? drawerOpener : document.querySelector('.tab.on');
+  if (focus) focus.focus({ preventScroll: true });
+  closed.setAttribute('aria-hidden', 'true');
+  drawerOpener = null;
 }
+function closeAllDrawers() { if (drawer) closeDrawer(drawer.id); }
 function showErr(id, msg) {
   var el = document.getElementById(id);
   el.textContent = msg; el.classList.remove('hidden');
@@ -520,18 +586,20 @@ function setSwitch(id, on) {
 }
 
 /* ---------- 添加规则 ---------- */
-function openNewRule() {
+function openNewRule(e) {
   document.getElementById('new-name').value = '';
   document.getElementById('new-proto').value = 'tcp+udp';
   document.getElementById('new-listen-port').value = '';
   document.getElementById('new-target').value = '';
   document.getElementById('new-target-port').value = '';
   hideErr('new-error');
-  openDrawer('new-drawer');
-  setTimeout(function () { document.getElementById('new-name').focus(); }, 60);
+  openDrawer('new-drawer', e.currentTarget);
 }
 
 function submitNewRule() {
+  var btn = document.getElementById('new-submit');
+  if (!isDrawer('new-drawer') || btn.disabled) return;
+  var session = drawerSession;
   var name = document.getElementById('new-name').value.trim();
   var proto = document.getElementById('new-proto').value;
   var lpRaw = document.getElementById('new-listen-port').value.trim();
@@ -547,15 +615,14 @@ function submitNewRule() {
     return;
   }
   var tp = Number(tpRaw);
-  if (!(tp >= 1 && tp <= 65535)) { showErr('new-error', '请输入 1-65535 的目标端口'); return; }
+  if (!Number.isInteger(tp) || tp < 1 || tp > 65535) { showErr('new-error', '请输入 1-65535 的目标端口'); return; }
   // 监听端口留空 → 传 0，由后端安全随机分配（前端绝不自己生成端口）。
   var lp = 0;
   if (lpRaw !== '') {
     lp = Number(lpRaw);
-    if (!(lp >= 1 && lp <= 65535)) { showErr('new-error', '监听端口需在 1-65535，或留空由系统随机分配'); return; }
+    if (!Number.isInteger(lp) || lp < 1 || lp > 65535) { showErr('new-error', '监听端口需在 1-65535，或留空由系统随机分配'); return; }
   }
 
-  var btn = document.getElementById('new-submit');
   btn.disabled = true; btn.textContent = '添加中…';
   hideErr('new-error');
   mutate('POST', '/api/rules', {
@@ -563,13 +630,13 @@ function submitNewRule() {
     target_address: target, target_port: tp
   }).then(function (rule) {
     btn.disabled = false; btn.textContent = '添加';
-    closeDrawer('new-drawer');
+    if (isDrawer('new-drawer', session)) closeDrawer('new-drawer');
     // 用服务端返回的正式规则刷新，不做乐观假成功。
     toast('规则已添加 · 监听端口 ' + rule.listen_port);
     refreshAfterRuleChange();
   }).catch(function (e) {
     btn.disabled = false; btn.textContent = '添加';
-    if (e.message !== '未登录') showErr('new-error', e.message);
+    if (isDrawer('new-drawer', session) && e.message !== '未登录') showErr('new-error', e.message);
   });
 }
 
@@ -589,7 +656,8 @@ function validTarget(v) {
 }
 
 /* ---------- 规则管理 ---------- */
-var policyState = { ruleId: null, rule: null };
+var policyState = { rule: null };
+var policyBusy = Object.create(null);
 
 function ruleById(id) {
   var rules = (state.summary && state.summary.rules) || [];
@@ -599,12 +667,14 @@ function ruleById(id) {
   return null;
 }
 
-function showPolicy(id) {
+function showPolicy(id, opener) {
+  if (policyBusy[id]) { toast('该规则正在更新…'); return; }
   var r = ruleById(id);
   if (!r) return;
-  policyState.ruleId = String(id);
+  closeAllDrawers();
   policyState.rule = r;
   document.getElementById('drawer-rule-name').textContent = r.name;
+  document.getElementById('pol-address').innerHTML = addressButtons(r.listen_port, false);
   document.getElementById('pol-name').value = r.name || '';
   document.getElementById('pol-proto').value = r.protocol || 'tcp+udp';
   document.getElementById('pol-listen-port').value = r.listen_port || '';
@@ -612,60 +682,63 @@ function showPolicy(id) {
   document.getElementById('pol-target-port').value = r.target_port || '';
   setSwitch('pol-enable', r.enabled);
 
-  // 域名解析信息（只读）。
-  var isDomain = !!r.resolve_status || isHostname(r.target_address);
-  var sect = document.getElementById('pol-dns-sect');
-  sect.classList.toggle('hidden', !isDomain);
-  if (isDomain) {
-    document.getElementById('pol-dns-host').textContent = r.target_address || '—';
-    setKV('pol-addr-ip', addrHost(), '—');
-  setKV('pol-addr-port', String(r.listen_port), '—');
-  document.getElementById('pol-addr-ip').onclick = function () { copyText(addrHost(), '已复制 ' + addrHost()); };
-  document.getElementById('pol-addr-port').onclick = function () { copyText(String(r.listen_port), '已复制端口 ' + r.listen_port); };
-  document.getElementById('pol-copy-addr').onclick = function () { copyText(addrHost(), '已复制 IP ' + addrHost()); };
-  setKV('pol-dns-v4', r.resolved_ipv4, '（无 A 记录）');
-    setKV('pol-dns-v6', r.resolved_ipv6 ? '[' + r.resolved_ipv6 + ']' : '', '（无 AAAA 记录）');
-    var stEl = document.getElementById('pol-dns-status');
-    if (r.resolve_status === 'stale') {
-      stEl.className = 'warn';
-      stEl.textContent = 'DNS 解析暂时失败，继续使用上次有效地址';
-    } else if (r.resolve_status === 'failed') {
-      stEl.className = 'warn';
-      stEl.textContent = '无法解析目标域名，转发当前不可用';
-    } else {
-      stEl.className = '';
-      stEl.textContent = '正常';
-    }
-  }
-
   var q = r.quota || {};
-  setSwitch('pol-quota-enable', q.quota_enabled);
-  document.getElementById('pol-quota-box').classList.toggle('hidden', !q.quota_enabled);
-  document.getElementById('pol-quota-used').textContent = fmtBytes(q.quota_used_bytes || 0);
-  if (q.quota_enabled && q.quota_limit_bytes > 0) {
-    var g = q.quota_limit_bytes / (1024 * 1024 * 1024), unit = 'GiB';
-    if (g >= 1024 && g % 1024 === 0) { g = g / 1024; unit = 'TiB'; }
-    document.getElementById('pol-quota-val').value = g;
-    document.getElementById('pol-quota-unit').value = unit;
-  } else {
-    document.getElementById('pol-quota-val').value = '';
-  }
+  var quotaEnabled = r.quota_enabled ?? q.quota_enabled;
+  var quotaLimit = r.quota_limit_bytes ?? q.quota_limit_bytes;
+  setSwitch('pol-quota-enable', quotaEnabled);
+  document.getElementById('pol-quota-box').classList.toggle('hidden', !quotaEnabled);
+  var g = quotaLimit > 0 ? quotaLimit / (1024 * 1024 * 1024) : '', unit = 'GiB';
+  if (g >= 1024 && g % 1024 === 0) { g = g / 1024; unit = 'TiB'; }
+  document.getElementById('pol-quota-val').value = g;
+  document.getElementById('pol-quota-unit').value = unit;
 
-  var ips = r.ips || {};
   setSwitch('pol-ip-enable', r.ip_limit_enabled);
   document.getElementById('pol-ip-box').classList.toggle('hidden', !r.ip_limit_enabled);
-  document.getElementById('pol-ip-active').textContent = ips.limited
-    ? ((ips.granted_count || 0) + ' / ' + ips.max_ips) : String(ips.granted_count || 0);
   document.getElementById('pol-ip-max').value = r.ip_limit_max > 0 ? r.ip_limit_max : '';
 
   hideErr('pol-error');
-  openDrawer('policy-drawer');
+  updatePolicyReadouts();
+  openDrawer('policy-drawer', opener);
+}
+function syncPolicyButtons() {
+  var r = policyState.rule;
+  if (!r) return;
+  var busy = policyBusy[r.id];
+  var onServer = ruleById(r.id);
+  [['pol-save', '保存', '保存中…'], ['pol-delete', '删除规则', '删除中…'],
+    ['pol-quota-reset', '重置用量（保留历史）', '重置中…']].forEach(function (b) {
+    var el = document.getElementById(b[0]);
+    el.disabled = !!busy || !onServer;
+    if (el.textContent !== (busy === b[0] ? b[2] : b[1])) el.textContent = busy === b[0] ? b[2] : b[1];
+  });
+}
+function updatePolicyReadouts() {
+  var original = policyState.rule;
+  if (!original) return;
+  var r = ruleById(original.id);
+  syncPolicyButtons();
+  if (!r) { showErr('pol-error', '该规则已删除'); return; }
+
+  // 只更新只读数据，不覆盖正在编辑的表单。DNS 始终显示当前已保存的目标。
+  var isDomain = !!r.resolve_status || isHostname(r.target_address);
+  document.getElementById('pol-dns-sect').classList.toggle('hidden', !isDomain);
+  if (isDomain) {
+    setText('pol-dns-host', r.target_address || '—');
+    setKV('pol-dns-v4', r.resolved_ipv4, '无 A 记录');
+    setKV('pol-dns-v6', r.resolved_ipv6, '无 AAAA 记录');
+    var stEl = document.getElementById('pol-dns-status');
+    stEl.className = ['stale', 'failed'].indexOf(r.resolve_status) >= 0 ? 'warn' : '';
+    setText('pol-dns-status', r.resolve_status === 'stale' ? '解析失败，沿用上次地址' :
+      r.resolve_status === 'failed' ? '无法解析，转发不可用' : (r.resolve_status ? '正常' : '等待解析'));
+  }
+  setText('pol-quota-used', r.quota ? fmtBytes(r.quota.quota_used_bytes) : '—');
+  setText('pol-ip-active', ruleIPCount(r));
 }
 
 function setKV(id, val, emptyTxt) {
   var el = document.getElementById(id);
-  if (val) { el.className = ''; el.textContent = val; }
-  else { el.className = 'muted'; el.textContent = emptyTxt; }
+  el.classList.toggle('muted', !val);
+  setText(id, val || emptyTxt);
 }
 
 function isHostname(v) {
@@ -676,16 +749,17 @@ function isHostname(v) {
 
 function unitToBytes(val, unit) {
   var n = Number(val);
-  if (!(n > 0)) return 0;
+  if (!Number.isFinite(n) || n <= 0) return 0;
   var mult = unit === 'TiB' ? 1024 * 1024 * 1024 * 1024 : 1024 * 1024 * 1024;
-  return Math.round(n * mult);
+  var bytes = Math.round(n * mult);
+  return Number.isSafeInteger(bytes) ? bytes : 0;
 }
 
 // savePolicy 分两步：先保存转发设置（如有变化），再保存配额 / IP 限制。
 // 两步都走各自的统一变更接口，任一失败即停止并展示服务端文案。
 function savePolicy() {
   var r = policyState.rule;
-  if (!r) return;
+  if (!isDrawer('policy-drawer') || !r || policyBusy[r.id] || !ruleById(r.id)) return;
   var name = document.getElementById('pol-name').value.trim();
   var proto = document.getElementById('pol-proto').value;
   var lpRaw = document.getElementById('pol-listen-port').value.trim();
@@ -697,7 +771,7 @@ function savePolicy() {
   // 编辑时端口必须明确填写，绝不静默换成随机端口。
   if (lpRaw === '') { showErr('pol-error', '请输入监听端口'); return; }
   var lp = Number(lpRaw);
-  if (!(lp >= 1 && lp <= 65535)) { showErr('pol-error', '监听端口需在 1-65535'); return; }
+  if (!Number.isInteger(lp) || lp < 1 || lp > 65535) { showErr('pol-error', '监听端口需在 1-65535'); return; }
   if (!validTarget(target)) {
     showErr('pol-error', /^https?:|\/|\[/i.test(target)
       ? '目标地址只填写 IP 或域名，不要包含 http://、https://、端口或路径'
@@ -705,7 +779,7 @@ function savePolicy() {
     return;
   }
   var tp = Number(tpRaw);
-  if (!(tp >= 1 && tp <= 65535)) { showErr('pol-error', '请输入 1-65535 的目标端口'); return; }
+  if (!Number.isInteger(tp) || tp < 1 || tp > 65535) { showErr('pol-error', '请输入 1-65535 的目标端口'); return; }
 
   var quotaOn = document.getElementById('pol-quota-enable').checked;
   var ipOn = document.getElementById('pol-ip-enable').checked;
@@ -713,78 +787,73 @@ function savePolicy() {
     ? unitToBytes(document.getElementById('pol-quota-val').value, document.getElementById('pol-quota-unit').value)
     : 0;
   var ipMax = ipOn ? Number(document.getElementById('pol-ip-max').value) : 0;
-  if (quotaOn && !(quotaBytes > 0)) { showErr('pol-error', '流量额度必须大于 0'); return; }
-  if (ipOn && !(ipMax >= 1)) { showErr('pol-error', '最大同时在线数必须 ≥ 1'); return; }
+  if (quotaOn && !(quotaBytes > 0)) { showErr('pol-error', '请输入有效的流量额度'); return; }
+  if (ipOn && (!Number.isSafeInteger(ipMax) || ipMax < 1)) { showErr('pol-error', '最大同时在线数必须 ≥ 1'); return; }
 
-  var btn = document.getElementById('pol-save');
-  btn.disabled = true; btn.textContent = '保存中…';
-  hideErr('pol-error');
-
-  var id = policyState.ruleId;
-  mutate('PUT', '/api/rules/' + id, {
-    name: name, protocol: proto, listen_port: lp,
-    target_address: target, target_port: tp, enabled: enabled
-  }).then(function () {
-    return mutate('PUT', '/api/rules/' + id + '/policy', {
-      quota_enabled: quotaOn,
-      quota_limit_bytes: quotaBytes,
-      ip_limit_enabled: ipOn,
-      ip_limit_max: ipMax
+  var updatedForward = false;
+  policyAction('pol-save', function (id) {
+    return mutate('PUT', '/api/rules/' + id, {
+      name: name, protocol: proto, listen_port: lp,
+      target_address: target, target_port: tp, enabled: enabled
+    }).then(function () {
+      updatedForward = true;
+      return mutate('PUT', '/api/rules/' + id + '/policy', {
+        quota_enabled: quotaOn,
+        quota_limit_bytes: quotaBytes,
+        ip_limit_enabled: ipOn,
+        ip_limit_max: ipMax
+      });
     });
-  }).then(function () {
-    btn.disabled = false; btn.textContent = '保存';
-    closeDrawer('policy-drawer');
-    toast('已保存');
-    refreshAfterRuleChange();
-  }).catch(function (e) {
-    btn.disabled = false; btn.textContent = '保存';
-    if (e.message !== '未登录') showErr('pol-error', e.message);
+  }, '已保存', function () { closeDrawer('policy-drawer'); }, function () { return updatedForward; });
+}
+function policyAction(action, request, okMessage, onCurrent, partialWrite) {
+  var r = policyState.rule;
+  if (!isDrawer('policy-drawer') || !r || policyBusy[r.id] || !ruleById(r.id)) return;
+  var id = r.id, session = drawerSession;
+  policyBusy[id] = action;
+  syncPolicyButtons();
+  hideErr('pol-error');
+  request(id).then(function (d) {
+    if (isDrawer('policy-drawer', session)) onCurrent(d);
+    toast(okMessage);
+    return refreshAfterRuleChange();
+  }, function (e) {
+    var partial = partialWrite && partialWrite();
+    if (isDrawer('policy-drawer', session) && e.message !== '未登录') {
+      showErr('pol-error', partial ? '转发设置已保存；配额或 IP 限制保存失败：' + e.message : e.message);
+    }
+    if (partial) return refreshAfterRuleChange();
+  }).finally(function () {
+    delete policyBusy[id];
+    syncPolicyButtons();
   });
 }
-
 function resetQuota() {
-  if (!window.confirm('确认重置该规则当前额度使用量？\n历史累计流量不会删除。')) return;
-  var btn = document.getElementById('pol-quota-reset');
-  btn.disabled = true;
-  mutate('POST', '/api/rules/' + policyState.ruleId + '/quota/reset')
-    .then(function (d) {
-      btn.disabled = false;
-      document.getElementById('pol-quota-used').textContent = fmtBytes(d.quota_used_bytes || 0);
-      toast('已重置'); refreshAfterRuleChange();
-    })
-    .catch(function (e) {
-      btn.disabled = false;
-      if (e.message !== '未登录') showErr('pol-error', e.message);
-    });
+  var r = policyState.rule;
+  if (!r || policyBusy[r.id] || !window.confirm('确认重置该规则当前额度使用量？\n历史累计流量不会删除。')) return;
+  policyAction('pol-quota-reset', function (id) {
+    return mutate('POST', '/api/rules/' + id + '/quota/reset');
+  }, '已重置用量', function (d) {
+    setText('pol-quota-used', fmtBytes(d.quota_used_bytes || 0));
+  });
 }
-
 function deleteRule() {
   var r = policyState.rule;
-  if (!r) return;
-  if (!window.confirm('确认删除规则「' + r.name + '」？\n转发会立即停止；历史流量统计仍保留。')) return;
-  var btn = document.getElementById('pol-delete');
-  btn.disabled = true; btn.textContent = '删除中…';
-  mutate('DELETE', '/api/rules/' + policyState.ruleId)
-    .then(function () {
-      btn.disabled = false; btn.textContent = '删除规则';
-      closeDrawer('policy-drawer');
-      toast('规则已删除'); refreshAfterRuleChange();
-    })
-    .catch(function (e) {
-      btn.disabled = false; btn.textContent = '删除规则';
-      if (e.message !== '未登录') showErr('pol-error', e.message);
-    });
+  if (!r || policyBusy[r.id] || !window.confirm('确认删除规则「' + r.name + '」？\n转发会立即停止；历史流量统计仍保留。')) return;
+  policyAction('pol-delete', function (id) {
+    return mutate('DELETE', '/api/rules/' + id);
+  }, '规则已删除', function () { closeDrawer('policy-drawer'); });
 }
 
 /* ---------- 在线 IP ---------- */
-var ipsDrawerRuleId = null;
+var ipsDrawerRuleId = null, ipsRevision = 0;
 
 function ipEntryHTML(e) {
   var v6 = String(e.ip || '').indexOf(':') >= 0;
   return '<div class="ip-item">' +
     '<div class="ip-line"><span class="ip-addr">' + esc(e.ip) + '</span>' +
     '<span class="ip-tag">' + (v6 ? 'IPv6' : 'IPv4') + '</span></div>' +
-    '<span class="ip-meta">在线 · ' + (e.tcp || 0) + ' TCP · ' + (e.udp || 0) + ' UDP</span></div>';
+    '<span class="ip-meta">在线 · ' + (Number(e.tcp) || 0) + ' TCP · ' + (Number(e.udp) || 0) + ' UDP</span></div>';
 }
 function rejectedEntryHTML(e) {
   return '<div class="ip-item rejected">' +
@@ -802,28 +871,43 @@ function renderIPList(snap) {
   }
   list.innerHTML = ips.map(ipEntryHTML).join('') + rejected.map(rejectedEntryHTML).join('');
 }
-function showIPs(id) {
-  ipsDrawerRuleId = String(id);
+function showIPs(id, opener) {
   var r = ruleById(id);
-  document.getElementById('ips-rule-name').textContent = r ? r.name : '';
-  renderIPList(r && r.ips);
-  openDrawer('ips-drawer');
-  api('/api/rules/' + id + '/ips').then(renderIPList).catch(function (e) {
-    if (e.message !== '未登录') toast(e.message);
+  if (!r) return;
+  openDrawer('ips-drawer', opener);
+  ipsDrawerRuleId = String(id);
+  var session = drawerSession, revision = ipsRevision;
+  setText('ips-rule-name', r.name);
+  if (r.ips) renderIPList(r.ips);
+  else trendMessage('ips-list', '正在读取在线 IP…');
+  function isCurrent() { return isDrawer('ips-drawer', session) && revision === ipsRevision; }
+  api('/api/rules/' + id + '/ips', null, revision).then(function (snap) {
+    if (isCurrent()) renderIPList(snap);
+  }).catch(function (e) {
+    if (!isCurrent() || e.message === '未登录') return;
+    if (!r.ips) trendMessage('ips-list', '在线 IP 加载失败 · ' + e.message);
+    else toast(e.message);
   });
 }
 
 /* ---------- SSE ---------- */
 function startEvents() {
   // EventSource 原生自动重连；服务重启后重连即收到完整 snapshot。
+  if (!window.EventSource) return;
   var es = new EventSource(url('api/events'), { withCredentials: true });
   es.addEventListener('snapshot', function (e) {
     try {
       var snap = JSON.parse(e.data);
+      if (!snap || !Array.isArray(snap.rules)) return;
+      noteAPIResult(true);
       renderSummary(snap);
       if (ipsDrawerRuleId) {
         var r = ruleById(ipsDrawerRuleId);
-        if (r) renderIPList(r.ips);
+        if (!r || r.ips) {
+          ipsRevision++;
+          if (r) renderIPList(r.ips);
+          else trendMessage('ips-list', '该规则已删除');
+        }
       }
     } catch (err) { /* 忽略坏包，下一次快照会覆盖 */ }
   });
@@ -848,34 +932,38 @@ document.getElementById('new-submit').addEventListener('click', submitNewRule);
 document.getElementById('new-drawer').addEventListener('keydown', function (e) {
   if (e.key === 'Enter' && e.target.tagName === 'INPUT') { e.preventDefault(); submitNewRule(); }
 });
+function copyAddressToken(e) {
+  var token = e.target.closest('[data-copy-val]');
+  if (!token) return false;
+  copyText(token.dataset.copyVal);
+  return true;
+}
+document.getElementById('pol-address').addEventListener('click', copyAddressToken);
 document.getElementById('rule-cards').addEventListener('click', function (e) {
-  var cv = e.target.closest('[data-copy-val]');
-  if (cv) { copyText(cv.getAttribute('data-copy-val'), '已复制 ' + cv.getAttribute('data-copy-val')); return; }
-  var cp = e.target.closest('[data-copy-addr]');
-  if (cp) {
-    var rid = cp.getAttribute('data-copy-addr');
-    var rule = (state.summary && state.summary.rules || []).filter(function (x) { return String(x.id) === String(rid); })[0];
-    if (rule) copyText(addrHost(), '已复制 IP ' + addrHost());
-    return;
-  }
+  if (copyAddressToken(e)) return;
   var ips = e.target.closest('[data-view-ips]');
-  if (ips) { showIPs(ips.getAttribute('data-view-ips')); return; }
+  if (ips) { showIPs(ips.dataset.viewIps, ips); return; }
   var mg = e.target.closest('[data-manage]');
-  if (mg) { showPolicy(mg.getAttribute('data-manage')); return; }
+  if (mg) showPolicy(mg.dataset.manage, mg);
 });
 document.getElementById('drawer-close').addEventListener('click', function () { closeDrawer('policy-drawer'); });
 document.getElementById('pol-cancel').addEventListener('click', function () { closeDrawer('policy-drawer'); });
 document.getElementById('pol-save').addEventListener('click', savePolicy);
 document.getElementById('pol-quota-reset').addEventListener('click', resetQuota);
 document.getElementById('pol-delete').addEventListener('click', deleteRule);
-document.getElementById('ips-close').addEventListener('click', function () {
-  ipsDrawerRuleId = null; closeDrawer('ips-drawer');
-});
-document.getElementById('drawer-mask').addEventListener('click', function () {
-  ipsDrawerRuleId = null; closeAllDrawers();
-});
+document.getElementById('ips-close').addEventListener('click', function () { closeDrawer('ips-drawer'); });
+document.getElementById('drawer-mask').addEventListener('click', closeAllDrawers);
 document.addEventListener('keydown', function (e) {
-  if (e.key === 'Escape') { ipsDrawerRuleId = null; closeAllDrawers(); }
+  if (!drawer) return;
+  if (e.key === 'Escape') { e.preventDefault(); closeAllDrawers(); return; }
+  if (e.key !== 'Tab') return;
+  var stops = Array.from(drawer.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled)'))
+    .filter(function (el) { return !el.closest('.hidden'); });
+  var first = stops[0], last = stops[stops.length - 1], current = document.activeElement;
+  if (!stops.includes(current) || (e.shiftKey ? current === first : current === last)) {
+    e.preventDefault();
+    (e.shiftKey ? last : first).focus();
+  }
 });
 document.getElementById('pol-quota-enable').addEventListener('change', function (e) {
   document.getElementById('pol-quota-box').classList.toggle('hidden', !e.target.checked);
@@ -886,13 +974,25 @@ document.getElementById('pol-ip-enable').addEventListener('change', function (e)
 
 /* ---------- 启动与轮询 ---------- */
 function loadSummary() {
-  return api('/api/summary').then(renderSummary)
-    .catch(function (e) { if (e.message !== '未登录') toast(e.message); });
+  var epoch = dataEpoch, rev = summaryRevision;
+  function isCurrent() { return epoch === dataEpoch && rev === summaryRevision; }
+  return api('/api/summary', null, rev).then(function (s) {
+    if (isCurrent()) renderSummary(s);
+  }).catch(function (e) {
+    if (!isCurrent() || e.message === '未登录') return;
+    if (!state.summary) trendMessage('rule-cards', '转发规则加载失败 · ' + e.message);
+    if (activeView === 'rules' && state.ruleId == null) trendMessage('rule-daily-table', '规则列表加载失败');
+  });
 }
 function loadLive() {
-  return api('/api/live').then(renderLive).catch(function () {});
+  var epoch = dataEpoch, rev = summaryRevision;
+  return api('/api/live', null, rev).then(function (v) {
+    if (epoch !== dataEpoch || rev !== summaryRevision) return;
+    renderLive(v, true);
+  }).catch(function () {});
 }
 
+initNav();
 loadSummary().then(function () { if (activeView === 'home') loadLive(); });
 startEvents();
 // 轮询按当前页签节流：趋势/规则页不需要每 2 秒的实时速率，总览页也不需要

@@ -147,6 +147,7 @@ func TestRuleCRUDWorksWhileConntrackBroken(t *testing.T) {
 	if fake.counterOf(nft.CounterUp(id)) < 0 {
 		t.Fatal("counter 必须建立")
 	}
+	fake.bumpCounter(nft.CounterUp(id), 123)
 
 	// 删除规则：nft 侧必须真的撤销，绝不能「DB 删了 nft 还在」。
 	if err := store.SoftDelete(ctx, id); err != nil {
@@ -158,8 +159,11 @@ func TestRuleCRUDWorksWhileConntrackBroken(t *testing.T) {
 	if n := fake.ruleCount("ip", nft.TableNAT4, nft.ChainPrerouting(nft.TableNAT4)); n != 0 {
 		t.Fatalf("规则删除后 DNAT 必须被撤销，剩余 %d 条", n)
 	}
-	if fake.counterOf(nft.CounterUp(id)) >= 0 {
-		t.Fatal("规则删除后遗留 counter 应被清理")
+	if n := fake.ruleCount("inet", nft.TableFilter, nft.ChainForward()); n != 0 {
+		t.Fatalf("删除最后一条规则后转发链应清空，剩余 %d 条", n)
+	}
+	if got := fake.counterOf(nft.CounterUp(id)); got != 123 {
+		t.Fatalf("退役计数器应保留给采集器，实际 %d", got)
 	}
 }
 

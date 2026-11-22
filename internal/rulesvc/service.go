@@ -1,39 +1,12 @@
-// Package rulesvc 是**唯一**的规则变更入口（RuleMutationService）。
-//
-// 为什么必须集中：Web API、CLI、后台 DNS reconcile 如果各自改库再各自调 nft，
-// 就必然出现「DB 成功 / nft 失败」或反向的不一致。本包把所有变更统一成一条
-// 事务化流水线：
-//
-//	读取正式状态
-//	  ↓
-//	构造 candidate（内存副本，绝不先落库）
-//	  ↓
-//	Validate（字段 + 目标地址 net/netip / hostname 严格校验）
-//	  ↓
-//	端口分配（留空→安全随机）+ 冲突检查（GuardPorts / 协议重叠）
-//	  ↓
-//	DNS 解析（域名目标；首次创建必须成功）
-//	  ↓
-//	DB 写入（创建时需要真实 ID —— nft 的 ct mark / counter 名都由 ID 决定）
-//	  ↓
-//	生成 nft candidate → `nft -c -f` 干跑校验 → `nft -f` 应用
-//	  ↓
-//	成功；任一步失败 → DB 与 nft 都回到变更前状态
-//
-// 为什么创建时先写库：nft 侧的 ct mark、named counter 名称全部由规则 ID 派生，
-// ID 只有落库后才确定。因此创建路径是「插入取 ID → 应用 nft → 失败则物理删除
-// 这条刚插入的行并回滚 nft」。刚创建的规则不可能有任何历史流量
-// （counter 尚未存在、totals/daily 无记录），物理删除是安全且干净的 ——
-// 这也是全仓唯一使用物理删除的地方；用户删除规则一律走软删除以保留历史。
-//
-// 编辑 / 策略 / 删除路径则相反：nft 先行（可靠可回滚），DB 收尾（不可逆）。
-//
-// 并发：所有变更串行化（mu），并在整个「nft + DB」过程中持有 enforcer 的
-// enforcement 锁，避免周期 reconcile 在中间态按旧数据重建 nft。
+// Package rulesvc coordinates committed SQLite state and nftables enforcement.
+// A mutation stages writes in SQLite, applies the candidate, then commits.
+// On ambiguous apply/commit failure it reconciles from the committed database;
+// on interruption the same recovery happens during the next startup.
 package rulesvc
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -47,19 +20,9 @@ import (
 // RuleStore 是本服务需要的持久层能力（由 forward.Store 实现）。
 // 抽象成接口便于故障注入测试（模拟 SQLite 写入失败）。
 type RuleStore interface {
-	ListActive(ctx context.Context) ([]*forward.Rule, error)
-	Create(ctx context.Context, r *forward.Rule) (int64, error)
-	Update(ctx context.Context, r *forward.Rule) error
-	SoftDelete(ctx context.Context, id int64) error
-	HardDelete(ctx context.Context, id int64) error
-	UpdateResolved(ctx context.Context, id int64, v4, v6 string, at int64, status, errMsg string) error
-
-	// UpdateResolvedBatch 在单个事务里批量写解析状态，并在 commit 之前
-	// 调用 beforeCommit（用于把候选规则集应用到 nft）。
-	//
-	// 语义见 forward.Store.UpdateResolvedBatch：commit 阶段失败返回
-	// *forward.ErrCommitFailed，调用方必须据此回滚 nft。
-	UpdateResolvedBatch(ctx context.Context, ups []forward.ResolvedUpdate, beforeCommit func() error) error
+	ListActive(context.Context) ([]*forward.Rule, error)
+	ReserveID(context.Context) (int64, error)
+	Transaction(context.Context, func(forward.Mutation) error) error
 }
 
 // Enforcer 抽象「把当前规则集同步到 nftables」的能力。
@@ -85,13 +48,14 @@ type Notifier func()
 
 // Service 是规则变更服务。
 type Service struct {
-	store    RuleStore
-	enforcer Enforcer
-	alloc    *forward.Allocator
-	resolver resolve.Resolver
-	guards   GuardProvider
-	notify   Notifier
-	now      func() time.Time
+	store        RuleStore
+	enforcer     Enforcer
+	alloc        *forward.Allocator
+	resolver     resolve.Resolver
+	guards       GuardProvider
+	notify       Notifier
+	mutationLock func(context.Context) (forward.GuardPorts, func(), error)
+	now          func() time.Time
 
 	// mu 串行化所有变更：分配端口 → 冲突检查 → 落库在同一临界区内完成，
 	// 因此并发创建不可能拿到同一个随机端口（TestRandomPortConcurrentCreate）。
@@ -132,6 +96,34 @@ func (s *Service) SetClock(fn func() time.Time) {
 
 // SetNotifier 设置提交成功后的通知回调。
 func (s *Service) SetNotifier(fn Notifier) { s.notify = fn }
+
+// SetMutationLock allows the daemon to serialize rule changes with external
+// config/port operations, obtaining current guard ports inside the file lock.
+// It must be configured before serving requests.
+func (s *Service) SetMutationLock(lock func(context.Context) (forward.GuardPorts, func(), error)) {
+	s.mutationLock = lock
+}
+
+func (s *Service) lockMutation(ctx context.Context) (forward.GuardPorts, func(), error) {
+	var release func()
+	guards := s.guards()
+	if s.mutationLock != nil {
+		var err error
+		guards, release, err = s.mutationLock(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	s.mu.Lock()
+	unlock := s.hold()
+	return guards, func() {
+		unlock()
+		s.mu.Unlock()
+		if release != nil {
+			release()
+		}
+	}, nil
+}
 
 // CreateInput 是创建规则的入参（只含用户可配置字段）。
 //
@@ -210,43 +202,37 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*forward.Rule, er
 		}
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	defer s.hold()()
+	guards, unlock, err := s.lockMutation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	existing, err := s.store.ListActive(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("读取规则列表失败: %w", err)
 	}
 	if cand.ListenPort == 0 {
-		p, aerr := s.alloc.Allocate(cand, existing, s.guards())
+		p, aerr := s.alloc.Allocate(cand, existing, guards)
 		if aerr != nil {
 			return nil, aerr
 		}
 		cand.ListenPort = p
 	}
-	if err := forward.CheckConflicts(cand, existing, s.guards()); err != nil {
+	if err := forward.CheckConflicts(cand, existing, guards); err != nil {
 		return nil, err
 	}
 	if cand.IsDomainTarget() {
 		applyResolve(cand, rstate)
 	}
 
-	// 写库取 ID（nft 侧对象名依赖 ID）。
-	id, err := s.store.Create(ctx, cand)
+	id, err := s.store.ReserveID(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("数据库写入失败: %w", err)
+		return nil, fmt.Errorf("分配规则 ID 失败: %w", err)
 	}
 	cand.ID = id
-
-	// 应用 nft；失败则物理删除这条刚插入的行并把 nft 恢复到变更前状态。
-	if err := s.apply(ctx, append(append([]*forward.Rule{}, existing...), cand)); err != nil {
-		if derr := s.store.HardDelete(ctx, id); derr != nil {
-			slog.Error("创建失败后清理新规则失败，DB 与 nft 可能不一致（下一轮 reconcile 会自愈）",
-				"id", id, "err", derr)
-		}
-		s.rollbackNFT(ctx, existing, "创建规则应用失败")
-		return nil, fmt.Errorf("无法应用 nftables 规则: %w", err)
+	if err := s.transact(ctx, append(existing, cand), func(m forward.Mutation) error { return m.Create(cand) }); err != nil {
+		return nil, err
 	}
 	s.fire()
 	return cand, nil
@@ -272,9 +258,11 @@ func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (*forwar
 		}
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	defer s.hold()()
+	guards, unlock, err := s.lockMutation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	existing, cur, err := s.load(ctx, id)
 	if err != nil {
@@ -305,7 +293,7 @@ func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (*forwar
 		targetChanged = newTarget != cur.TargetAddress
 		cand.TargetAddress = newTarget
 	}
-	if err := forward.CheckConflicts(&cand, existing, s.guards()); err != nil {
+	if err := forward.CheckConflicts(&cand, existing, guards); err != nil {
 		return nil, err
 	}
 
@@ -327,12 +315,8 @@ func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (*forwar
 		}
 	}
 
-	if err := s.applyWithRollback(ctx, s.withCandidate(existing, &cand), existing); err != nil {
-		return nil, fmt.Errorf("无法应用 nftables 规则: %w", err)
-	}
-	if err := s.store.Update(ctx, &cand); err != nil {
-		s.rollbackNFT(ctx, existing, "编辑规则落库失败")
-		return nil, fmt.Errorf("数据库写入失败: %w", err)
+	if err := s.transact(ctx, s.withCandidate(existing, &cand), func(m forward.Mutation) error { return m.Update(&cand) }); err != nil {
+		return nil, err
 	}
 	s.fire()
 	return &cand, nil
@@ -351,9 +335,11 @@ func (s *Service) SetEnabled(ctx context.Context, id int64, enabled bool) (*forw
 // 配额与 IP 限制的变更**不触碰 named counter**：配额超限走 qblock set 元素，
 // allow set 走元素增量，两者都不重写 counter 声明，因此累计流量不会被清零。
 func (s *Service) UpdatePolicy(ctx context.Context, id int64, in PolicyInput) (*forward.Rule, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	defer s.hold()()
+	_, unlock, err := s.lockMutation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	existing, cur, err := s.load(ctx, id)
 	if err != nil {
@@ -383,12 +369,8 @@ func (s *Service) UpdatePolicy(ctx context.Context, id int64, in PolicyInput) (*
 		return nil, fmt.Errorf("最大同时在线数必须 >= 1")
 	}
 
-	if err := s.applyWithRollback(ctx, s.withCandidate(existing, &cand), existing); err != nil {
-		return nil, fmt.Errorf("无法应用 nftables 规则: %w", err)
-	}
-	if err := s.store.Update(ctx, &cand); err != nil {
-		s.rollbackNFT(ctx, existing, "策略落库失败")
-		return nil, fmt.Errorf("数据库写入失败: %w", err)
+	if err := s.transact(ctx, s.withCandidate(existing, &cand), func(m forward.Mutation) error { return m.Update(&cand) }); err != nil {
+		return nil, err
 	}
 	s.fire()
 	return &cand, nil
@@ -396,9 +378,11 @@ func (s *Service) UpdatePolicy(ctx context.Context, id int64, in PolicyInput) (*
 
 // Delete 软删除规则：撤销转发，但保留历史流量（今日/累计/每日全部保留）。
 func (s *Service) Delete(ctx context.Context, id int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	defer s.hold()()
+	_, unlock, err := s.lockMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	existing, cur, err := s.load(ctx, id)
 	if err != nil {
@@ -410,205 +394,116 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 			remaining = append(remaining, r)
 		}
 	}
-	if err := s.applyWithRollback(ctx, remaining, existing); err != nil {
-		return fmt.Errorf("无法应用 nftables 规则: %w", err)
-	}
-	if err := s.store.SoftDelete(ctx, id); err != nil {
-		s.rollbackNFT(ctx, existing, "删除规则落库失败")
-		return fmt.Errorf("数据库写入失败: %w", err)
+	if err := s.transact(ctx, remaining, func(m forward.Mutation) error { return m.SoftDelete(id) }); err != nil {
+		return err
 	}
 	s.fire()
 	return nil
 }
 
-// RefreshDNS 对所有域名规则做一轮解析并在地址变化时同步 nft。
-//
-// ★ DNS 查询绝不在锁内进行（v0.3.1 收口）。旧实现全程持有 mu + enforcer 锁，
-// 一次 DNS 超时（5s）就会把所有规则 CRUD 卡死数秒到数十秒。现在分三段：
-//
-//  1. 加锁 → snapshot 需要解析的规则（域名 + 当前状态 + version 指纹）→ 解锁
-//  2. 锁外并发解析（A/AAAA 由 resolve 内部并行，规则之间受 dnsConcurrency 限流）
-//  3. 重新加锁 → 校验目标域名 / updated_at 未被用户改动 → 事务化 apply
-//
-// ★ DB 与 nft 事务一致（v0.3.2 收口）：阶段 3 走 store.UpdateResolvedBatch
-// （BEGIN → 批量写解析列 → ApplyRules → COMMIT），任一步失败都回到
-// 「DB 与 nft 都是旧状态」。详见函数体内的注释。
-//
-// 关键行为：
-//   - 只有 last-known-good 地址真正变化才走 nft 同步（避免无谓重写）；
-//   - DNS 临时失败保留旧地址（resolve.Resolve 已保证），只更新状态文本；
-//   - 解析期间用户改了目标或删除了规则 → 丢弃这条过期结果，绝不覆盖新值；
-//   - 解析状态字段用独立 SQL 写入，不触碰用户配置字段，不抬 updated_at；
-//   - 变化时走与 Web 变更完全相同的 apply 路径，因此 counter 不清零。
-//
-// 返回本轮发生地址变化的规则数。
+// RefreshDNS resolves outside the mutation lock and discards results if
+// the rule or its last-known-good state changed while lookup was in flight.
 func (s *Service) RefreshDNS(ctx context.Context) (int, error) {
-	// ---- 阶段 1：锁内 snapshot ----
-	s.mu.Lock()
 	existing, err := s.store.ListActive(ctx)
 	if err != nil {
-		s.mu.Unlock()
 		return 0, err
 	}
-	type job struct {
-		id        int64
-		host      string
-		prev      resolve.State
-		updatedAt int64
+	type result struct {
+		original *forward.Rule
+		state    resolve.State
 	}
-	var jobs []job
-	var clearIDs []int64
-	for _, r := range existing {
-		if !r.IsDomainTarget() {
-			// IP 目标：清掉可能残留的解析状态（例如从域名改成 IP 的旧数据）。
-			if r.ResolveStatus != "" || r.ResolvedV4 != "" || r.ResolvedV6 != "" {
-				clearIDs = append(clearIDs, r.ID)
+	jobs := make(chan int)
+	results := make([]result, len(existing))
+	var wg sync.WaitGroup
+	now := s.now()
+	for i := 0; i < min(dnsConcurrency, len(existing)); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				if ctx.Err() != nil {
+					continue
+				}
+				r := existing[i]
+				prev := resolve.State{V4: r.ResolvedV4, V6: r.ResolvedV6, At: r.ResolvedAt, Status: r.ResolveStatus, Err: r.ResolveError}
+				if r.IsDomainTarget() {
+					state := resolve.Resolve(ctx, s.resolver, r.TargetAddress, prev, now)
+					if state != prev {
+						results[i] = result{r, state}
+					}
+				} else if prev != (resolve.State{}) {
+					results[i] = result{original: r}
+				}
 			}
-			continue
-		}
-		jobs = append(jobs, job{
-			id:        r.ID,
-			host:      r.TargetAddress,
-			updatedAt: r.UpdatedAt,
-			prev: resolve.State{V4: r.ResolvedV4, V6: r.ResolvedV6, At: r.ResolvedAt,
-				Status: r.ResolveStatus, Err: r.ResolveError},
-		})
+		}()
 	}
-	s.mu.Unlock()
-
-	// IP 目标的解析状态清理不需要 DNS，直接写库（Update 只改解析列）。
-	for _, id := range clearIDs {
-		if err := s.store.UpdateResolved(ctx, id, "", "", 0, "", ""); err != nil {
-			slog.Warn("清理解析状态失败", "rule", id, "err", err)
+	for i := range existing {
+		if ctx.Err() != nil {
+			break
 		}
+		jobs <- i
 	}
-	if len(jobs) == 0 {
+	close(jobs)
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	any := false
+	for _, res := range results {
+		any = any || res.original != nil
+	}
+	if !any {
 		return 0, nil
 	}
 
-	// ---- 阶段 2：锁外并发解析 ----
-	type result struct {
-		id        int64
-		host      string
-		updatedAt int64
-		state     resolve.State
+	_, unlock, err := s.lockMutation(ctx)
+	if err != nil {
+		return 0, err
 	}
-	results := make([]result, len(jobs))
-	sem := make(chan struct{}, dnsConcurrency)
-	var wg sync.WaitGroup
-	now := s.now()
-	for i, jb := range jobs {
-		wg.Add(1)
-		go func(i int, jb job) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			st := resolve.Resolve(ctx, s.resolver, jb.host, jb.prev, now)
-			results[i] = result{id: jb.id, host: jb.host, updatedAt: jb.updatedAt, state: st}
-		}(i, jb)
-	}
-	wg.Wait()
-
-	// ---- 阶段 3：重新加锁，校验版本后事务化应用 ----
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	defer s.hold()()
-
+	defer unlock()
 	current, err := s.store.ListActive(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("读取规则列表失败: %w", err)
 	}
-	byID := make(map[int64]*forward.Rule, len(current))
-	for _, r := range current {
-		byID[r.ID] = r
-	}
-
-	changed := 0
-	next := make([]*forward.Rule, 0, len(current))
-	for _, r := range current {
-		cp := *r
-		next = append(next, &cp)
-	}
-	nextByID := make(map[int64]*forward.Rule, len(next))
-	for _, r := range next {
-		nextByID[r.ID] = r
-	}
-
-	// ups 是要写库的解析状态；与 next（送给 nft 的候选规则集）严格同源。
-	ups := make([]forward.ResolvedUpdate, 0, len(results))
+	byID := make(map[int64]result, len(results))
 	for _, res := range results {
-		cur, ok := byID[res.id]
-		if !ok {
-			// 规则在解析期间被删除：丢弃过期结果，绝不「复活」它。
-			slog.Debug("丢弃过期 DNS 解析结果（规则已删除）", "rule", res.id)
+		if res.original != nil {
+			byID[res.original.ID] = res
+		}
+	}
+	changed := 0
+	var ups []forward.ResolvedUpdate
+	for i, cur := range current {
+		res, ok := byID[cur.ID]
+		if !ok || *cur != *res.original {
 			continue
 		}
-		// 解析期间用户改了目标或改过规则（含启停）→ 本次结果已过期，丢弃。
-		if cur.TargetAddress != res.host || cur.UpdatedAt != res.updatedAt {
-			slog.Debug("丢弃过期 DNS 解析结果（规则在解析期间被修改）", "rule", res.id)
-			continue
-		}
-		cand := nextByID[res.id]
-		if cand == nil {
-			continue
-		}
-		applyResolve(cand, res.state)
-		ups = append(ups, forward.ResolvedUpdate{
-			ID: res.id, V4: res.state.V4, V6: res.state.V6,
-			At: res.state.At, Status: res.state.Status, Err: res.state.Err,
-		})
-		prev := resolve.State{V4: cur.ResolvedV4, V6: cur.ResolvedV6}
-		if res.state.Changed(prev) {
+		cand := *cur
+		applyResolve(&cand, res.state)
+		current[i] = &cand
+		ups = append(ups, forward.ResolvedUpdate{ID: cur.ID, V4: cand.ResolvedV4, V6: cand.ResolvedV6,
+			At: cand.ResolvedAt, Status: cand.ResolveStatus, Err: cand.ResolveError})
+		if cur.IsDomainTarget() && (cand.ResolvedV4 != cur.ResolvedV4 || cand.ResolvedV6 != cur.ResolvedV6) {
 			changed++
 		}
 	}
-
 	if len(ups) == 0 {
 		return 0, nil
 	}
-
-	// ★ 事务化：DB 与 nft 要么都成功，要么都回滚（v0.3.2 收口）。
-	//
-	// 旧实现是「先 ApplyRules 到 nft，再逐条 UpdateResolved，写失败只打
-	// warning」——一旦某条写库失败，nft 已用新地址而 DB 仍记旧地址，
-	// 这种不一致会一直存在（下一轮解析结果相同时甚至不会再触发同步）。
-	//
-	// 现在：
-	//   BEGIN → 批量写解析列 → ApplyRules(候选集) → COMMIT
-	//
-	//   · 写库失败      → ROLLBACK，nft 未被改动
-	//   · ApplyRules 失败 → ROLLBACK（apply 内部已把 nft 回滚到旧状态）
-	//   · COMMIT 失败    → nft 已是新状态，必须把 nft 回滚回旧规则集，
-	//                      并且明确报错（不再是 warning）
-	//
-	// 无论几条域名规则变化，都只有一次 ApplyRules + 一次 commit，
-	// 不会出现「apply、写库、apply、写库」的多次中间状态。
-	applied := false
-	err = s.store.UpdateResolvedBatch(ctx, ups, func() error {
-		if changed == 0 {
-			// 地址没变：不需要重写 nft（避免无谓的链重建）。
-			return nil
+	if changed == 0 {
+		current = nil
+	}
+	err = s.transact(ctx, current, func(m forward.Mutation) error {
+		for _, u := range ups {
+			if err := m.UpdateResolved(u); err != nil {
+				return err
+			}
 		}
-		if aerr := s.apply(ctx, next); aerr != nil {
-			// apply 自身失败：nft 未进入新状态，但可能处于半应用，
-			// 统一回滚到变更前规则集。
-			s.rollbackNFT(ctx, current, "DNS 目标更新应用失败")
-			return fmt.Errorf("DNS 目标更新应用失败: %w", aerr)
-		}
-		applied = true
 		return nil
 	})
 	if err != nil {
-		var commitErr *forward.ErrCommitFailed
-		if errors.As(err, &commitErr) && applied {
-			// nft 已是新状态但 DB 未提交 → 必须把 nft 退回旧状态，
-			// 否则会留下「nft 新地址、DB 旧地址」的不一致。
-			slog.Error("DNS 解析状态提交失败，正在回滚 nftables", "err", commitErr.Err)
-			s.rollbackNFT(ctx, current, "DNS 解析状态提交失败")
-		}
 		return 0, fmt.Errorf("DNS 刷新失败: %w", err)
 	}
-
 	if changed > 0 {
 		s.fire()
 	}
@@ -657,37 +552,59 @@ func (s *Service) withCandidate(existing []*forward.Rule, cand *forward.Rule) []
 	return out
 }
 
-// apply 同步 nft（enforcer 为 nil 时为空操作）。
-func (s *Service) apply(ctx context.Context, rules []*forward.Rule) error {
-	if s.enforcer == nil {
+// transact does not treat the old in-memory slice as truth after a commit
+// error. Read the SQLite state after the transaction closes, using an
+// independent bounded context even if the HTTP client has disconnected.
+// A nil candidate means the edit only changes DNS metadata.
+func (s *Service) transact(ctx context.Context, candidate []*forward.Rule, edit func(forward.Mutation) error) error {
+	attempted := false
+	var restore func()
+	err := s.store.Transaction(ctx, func(m forward.Mutation) error {
+		if err := edit(m); err != nil {
+			return fmt.Errorf("数据库写入失败: %w", err)
+		}
+		if s.enforcer == nil || candidate == nil {
+			return nil
+		}
+		attempted = true
+		if e, ok := s.enforcer.(interface{ SaveRuntime() func() }); ok {
+			restore = e.SaveRuntime()
+		}
+		var err error
+		if e, ok := s.enforcer.(interface {
+			ApplyRulesTx(context.Context, []*forward.Rule, *sql.Tx) error
+		}); ok {
+			err = e.ApplyRulesTx(ctx, candidate, m.SQLTx())
+		} else {
+			err = s.enforcer.ApplyRules(ctx, candidate)
+		}
+		if err != nil {
+			return fmt.Errorf("无法应用 nftables 规则: %w", err)
+		}
 		return nil
-	}
-	return s.enforcer.ApplyRules(ctx, rules)
-}
-
-// applyWithRollback 应用 next 规则集；失败时把 nft 恢复到 prev 状态。
-func (s *Service) applyWithRollback(ctx context.Context, next, prev []*forward.Rule) error {
-	if err := s.apply(ctx, next); err != nil {
-		s.rollbackNFT(ctx, prev, "变更应用失败")
+	})
+	if err == nil || !attempted {
 		return err
 	}
-	return nil
-}
 
-// rollbackNFT 把 nft 恢复到给定（变更前的正式）规则集。
-func (s *Service) rollbackNFT(ctx context.Context, prev []*forward.Rule, reason string) {
-	if s.enforcer == nil {
-		return
+	if restore != nil {
+		restore()
 	}
-	// 用独立 ctx：请求 ctx 可能已被取消，回滚必须尽力完成。
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
 	defer cancel()
-	if err := s.enforcer.ApplyRules(rctx, prev); err != nil {
-		slog.Error("nft 回滚失败，可能与数据库不一致（下一轮 reconcile 会自愈）",
-			"reason", reason, "err", err)
-		return
+	committed, rerr := s.store.ListActive(rctx)
+	if rerr == nil {
+		rerr = s.enforcer.ApplyRules(rctx, committed)
 	}
-	slog.Warn("已回滚 nftables 到变更前状态", "reason", reason)
+	if rerr != nil {
+		rerr = fmt.Errorf("无法恢复已提交规则的 nft 状态: %w", rerr)
+		if e, ok := s.enforcer.(interface{ MarkUnready(error) }); ok {
+			e.MarkUnready(rerr)
+		}
+		slog.Error("规则恢复失败", "err", rerr)
+		return errors.Join(err, rerr)
+	}
+	return err
 }
 
 func (s *Service) fire() {

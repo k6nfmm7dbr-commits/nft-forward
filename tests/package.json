@@ -1,0 +1,1 @@
+{"name":"nft-forward-ui-tests","private":true,"scripts":{"test":"node nff_panel_ui_test.js"},"devDependencies":{"jsdom":"26.1.0"}}

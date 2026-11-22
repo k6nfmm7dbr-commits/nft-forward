@@ -26,7 +26,9 @@ package policy
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
+	"maps"
 	"strconv"
 	"strings"
 	"sync"
@@ -341,7 +343,46 @@ func (s *Service) Hold() func() {
 // 与周期 reconcile 共用同一条 sync 路径，因此「结构未变只走元素增量」
 // 的 counter 保护同样生效；conntrack 是否可用不会影响它是否执行。
 func (s *Service) ApplyRules(ctx context.Context, rules []*forward.Rule) error {
-	return s.sync(ctx, rules)
+	return s.sync(ctx, rules, nil)
+}
+
+// ApplyRulesTx reads fall-back quota totals on the transaction's connection.
+func (s *Service) ApplyRulesTx(ctx context.Context, rules []*forward.Rule, tx *sql.Tx) error {
+	return s.sync(ctx, rules, tx)
+}
+
+// SaveRuntime limits rollback bookkeeping to explicit rule transactions (not
+// the hot reconcile path). Caller holds Hold until either commit or restore.
+func (s *Service) SaveRuntime() func() {
+	ip := make(map[int64]*NodeIPState, len(s.ipStates))
+	for id, old := range s.ipStates {
+		next := &NodeIPState{Slots: make(map[string]*IPSlot, len(old.Slots)), Observed: make(map[string]*ObservedIP, len(old.Observed)), Rejected: maps.Clone(old.Rejected), MaxIPs: old.MaxIPs}
+		for k, st := range old.Slots {
+			copy := *st
+			next.Slots[k] = &copy
+		}
+		for k, st := range old.Observed {
+			copy := *st
+			next.Observed[k] = &copy
+		}
+		ip[id] = next
+	}
+	flows := make(map[string]*flowState, len(s.flows))
+	for k, st := range s.flows {
+		copy := *st
+		flows[k] = &copy
+	}
+	return func() { s.ipStates, s.flows = ip, flows }
+}
+
+// MarkUnready keeps a persistent runtime failure visible until enforcement
+// succeeds again. Conntrack degradation alone does not revoke readiness.
+func (s *Service) MarkUnready(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ready = false
+	s.lastErr = err.Error()
+	s.lastApplyErr = err.Error()
 }
 
 // Reconcile 执行一轮：读规则 → 观测 → slot 准入 → 配额判定 → nft 强制 → 落库状态。
@@ -350,10 +391,10 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	defer s.runMu.Unlock()
 	rules, err := s.store.ListActive(ctx)
 	if err != nil {
-		s.setErr(err.Error())
+		s.MarkUnready(err)
 		return err
 	}
-	return s.sync(ctx, rules)
+	return s.sync(ctx, rules, nil)
 }
 
 // ---- 核心同步 ----
@@ -367,7 +408,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 //
 // 因此 conntrack 异常期间用户依然可以正常增删改规则，且「API 返回成功」
 // 严格等价于「DB 与 nft 一致」。
-func (s *Service) sync(ctx context.Context, rules []*forward.Rule) error {
+func (s *Service) sync(ctx context.Context, rules []*forward.Rule, tx *sql.Tx) error {
 	enabled := make([]*forward.Rule, 0, len(rules))
 	for _, r := range rules {
 		if r != nil && !r.Deleted && r.Enabled {
@@ -402,18 +443,15 @@ func (s *Service) sync(ctx context.Context, rules []*forward.Rule) error {
 	var fallbackTotals map[int64]int64
 	if !live.Ready {
 		var terr error
-		if fallbackTotals, terr = s.allLifetimeBytes(ctx); terr != nil {
-			s.setErr(terr.Error())
+		if fallbackTotals, terr = s.allLifetimeBytes(ctx, tx); terr != nil {
+			s.MarkUnready(terr)
 			return terr
 		}
 	}
 	curSt, err := s.nftReadState(ctx, s.runner)
 	if err != nil {
-		msg := "读取 nft 状态失败: " + err.Error()
-		s.setErr(msg)
-		s.mu.Lock()
-		s.lastApplyErr = err.Error()
-		s.mu.Unlock()
+		err = fmt.Errorf("读取 nft 状态失败: %w", err)
+		s.MarkUnready(err)
 		return err
 	}
 	counterBytes := map[string]int64{}
@@ -435,7 +473,7 @@ func (s *Service) sync(ctx context.Context, rules []*forward.Rule) error {
 		// ---- 配额（A 层：不依赖 conntrack）----
 		total, used, qerr := s.quotaUsed(r, live, counterBytes, fallbackTotals)
 		if qerr != nil {
-			s.setErr(qerr.Error())
+			s.MarkUnready(qerr)
 			return qerr
 		}
 		newQuotaTotals[r.ID] = total
@@ -492,7 +530,6 @@ func (s *Service) sync(ctx context.Context, rules []*forward.Rule) error {
 	for id := range s.ipStates {
 		if !live4[id] {
 			delete(s.ipStates, id)
-			delete(s.states, id)
 			s.dropFlowsOf(id)
 		}
 	}
@@ -505,11 +542,8 @@ func (s *Service) sync(ctx context.Context, rules []*forward.Rule) error {
 	// ---- A 层：结构 + 元素同步（无论 conntrack 如何都必须执行）----
 	gi := &nft.GenInput{Rules: enabled, States: nftStates}
 	if err := s.applyNFT(ctx, gi, quotaBlocked, curSt); err != nil {
-		msg := "nft 应用失败: " + err.Error()
-		s.setErr(msg)
-		s.mu.Lock()
-		s.lastApplyErr = err.Error()
-		s.mu.Unlock()
+		err = fmt.Errorf("nft 应用失败: %w", err)
+		s.MarkUnready(err)
 		return err
 	}
 
@@ -560,8 +594,12 @@ func (s *Service) quotaUsed(r *forward.Rule, live traffic.LiveDelta,
 //
 // 只在 collector 首轮采集完成之前使用；正常运行期配额走 traffic.LiveDelta，
 // 完全不查库。
-func (s *Service) allLifetimeBytes(ctx context.Context) (map[int64]int64, error) {
-	rows, err := s.db.QueryContext(ctx,
+func (s *Service) allLifetimeBytes(ctx context.Context, tx *sql.Tx) (map[int64]int64, error) {
+	query := s.db.QueryContext
+	if tx != nil {
+		query = tx.QueryContext
+	}
+	rows, err := query(ctx,
 		"SELECT rule_id,upload_bytes,download_bytes FROM traffic_totals")
 	if err != nil {
 		return nil, err
@@ -808,32 +846,13 @@ func (s *Service) applyNFT(ctx context.Context, gi *nft.GenInput, quotaBlocked [
 	sig := nft.StructSig(gi)
 	drift := nft.DetectDrift(gi, cur)
 
-	if sig != s.lastStructSig || !drift.Empty() {
-		if !drift.Empty() && sig == s.lastStructSig {
-			// 结构签名没变却有漂移 = 被外部改动，属于真正的自愈事件。
-			desc := drift.Describe()
-			slog.Warn("检测到自有 nft 对象漂移，正在自动修复", "drift", desc)
-			s.mu.Lock()
-			s.lastHealMissing = desc
-			s.mu.Unlock()
-		}
-		script := nft.GenStructScript(gi, cur.Existing())
-		if err := s.nftApply(ctx, s.runner, s.nftConf, script); err != nil {
-			// ★ 绝不在此更新 lastStructSig：内核没有接受这批规则，
-			// 内部缓存必须保持「未应用」，下一轮重新尝试。
-			return err
-		}
-		s.lastStructSig = sig
-		if !drift.Empty() {
-			s.mu.Lock()
-			s.lastHealOK = s.now().Unix()
-			s.mu.Unlock()
-		}
-		// 结构重建后 set 元素可能被清空（新表），重新读一次现状
-		// 以便下面的增量以真实状态为基准。
-		if cur, err = s.nftReadState(ctx, s.runner); err != nil {
-			return err
-		}
+	structural := sig != s.lastStructSig || !drift.Empty()
+	if !drift.Empty() && sig == s.lastStructSig {
+		desc := drift.Describe()
+		slog.Warn("检测到自有 nft 对象漂移，正在自动修复", "drift", desc)
+		s.mu.Lock()
+		s.lastHealMissing = desc
+		s.mu.Unlock()
 	}
 
 	// 元素增量：配额阻断 + 每规则 allow set。
@@ -851,8 +870,24 @@ func (s *Service) applyNFT(ctx context.Context, gi *nft.GenInput, quotaBlocked [
 			nft.AllowDiff(r.ID, true, cur.ElementsOf(nft.AllowSetV6(r.ID)), st.AllowV6),
 		)
 	}
-	// 无变化时脚本为空 → 完全不调用 nft。
 	elemScript := nft.GenElementScript(diffs)
+	if structural {
+		// The generated declaration preserves existing allow/quota sets and
+		// adds missing sets empty. Append their deltas to the same nft batch
+		// so chains are never installed without their new enforcement state.
+		gi.KeepCounters = true
+		script := nft.GenStructScript(gi, cur.Existing()) + elemScript
+		if err := s.nftApply(ctx, s.runner, s.nftConf, script); err != nil {
+			return err
+		}
+		s.lastStructSig = sig
+		if !drift.Empty() {
+			s.mu.Lock()
+			s.lastHealOK = s.now().Unix()
+			s.mu.Unlock()
+		}
+		return nil
+	}
 	if elemScript == "" {
 		return nil
 	}
@@ -902,12 +937,6 @@ func (s *Service) snapshotIPs(ruleID int64, st *NodeIPState) RuleIPSnapshot {
 		snap.Rejected = append(snap.Rejected, e)
 	}
 	return snap
-}
-
-func (s *Service) setErr(msg string) {
-	s.mu.Lock()
-	s.lastErr = msg
-	s.mu.Unlock()
 }
 
 func splitV4(set map[string]bool) []string {

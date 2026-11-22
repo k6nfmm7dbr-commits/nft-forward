@@ -2,6 +2,7 @@ package rulesvc
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net"
@@ -32,8 +33,6 @@ type memStore struct {
 	failResolvedCommit bool
 	// resolvedCommits 统计成功提交的批次数（断言「一次 refresh 只提交一次」）。
 	resolvedCommits int
-	// createdIDs 记录曾经插入过的 ID（用于断言回滚是否物理删除）。
-	createdIDs []int64
 }
 
 func newMemStore() *memStore {
@@ -63,114 +62,85 @@ func (m *memStore) ListActive(context.Context) ([]*forward.Rule, error) {
 	return out, nil
 }
 
-func (m *memStore) Create(_ context.Context, r *forward.Rule) (int64, error) {
+func (m *memStore) ReserveID(context.Context) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.failCreate {
-		return 0, errors.New("disk I/O error")
-	}
 	id := m.nextID
 	m.nextID++
-	cp := *r
-	cp.ID = id
-	m.rules[id] = &cp
-	m.createdIDs = append(m.createdIDs, id)
 	return id, nil
 }
 
-func (m *memStore) Update(_ context.Context, r *forward.Rule) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.failUpdate {
-		return errors.New("database is locked")
-	}
-	if _, ok := m.rules[r.ID]; !ok {
-		return fmt.Errorf("规则 %d 不存在", r.ID)
+type memMutation struct {
+	store    *memStore
+	rules    map[int64]*forward.Rule
+	resolved bool
+}
+
+func (m *memMutation) SQLTx() *sql.Tx { return nil }
+func (m *memMutation) Create(r *forward.Rule) error {
+	if m.store.failCreate {
+		return errors.New("disk I/O error")
 	}
 	cp := *r
 	m.rules[r.ID] = &cp
 	return nil
 }
-
-func (m *memStore) SoftDelete(_ context.Context, id int64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.failDelete {
+func (m *memMutation) Update(r *forward.Rule) error {
+	if m.store.failUpdate {
 		return errors.New("database is locked")
 	}
-	r, ok := m.rules[id]
-	if !ok {
-		return fmt.Errorf("规则 %d 不存在", id)
+	if _, ok := m.rules[r.ID]; !ok {
+		return fmt.Errorf("rule %d not found", r.ID)
 	}
-	r.Deleted = true
-	delete(m.rules, id) // ListActive 只返回未删除
+	cp := *r
+	m.rules[r.ID] = &cp
 	return nil
 }
-
-func (m *memStore) HardDelete(_ context.Context, id int64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (m *memMutation) SoftDelete(id int64) error {
+	if m.store.failDelete {
+		return errors.New("database is locked")
+	}
 	delete(m.rules, id)
 	return nil
 }
-
-func (m *memStore) UpdateResolved(_ context.Context, id int64, v4, v6 string, at int64, status, errMsg string) error {
+func (m *memMutation) UpdateResolved(u forward.ResolvedUpdate) error {
+	if m.store.failResolvedWrite {
+		return errors.New("disk I/O error")
+	}
+	r, ok := m.rules[u.ID]
+	if !ok {
+		return fmt.Errorf("rule %d not found", u.ID)
+	}
+	r.ResolvedV4, r.ResolvedV6, r.ResolvedAt = u.V4, u.V6, u.At
+	r.ResolveStatus, r.ResolveError = u.Status, u.Err
+	m.resolved = true
+	return nil
+}
+func (m *memStore) Transaction(_ context.Context, edit func(forward.Mutation) error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	r, ok := m.rules[id]
-	if !ok {
-		return fmt.Errorf("规则 %d 不存在", id)
+	staged := &memMutation{store: m, rules: make(map[int64]*forward.Rule, len(m.rules))}
+	for id, r := range m.rules {
+		cp := *r
+		staged.rules[id] = &cp
 	}
-	r.ResolvedV4, r.ResolvedV6, r.ResolvedAt = v4, v6, at
-	r.ResolveStatus, r.ResolveError = status, errMsg
+	if err := edit(staged); err != nil {
+		return err
+	}
+	if staged.resolved && m.failResolvedCommit {
+		return &forward.ErrCommitFailed{Err: errors.New("database is locked")}
+	}
+	if staged.resolved {
+		m.resolvedCommits++
+	}
+	m.rules = staged.rules
 	return nil
 }
 
-// UpdateResolvedBatch 模拟「事务 + commit 前钩子」语义，可注入两类故障：
-//
-//	failResolvedWrite  写解析列阶段失败（nft 尚未被改动）
-//	failResolvedCommit commit 阶段失败（nft 已是新状态，调用方必须回滚 nft）
-//
-// 事务性用「先在副本上改，commit 成功才写回」模拟：任何阶段失败都不留下部分更新。
-func (m *memStore) UpdateResolvedBatch(_ context.Context, ups []forward.ResolvedUpdate,
-	beforeCommit func() error) error {
-	m.mu.Lock()
-	if m.failResolvedWrite {
-		m.mu.Unlock()
-		return errors.New("disk I/O error")
-	}
-	// 校验目标规则都还在（与真实 SQL 的 WHERE id=? AND deleted=0 一致）。
-	staged := make([]forward.ResolvedUpdate, 0, len(ups))
-	for _, u := range ups {
-		if _, ok := m.rules[u.ID]; !ok {
-			m.mu.Unlock()
-			return fmt.Errorf("规则 %d 不存在或已删除", u.ID)
-		}
-		staged = append(staged, u)
-	}
-	m.mu.Unlock()
-
-	if beforeCommit != nil {
-		if err := beforeCommit(); err != nil {
-			return err // 回滚：什么都没写
-		}
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.failResolvedCommit {
-		return &forward.ErrCommitFailed{Err: errors.New("database is locked")}
-	}
-	for _, u := range staged {
-		r, ok := m.rules[u.ID]
-		if !ok {
-			continue
-		}
-		r.ResolvedV4, r.ResolvedV6, r.ResolvedAt = u.V4, u.V6, u.At
-		r.ResolveStatus, r.ResolveError = u.Status, u.Err
-	}
-	m.resolvedCommits++
-	return nil
+func (m *memStore) UpdateResolved(ctx context.Context, id int64, v4, v6 string, at int64, status, msg string) error {
+	return m.Transaction(ctx, func(tx forward.Mutation) error {
+		return tx.UpdateResolved(forward.ResolvedUpdate{ID: id, V4: v4, V6: v6, At: at, Status: status, Err: msg})
+	})
 }
 
 func (m *memStore) count() int {

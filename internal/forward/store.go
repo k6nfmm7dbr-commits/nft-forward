@@ -62,17 +62,24 @@ func (st *Store) CreateTx(ctx context.Context, tx *sql.Tx, r *Rule) (int64, erro
 	now := time.Now().Unix()
 	r.CreatedAt = now
 	r.UpdatedAt = now
+	// NULL lets SQLite allocate the ID for non-runtime callers. Runtime
+	// callers reserve an ID first so a rolled-back candidate's mark is never reused.
+	var idArg any
+	if r.ID != 0 {
+		idArg = r.ID
+	}
 	res, err := st.target(tx).ExecContext(ctx,
-		`INSERT INTO rules(name,enabled,protocol,listen_port,
-			target_address,target_port,created_at,updated_at,deleted,deleted_at,
-			quota_enabled,quota_limit_bytes,quota_reset_baseline,ip_limit_enabled,ip_limit_max,
-			resolved_ipv4,resolved_ipv6,resolved_at,resolve_status,resolve_error)
-			VALUES(?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?)`,
-		r.Name, b2i(r.Enabled), r.Protocol, r.ListenPort,
+		`INSERT INTO rules(id,name,enabled,protocol,listen_port,
+            target_address,target_port,created_at,updated_at,deleted,deleted_at,
+            quota_enabled,quota_limit_bytes,quota_reset_baseline,ip_limit_enabled,ip_limit_max,
+            resolved_ipv4,resolved_ipv6,resolved_at,resolve_status,resolve_error)
+            VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?)`,
+		idArg, r.Name, b2i(r.Enabled), r.Protocol, r.ListenPort,
 		r.TargetAddress, r.TargetPort, r.CreatedAt, r.UpdatedAt,
 		b2i(r.QuotaEnabled), r.QuotaLimitBytes, r.QuotaResetBaseline,
 		b2i(r.IPLimitEnabled), r.IPLimitMax,
 		r.ResolvedV4, r.ResolvedV6, r.ResolvedAt, r.ResolveStatus, r.ResolveError)
+
 	if err != nil {
 		return 0, err
 	}
@@ -107,106 +114,107 @@ func (st *Store) UpdateTx(ctx context.Context, tx *sql.Tx, r *Rule) error {
 	if err != nil {
 		return err
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("规则 %d 不存在或已删除", r.ID)
-	}
-	return nil
+	return requireAffected(res, r.ID)
 }
 
-// UpdateResolved 只更新运行时解析结果（不动用户配置字段、不刷新 updated_at）。
-//
-// 单独一条 SQL 的原因：DNS reconcile 高频运行，若走全量 Update 会把
-// updated_at 抬高并覆盖并发编辑写入的用户字段。
-func (st *Store) UpdateResolved(ctx context.Context, id int64, v4, v6 string, at int64, status, errMsg string) error {
-	res, err := st.db.ExecContext(ctx,
-		`UPDATE rules SET resolved_ipv4=?,resolved_ipv6=?,resolved_at=?,resolve_status=?,resolve_error=?
-		 WHERE id=? AND deleted=0`, v4, v6, at, status, errMsg, id)
+// ReserveID consumes an AUTOINCREMENT ID before it can be exposed to nft
+// (and potentially to conntrack). A crash or rollback may leave a harmless gap.
+func (st *Store) ReserveID(ctx context.Context) (int64, error) {
+	tx, err := st.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("规则 %d 不存在或已删除", id)
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO sqlite_sequence(name,seq)
+        SELECT 'rules',0 WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name='rules')`); err != nil {
+		return 0, err
 	}
-	return nil
+	var id int64
+	if err := tx.QueryRowContext(ctx, `UPDATE sqlite_sequence SET seq=max(seq,coalesce((SELECT max(id) FROM rules),0))+1
+        WHERE name='rules' AND seq < 4294967295 RETURNING seq`).Scan(&id); err != nil {
+		return 0, err
+	}
+	if id <= 0 || id > 4294967295 {
+		return 0, fmt.Errorf("规则 ID 超出 nft mark 范围: %d", id)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
-// ResolvedUpdate 是一条规则的解析状态更新（供批量事务写入）。
-type ResolvedUpdate struct {
-	ID     int64
-	V4     string
-	V6     string
-	At     int64
-	Status string
-	Err    string
+// Mutation is the uncommitted rule state plus the read view needed by policy.
+// SQLTx returns the same connection: policy must not wait on the single DB
+// connection held by this transaction while it reads quota totals.
+type Mutation interface {
+	Create(*Rule) error
+	Update(*Rule) error
+	SoftDelete(int64) error
+	UpdateResolved(ResolvedUpdate) error
+	SQLTx() *sql.Tx
 }
 
-// ErrCommitFailed 标记「事务提交阶段」失败。
-//
-// 为什么需要单独的类型：DNS 刷新是「先在事务里写 DB → 再 apply nft →
-// 最后 commit」。commit 失败时 nft **已经**是新状态，调用方必须把 nft 回滚；
-// 而 commit 之前的任何失败都还没碰过 nft（或已由 apply 自身回滚），
-// 两种情况的善后动作完全不同，必须能区分。
+type mutation struct {
+	ctx   context.Context
+	store *Store
+	tx    *sql.Tx
+}
+
+func (m mutation) Create(r *Rule) error      { _, err := m.store.CreateTx(m.ctx, m.tx, r); return err }
+func (m mutation) Update(r *Rule) error      { return m.store.UpdateTx(m.ctx, m.tx, r) }
+func (m mutation) SoftDelete(id int64) error { return m.store.SoftDeleteTx(m.ctx, m.tx, id) }
+func (m mutation) UpdateResolved(u ResolvedUpdate) error {
+	return m.store.updateResolved(m.ctx, m.tx, u)
+}
+func (m mutation) SQLTx() *sql.Tx { return m.tx }
+
+// ErrCommitFailed marks a commit error after the callback ran. Its outcome
+// must be checked from the authoritative, committed rule state.
 type ErrCommitFailed struct{ Err error }
 
 func (e *ErrCommitFailed) Error() string { return "事务提交失败: " + e.Err.Error() }
 func (e *ErrCommitFailed) Unwrap() error { return e.Err }
 
-// UpdateResolvedBatch 在**单个 SQLite 事务**里批量写入解析状态，
-// 并在 commit 之前调用 beforeCommit（通常是「把候选规则集应用到 nft」）。
-//
-// 执行顺序与失败语义：
-//
-//  1. BEGIN
-//  2. 逐条 UPDATE 解析列（任一失败 → ROLLBACK，返回普通 error；nft 未被改动）
-//  3. beforeCommit()（失败 → ROLLBACK，返回普通 error）
-//  4. COMMIT（失败 → 返回 *ErrCommitFailed，调用方必须回滚 nft）
-//
-// 这样「DB 与 nft 要么都成功，要么都回滚」的原则也覆盖后台 DNS 刷新 ——
-// 旧实现是「先 apply nft，再逐条写库，写失败只打 warning」，会留下
-// 「nft 用新地址、DB 记旧地址」的长期不一致。
-//
-// beforeCommit 为 nil 时退化为纯批量写入。
-func (st *Store) UpdateResolvedBatch(ctx context.Context, ups []ResolvedUpdate, beforeCommit func() error) error {
-	if len(ups) == 0 {
-		if beforeCommit != nil {
-			return beforeCommit()
-		}
-		return nil
-	}
+func (st *Store) Transaction(ctx context.Context, edit func(Mutation) error) error {
 	tx, err := st.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("开启事务失败: %w", err)
 	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-
-	for _, u := range ups {
-		res, err := tx.ExecContext(ctx,
-			`UPDATE rules SET resolved_ipv4=?,resolved_ipv6=?,resolved_at=?,resolve_status=?,resolve_error=?
-			 WHERE id=? AND deleted=0`,
-			u.V4, u.V6, u.At, u.Status, u.Err, u.ID)
-		if err != nil {
-			return fmt.Errorf("写入规则 %d 解析状态失败: %w", u.ID, err)
-		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			return fmt.Errorf("规则 %d 不存在或已删除", u.ID)
-		}
-	}
-
-	if beforeCommit != nil {
-		if err := beforeCommit(); err != nil {
-			return err
-		}
+	defer tx.Rollback()
+	if err := edit(mutation{ctx: ctx, store: st, tx: tx}); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return &ErrCommitFailed{Err: err}
 	}
-	committed = true
+	return nil
+}
+
+// ResolvedUpdate changes only an existing rule's observed DNS state.
+type ResolvedUpdate struct {
+	ID          int64
+	V4, V6      string
+	At          int64
+	Status, Err string
+}
+
+func (st *Store) updateResolved(ctx context.Context, tx *sql.Tx, u ResolvedUpdate) error {
+	res, err := st.target(tx).ExecContext(ctx, `UPDATE rules SET resolved_ipv4=?,resolved_ipv6=?,resolved_at=?,resolve_status=?,resolve_error=? WHERE id=? AND deleted=0`,
+		u.V4, u.V6, u.At, u.Status, u.Err, u.ID)
+	if err != nil {
+		return err
+	}
+	return requireAffected(res, u.ID)
+}
+
+func requireAffected(res sql.Result, id int64) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("规则 %d 不存在或已删除", id)
+	}
 	return nil
 }
 
@@ -223,21 +231,7 @@ func (st *Store) SoftDeleteTx(ctx context.Context, tx *sql.Tx, id int64) error {
 	if err != nil {
 		return err
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("规则 %d 不存在或已删除", id)
-	}
-	return nil
-}
-
-// HardDelete 物理删除一行。
-//
-// **唯一使用场景**：规则刚插入但 nft 应用失败，需要撤销这次创建。
-// 此时该规则不可能有任何历史流量（counter 尚未创建，totals/daily 无记录），
-// 因此物理删除是干净的。用户主动删除规则一律走 SoftDelete 以保留历史统计。
-func (st *Store) HardDelete(ctx context.Context, id int64) error {
-	_, err := st.db.ExecContext(ctx, `DELETE FROM rules WHERE id=?`, id)
-	return err
+	return requireAffected(res, id)
 }
 
 // Get 按 ID 读取（不含已删除）。

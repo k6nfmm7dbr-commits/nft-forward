@@ -104,7 +104,7 @@ nocomment "$ROOT/internal/nft/clear.go" | grep -qE 'nff_nat4|TableNAT4'; ck "cle
 if nocomment "$ROOT/internal/nft/clear.go" | grep -q 'flush'; then rc=1; else rc=0; fi
 ck "clear 不使用 flush" 0 "$rc"
 grep -q 'HasPrefix(name, TableFilter' "$ROOT/internal/nft/engine.go"; ck "遗留对象清理限定自有前缀" 0 $?
-grep -q '"nft", "-c", "-f"' "$ROOT/internal/nft/apply.go"; ck "应用前 nft -c 干跑检查" 0 $?
+grep -q 'runBatch(ctx, runner, "检查", "-c", "-f"' "$ROOT/internal/nft/apply.go"; ck "应用前 nft -c 干跑检查" 0 $?
 
 # ---- C2. 完整 Desired State 自愈 ----
 grep -q 'func DesiredObjects' "$ROOT/internal/nft/desired.go"; ck "存在 Desired State 定义" 0 $?
@@ -169,7 +169,7 @@ for m in 'store.Create' 'store.Update(' 'store.SoftDelete' 'store.HardDelete' 'n
 done
 grep -q 's.rules.Create' "$ROOT/internal/api/rules.go"; ck "创建规则走 rulesvc" 0 $?
 grep -q 's.rules.UpdatePolicy' "$ROOT/internal/api/rules.go"; ck "配额/IP 限制走 rulesvc" 0 $?
-grep -q 'applyWithRollback' "$ROOT/internal/rulesvc/service.go"; ck "rulesvc 失败双向回滚" 0 $?
+rg -q 'committed, rerr := s.store.ListActive\(rctx\)' "$ROOT/internal/rulesvc/service.go" && rg -q 's.enforcer.ApplyRules\(rctx, committed\)' "$ROOT/internal/rulesvc/service.go"; ck "rulesvc 失败后从已提交状态恢复" 0 $?
 grep -q 'hold()' "$ROOT/internal/rulesvc/service.go"; ck "rulesvc 与周期 reconcile 互斥" 0 $?
 
 # ---- G. 无 Git Tag 依赖 ----
@@ -326,7 +326,7 @@ ck "已移除 per-rule QueryRow" 0 "$rc"
 grep -q 'placeholders(' "$ROOT/internal/api/handlers.go"; ck "批量查询用参数占位符（无拼接注入）" 0 $?
 grep -q 'dnsConcurrency' "$ROOT/internal/rulesvc/service.go"; ck "DNS 刷新有并发上限" 0 $?
 grep -q 's.mu.Unlock()' "$ROOT/internal/rulesvc/service.go"; ck "RefreshDNS 分段释放锁" 0 $?
-grep -q '丢弃过期 DNS 解析结果' "$ROOT/internal/rulesvc/service.go"; ck "过期 DNS 结果被丢弃" 0 $?
+rg -Fq '!ok || *cur != *res.original' "$ROOT/internal/rulesvc/service.go"; ck "过期 DNS 结果被丢弃" 0 $?
 grep -q 'func (c \*Collector) LiveSnapshot' "$ROOT/internal/traffic/collector.go"; ck "collector 暴露实时快照" 0 $?
 grep -q 'live.Used(' "$ROOT/internal/policy/service.go"; ck "配额使用实时用量" 0 $?
 grep -q 'func (s \*Service) allLifetimeBytes' "$ROOT/internal/policy/service.go"; ck "配额兜底路径批量读库" 0 $?
@@ -378,8 +378,8 @@ for item in SQLite nftables 'nft netlink' 'owned tables' ip_forward conntrack ct
 done
 if printf '%s' "$SELFTEST" | grep -qE 'cfg\.SysctlConf|panel\.json|"/etc/'; then rc=1; else rc=0; fi
 ck "自检正常输出不打印文件路径" 0 "$rc"
-# cfg.DB 只允许出现在 database.Open 调用里（打开库必须用路径），不得作为展示文本
-if printf '%s' "$SELFTEST" | grep 'cfg.DB' | grep -qv 'database.Open'; then rc=1; else rc=0; fi
+# The read-only database probe may use the path, but successful output must not.
+if printf '%s' "$SELFTEST" | rg 'cfg\.DB' | rg -qv 'checkDatabase\(cfg\.DB\)'; then rc=1; else rc=0; fi
 ck "自检不把数据库路径作为展示文本" 0 "$rc"
 if grep -q '"\$CORE_BIN" panel-info' "$ROOT/install.sh"; then rc=0; else rc=1; fi
 ck "安装器复用 panel-info 输出" 0 "$rc"

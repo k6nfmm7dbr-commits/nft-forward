@@ -58,9 +58,22 @@ SQLite     = 永久统计与配置持久化
 
 ## 安装
 
+在支持 nftables 的 Linux 上安装，需要 root 权限。以下命令需要 Bash、Git、curl 和 `sha256sum`。在空目录里执行；已是 root 时可以去掉 `sudo`。
+
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/k6nfmm7dbr-commits/nft-forward/main/install.sh)
+repo=k6nfmm7dbr-commits/nft-forward
+rev=$(git ls-remote "https://github.com/$repo.git" refs/heads/dist | cut -f1)
+[[ "$rev" =~ ^[0-9a-f]{40}$ ]] &&
+  base="https://raw.githubusercontent.com/$repo/$rev" &&
+  curl -fsSLO "$base/install.sh" &&
+  curl -fsSLO "$base/install.sh.sha256" &&
+  sha256sum -c install.sh.sha256 &&
+  sudo env NFF_DIST_SHA="$rev" bash install.sh
 ```
+
+升级时，已使用新版安装器的机器运行 `sudo nff --update`。首次从旧版迁移时，按上面的方法下载并校验新版安装器，把最后一行改为 `sudo env NFF_DIST_SHA="$rev" bash install.sh --update`。不要先覆盖原脚本，也不要用旧 `nff --update` 执行这次迁移。
+
+升级保留转发规则、SQLite 历史、令牌、端口和入口路径；正在运行的服务可能短暂中断。若报告回滚未完成，保留 `/etc/nft-forward/.install-transaction`，不要删除备份后直接重试。安装快照不覆盖 SQLite/WAL，不替代数据库备份。
 
 安装结束时屏幕会打印两行，请完整保存：
 
@@ -122,7 +135,7 @@ nff --uninstall      # 卸载
 
 ## 设计要点
 
-**所有规则变更走同一个入口。** 规则 CRUD、配额、IP 限制、DNS 更新都经过 `internal/rulesvc`：candidate → 校验 → 解析 → 冲突检查 → `nft -c` 干跑 → 应用 → DB 提交，任一步失败双向回滚。因此「API 返回成功」严格等价于「数据库与 nftables 一致」。
+**规则修改**先在 SQLite 事务中暂存，再用 `nft -c` 检查候选规则。结构和策略元素在同一个 nft 批次里应用，然后提交数据库。失败后按数据库中已提交的规则恢复；如果恢复也失败，会报错并取消数据面就绪状态。
 
 **nft 同步分两层，这是流量统计正确性的关键。** named counter 是 nftables 的表级对象，销毁重建表会连同累计字节一起清零。策略 reconcile 是 500ms 周期的，如果每轮都重建表，counter 会被反复清零、绝大部分流量丢失。因此：
 
@@ -140,7 +153,7 @@ nff --uninstall      # 卸载
 
 **每条 DNAT 都带 `fib daddr type local`。** 规则没有监听地址，若直接写 `tcp dport 5000 dnat to ...`，那么当这台机器同时承担路由/网关职责时，仅仅经过本机（目的地址是别人）的同端口流量也会被劫持。`fib daddr type local` 让规则只匹配「目的地址属于本机」的包，等价于「监听本机所有本地地址」，同时不误伤 transit 流量。
 
-**`/healthz` 的 200 代表数据面已就绪，不只是「HTTP 活着」。** 进程启动顺序是「先绑定 HTTP → 再做首轮 nft enforcement」：绑定后 `/healthz` 能立刻应答，但在首轮 enforcement 成功之前返回 **503**。因此安装器与升级器的健康确认不会把「面板能应答、systemd active，但转发规则根本没加载」当成成功。首轮 enforcement 带重试（开机早期 nftables 模块可能尚未就绪），仍失败则保持 503 并由周期 reconcile 继续尝试。运行期偶发的 reconcile 失败属于 degraded，不会把 `/healthz` 打成 503（否则 systemd 会反复重启整个服务）。conntrack 不可用**不影响** readiness —— 结构 enforcement 不依赖它，只有 IP slot 进入冻结。
+**`/healthz` 的 200 代表数据面已就绪。** 启动时先占用面板端口，加载已保存规则、应用 nft 并保存有效配置后才开始服务 HTTP。首轮 enforcement 在限时内仍失败则退出；运行中策略同步失败时 `/healthz` 返回 503，恢复后重回 200。conntrack 不可用只冻结 IP slot，不妨碍结构 enforcement。
 
 **结构 enforcement 与 IP Slot enforcement 彻底解耦。** 两者对 conntrack 的依赖完全不同：
 
@@ -185,8 +198,8 @@ conntrack 的状态被显式分成四种，只有第一种允许做在线判定�
 - 所有 nft 变更先 `nft -c -f` 干跑检查，通过后才 `nft -f` 应用；失败不写入成功状态。
 - 配置写入是原子的（tmp → fsync → chmod 0600 → rename → fsync 目录）；配置损坏时 fail-closed，绝不用默认值覆盖，也绝不因此重置令牌/端口/入口路径。
 - 首次安装若服务启动或健康确认未通过：退出码非 0、不打印「安装完成」、保留现场供排错。健康确认包含数据面 —— `/healthz` 在首轮 nft enforcement 成功前返回 503。
-- 后台 DNS 刷新与规则 CRUD 一样是事务化的：DB 与 nft 要么都成功，要么都回滚。
-- 升级是事务化的：备份旧二进制与 `panel.json` → 下载 → SHA256 校验 → 架构与版本自检 → 原子替换 → 配置迁移 → 重启 → systemd active → localhost `/healthz` → `selftest`，**全部通过后**才删除备份。任一步失败即恢复旧二进制与旧配置、重启旧服务并再次验证；确认恢复成功才提示「已回滚」，回滚失败会明确报错。
+- 后台 DNS 刷新和规则修改共用事务；失败时按已提交的数据库状态恢复，再次失败则明确报错。
+- 新安装器从固定提交下载并校验文件，确认 `/healthz` 和自检通过后才完成升级。安装和服务状态回滚未确认时保留备份。
 - 升级保留：转发规则、流量历史、访问令牌、随机面板端口、随机入口路径及其它用户设置。数据库迁移只 `ADD COLUMN`，不 DROP、不重建表。
 - 卸载只删自有表与自有文件，数据目录需显式确认才删。
 
