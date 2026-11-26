@@ -7,6 +7,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -29,19 +31,7 @@ func runCmd(name string, args ...string) {
 	}
 }
 
-// runUpdate 把在线升级交给安装器脚本执行。
-//
-// 升级逻辑（下载校验、原子替换、失败回滚）全部在 install.sh 里，Go 侧只做
-// 转发：正在运行的二进制不能安全地覆盖自己，由外部脚本替换才可靠。
-func runUpdate() {
-	self := "/etc/nft-forward/nft-forward.sh"
-	if _, err := os.Stat(self); err == nil {
-		runCmd("bash", self, "--update")
-		return
-	}
-	fmt.Println("未找到安装器脚本，请运行一键安装命令完成升级:")
-	fmt.Println("  bash <(curl -fsSL https://raw.githubusercontent.com/k6nfmm7dbr-commits/nft-forward/main/install.sh)")
-}
+const installedMenuScript = "/etc/nft-forward/nft-forward.sh"
 
 func runClear() int {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -60,27 +50,51 @@ func runClear() int {
 	return 0
 }
 
-// panelInfo 打印用户真正需要的两行：面板地址与访问令牌。
-//
-// 刻意 **不打印** 配置文件路径、数据库路径、sysctl 路径、安装目录 ——
-// 那些是实现细节，用户运维不需要，写在屏幕上只会增加令牌所在位置的暴露面。
+// panelInfo 打印用户真正需要的两行，不暴露配置等文件的位置。
 func panelInfo() int {
+	return printPanel(os.Stdout, os.Stderr, publicIP, true)
+}
+
+func panelURL() int {
+	return printPanel(os.Stdout, os.Stderr, publicIP, false)
+}
+
+func printPanel(stdout, stderr io.Writer, discoverIP func() string, withToken bool) int {
 	c, err := config.LoadStrict()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "读取配置失败:", err)
+		fmt.Fprintln(stderr, "读取配置失败:", err)
 		return 1
 	}
-	if c.Port == 0 || c.Token == "" || c.EntryPath == "" {
-		fmt.Fprintln(os.Stderr, "面板尚未完成初始化，请重新运行安装脚本")
+	if c.Port == 0 || c.EntryPath == "" || (withToken && c.Token == "") {
+		fmt.Fprintln(stderr, "面板尚未完成初始化，请重新运行安装脚本")
 		return 1
 	}
-	host := publicIP()
-	if host == "" {
-		host = "<本机IP>"
+	address := buildPanelURL(c.Listen, c.Port, c.EntryRoute(), discoverIP)
+	if withToken {
+		fmt.Fprintln(stdout, "面板地址:", address)
+		fmt.Fprintln(stdout, "访问令牌:", c.Token)
+	} else {
+		fmt.Fprintln(stdout, address)
 	}
-	fmt.Printf("面板地址: http://%s:%d%s/\n", host, c.Port, c.EntryRoute())
-	fmt.Printf("访问令牌: %s\n", c.Token)
 	return 0
+}
+
+func buildPanelURL(listen string, port int, entryRoute string, discoverIP func() string) string {
+	host := listen
+	ip, _ := netip.ParseAddr(listen)
+	if listen == "" || ip.Unmap().IsUnspecified() {
+		// Preserve hostname -I discovery for wildcard binds only; use loopback
+		// of the appropriate family if discovery fails.
+		host = "127.0.0.1"
+		if ip.Unmap().Is6() {
+			host = "::1"
+		}
+		if discovered, err := netip.ParseAddr(discoverIP()); err == nil && !discovered.Unmap().IsUnspecified() {
+			host = discovered.String()
+		}
+	}
+	u := url.URL{Scheme: "http", Host: net.JoinHostPort(host, strconv.Itoa(port)), Path: entryRoute + "/"}
+	return u.String()
 }
 
 // selfTest 输出各子系统状态。
@@ -288,7 +302,39 @@ func mustRead(path string) []byte {
 	return b
 }
 
-func menu() {
+func menu() int {
+	// The installed script owns the menu (including platform-specific service
+	// management). A binary using a custom config should not open the system menu.
+	if config.AppDir() == "/etc/nft-forward" && config.ConfPath() == "/etc/nft-forward/panel.json" && os.Getenv("NFF_ROOT") == "" {
+		if status, handled := runInstalledMenu(installedMenuScript, os.Stdin, os.Stdout, os.Stderr); handled {
+			return status
+		}
+	}
+	standaloneMenu()
+	return 0
+}
+
+func runInstalledMenu(script string, stdin io.Reader, stdout, stderr io.Writer) (int, bool) {
+	if _, err := os.Stat(script); err != nil {
+		if os.IsNotExist(err) {
+			return 0, false
+		}
+		fmt.Fprintln(stderr, "无法检查已安装的管理脚本:", err)
+		return 1, true
+	}
+	cmd := exec.Command(script)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
+	if err := cmd.Run(); err != nil {
+		if e, ok := err.(*exec.ExitError); ok && e.ExitCode() >= 0 {
+			return e.ExitCode(), true
+		}
+		fmt.Fprintln(stderr, "无法运行已安装的管理脚本:", err)
+		return 1, true
+	}
+	return 0, true
+}
+
+func standaloneMenu() {
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Println()
@@ -307,7 +353,10 @@ func menu() {
 		fmt.Println("  0. 退出")
 		fmt.Println("━━━━━━━━━━━━━━━━━━━━")
 		fmt.Print("请选择: ")
-		line, _ := reader.ReadString('\n')
+		line, err := reader.ReadString('\n')
+		if len(line) == 0 && err != nil {
+			return
+		}
 		choice := strings.TrimSpace(line)
 		switch choice {
 		case "1":
@@ -323,7 +372,7 @@ func menu() {
 		case "6":
 			_ = panelInfo()
 		case "7":
-			runUpdate()
+			fmt.Println("未使用已安装的管理菜单。请按项目 README 下载并校验发行版安装脚本后再升级。")
 		case "8":
 			selfTest()
 		case "a", "A":

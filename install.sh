@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NFT Forward — nftables 端口转发 + 流量监控面板
-#  一键安装:  bash <(curl -fsSL https://raw.githubusercontent.com/k6nfmm7dbr-commits/nft-forward/main/install.sh)
+#  安装:  按仓库 README 下载并校验安装脚本
 #  管理命令:  nff
 #
 #  安全承诺（不可妥协）：
@@ -16,7 +16,6 @@ APP_NAME="NFT Forward"
 APP_VERSION="0.4.0"
 REPO="k6nfmm7dbr-commits/nft-forward"
 OFFICIAL_RAW="https://raw.githubusercontent.com/$REPO"
-RAW_URL="${NFF_RAW_URL:-$OFFICIAL_RAW/main/install.sh}" # help/bootstrap hint only
 RAW_BASE="${NFF_RAW_BASE:-}" # optional binary mirror, never a trust source
 GH_PROXY="${NFF_GH_PROXY:-}"
 ROOT="${NFF_ROOT:-}"
@@ -523,7 +522,7 @@ change_panel_port() {  # change_panel_port <新端口>
   # 3-4) 重启 + 三重确认 + 确认新端口真的在监听
   if start_service && port_listening "$newp"; then
     ok "面板端口已改为 $newp"
-    show_panel_info
+    panel_url || warn "面板地址暂不可用，请运行 nff --panel-url"
     return 0
   fi
 
@@ -561,33 +560,15 @@ port_listening() {  # port_listening <端口>
 }
 # <<< change-port
 
-panel_url() {
-  local host port entry
-  host=$(hostname -I 2>/dev/null | awk '{print $1}')
-  [[ -z "$host" ]] && host="127.0.0.1"
-  port=$(panel_get port) || return 1
-  entry=$(panel_get entry_path) || return 1
-  [[ -z "$port" || -z "$entry" ]] && { echo "（面板尚未初始化）"; return 0; }
-  echo "http://${host}:${port}/${entry}/"
-}
+panel_url() { installed_core panel-url; }
 
-# show_panel_info 只显示用户真正需要的两行：面板地址 + 访问令牌。
-#
-# 刻意不打印配置文件 / 数据库 / sysctl / 安装目录路径 —— 那些是实现细节，
-# 写在屏幕上只会告诉旁观者「令牌存在哪个文件」。
 show_panel_info() {
-  printf '%s面板信息%s\n' "$C_B" "$C_RESET"
   local text
-  if [[ -x "$CORE_BIN" ]] && text=$(NFT_FORWARD_DIR="$APP_DIR" NFT_FORWARD_CONF="$PANEL_CONF" bounded 35 "$CORE_BIN" panel-info); then
-    while IFS= read -r line; do
-      printf '  %s%s%s\n' "$C_CYAN" "$line" "$C_RESET"
-    done <<< "$text"
-    return 0
-  fi
-  printf '  地址: %s%s%s\n' "$C_CYAN" "$(panel_url)" "$C_RESET"
-  local token
-  token=$(panel_get token) || return 1
-  [[ -n "$token" ]] && printf '  访问令牌: %s%s%s\n' "$C_CYAN" "$token" "$C_RESET"
+  text=$(installed_core panel-info) || return 1
+  printf '%s面板信息%s\n' "$C_B" "$C_RESET"
+  while IFS= read -r line; do
+    printf '  %s%s%s\n' "$C_CYAN" "$line" "$C_RESET"
+  done <<< "$text"
 }
 
 # ---------------------------------------------------------------- Installer transaction
@@ -943,15 +924,44 @@ menu_service() {
   done
 }
 
+change_panel_setting() { # listen or interval; existing credentials are untouched
+  local key="$1" value="$2" old active
+  case "$key" in
+    listen) [[ "$value" == '127.0.0.1' || "$value" == '0.0.0.0' ]] || return 1 ;;
+    interval)
+      if [[ ! "$value" =~ ^([1-9]|[1-5][0-9]|60)$ ]]; then warn "请输入 1–60 秒"; return 1; fi ;;
+    *) return 1 ;;
+  esac
+  [[ "$INIT_SYS" != none && ! -e "$APP_DIR/.install-transaction" ]] || { err "当前不能修改运行配置"; return 1; }
+  old=$(panel_get "$key") && [[ -n "$old" ]] && service_inventory || { err "无法确认原配置或服务状态"; return 1; }
+  active=$SERVICE_ACTIVE
+  if [[ "$old" == "$value" ]]; then info "设置未变更"; return 0; fi
+  panel_set "$key" "$value" || { err "未能保存设置"; return 1; }
+  if [[ "$active" == 0 ]] || start_service; then
+    ok "设置已保存"
+    if [[ "$key" == listen && "$value" == '0.0.0.0' ]]; then
+      warn "面板已监听全部 IPv4 地址；不要将明文 HTTP 面板直接开放到公网"
+    fi
+    return 0
+  fi
+  if panel_set "$key" "$old" && start_service; then
+    err "新设置未通过健康检查，已恢复原设置"
+  else
+    err "无法确认原设置已恢复，请检查面板和服务状态"
+  fi
+  return 1
+}
+
 menu_panel() {
   while :; do
     banner
-    printf '%s面板设置%s\n\n' "$C_B" "$C_RESET"
+    printf '%s面板设置与统计维护%s\n\n' "$C_B" "$C_RESET"
     printf '  端口: %s    监听: %s    采集间隔: %ss\n\n' \
       "$(panel_get port)" "$(panel_get listen)" "$(panel_get interval)"
     echo "  1) 修改面板端口"
-    echo "  2) 切换监听范围（全部 / 仅本机）"
-    echo "  3) 自检"
+    echo "  2) 修改采集间隔"
+    echo "  3) 切换监听范围（全部 / 仅本机）"
+    echo "  4) 运行统计自检"
     echo "  0) 返回"
     echo
     printf '请选择: '
@@ -961,18 +971,41 @@ menu_panel() {
          local p=""; read -r p || true
          change_panel_port "$p" || :
          pause ;;
-      2) local cur
-         if [[ "$INIT_SYS" == none || -e "$APP_DIR/.install-transaction" ]]; then
-           warn "当前不能修改运行配置"; pause; continue
-         fi
-         cur=$(panel_get listen)
-         if [[ "$cur" == "127.0.0.1" ]]; then
-           panel_set listen "0.0.0.0" && ok "已切换为监听全部地址"
-         else
-           panel_set listen "127.0.0.1" && ok "已切换为仅本机访问"
-         fi
-         start_service || err "服务重启后健康检查未通过"; pause ;;
-      3) hr; runtime_core selftest || :; hr; pause ;;
+      2) printf '采集间隔 (1-60 秒): '
+         local n=""; read -r n || true
+         change_panel_setting interval "$n" || :
+         pause ;;
+      3) local cur next
+         if cur=$(panel_get listen); then
+           case "$cur" in
+             127.*|localhost|::1|'[::1]') next=0.0.0.0 ;;
+             *) next=127.0.0.1 ;;
+           esac
+           change_panel_setting listen "$next" || :
+         else err "无法读取当前监听地址"; fi
+         pause ;;
+      4) hr; runtime_core selftest || :; hr; pause ;;
+      0|"") return 0 ;;
+      *) warn "无效选择" ;;
+    esac
+  done
+}
+
+menu_settings() {
+  while :; do
+    banner
+    printf '%s系统设置与运维%s\n\n' "$C_B" "$C_RESET"
+    echo "  1) 面板设置与统计维护"
+    echo "  2) 查看面板信息（地址与令牌）"
+    echo "  3) 服务管理"
+    echo "  0) 返回"
+    echo
+    printf '请选择: '
+    local c=""; read -r c || true
+    case "$c" in
+      1) menu_panel ;;
+      2) banner; show_panel_info || warn "面板信息暂不可用"; echo; pause ;;
+      3) menu_service ;;
       0|"") return 0 ;;
       *) warn "无效选择" ;;
     esac
@@ -985,25 +1018,20 @@ main_menu() {
     printf '  面板: %s    %sv%s%s\n' \
       "$(panel_running && echo "${C_GREEN}●${C_RESET} 运行中" || echo "${C_RED}●${C_RESET} 已停止")" \
       "$C_DIM" "$APP_VERSION" "$C_RESET"
-    printf '  地址: %s%s%s\n\n' "$C_CYAN" "$(panel_url)" "$C_RESET"
-    printf '  %s转发规则的增删改查请在 Web 面板操作%s\n\n' "$C_DIM" "$C_RESET"
-    echo "  1) 面板信息（地址 + 访问令牌）"
-    echo "  2) 面板设置"
-    echo "  3) 服务管理"
-    echo "  4) 自检"
-    echo "  5) 检查更新"
-    echo "  6) 卸载"
+    local url
+    url=$(panel_url 2>/dev/null) || url='（面板地址不可用）'
+    printf '  面板: %s%s%s\n\n' "$C_CYAN" "$url" "$C_RESET"
+    echo "  1) 系统设置与运维"
+    echo "  2) 检查更新"
+    echo "  3) 卸载"
     echo "  0) 退出"
     echo
     printf '请选择: '
     local c=""; read -r c || true
     case "$c" in
-      1) banner; show_panel_info; echo; pause ;;
-      2) menu_panel ;;
-      3) menu_service ;;
-      4) banner; hr; runtime_core selftest || :; hr; pause ;;
-      5) do_update || :; pause ;;
-      6) uninstall_all || :; pause ;;
+      1) menu_settings ;;
+      2) do_update || :; pause ;;
+      3) uninstall_all || :; pause ;;
       0|"") clear 2>/dev/null || true; exit 0 ;;
       *) warn "无效选择"; sleep 1 ;;
     esac
@@ -1044,7 +1072,7 @@ main() {
       cat <<EOF
 $APP_NAME v$APP_VERSION — nftables 端口转发 + 流量监控面板（Go 单二进制）
 
-安装:   bash <(curl -fsSL $RAW_URL)
+安装:   https://github.com/$REPO#安装（先下载并校验）
 菜单:   nff
 用法:   nff [选项]
 

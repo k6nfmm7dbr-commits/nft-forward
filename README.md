@@ -82,7 +82,7 @@ rev=$(git ls-remote "https://github.com/$repo.git" refs/heads/dist | cut -f1)
 访问令牌: <32 位十六进制>
 ```
 
-之后随时运行 `nff` 打开菜单，选「查看面板信息」可再次显示这两行。
+之后运行 `nff`，在「系统设置与运维 → 查看面板信息」可以再看地址和令牌。只查看地址用 `nff --panel-url`。升级不更换已有令牌。
 
 常用命令：
 

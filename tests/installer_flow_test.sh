@@ -400,6 +400,76 @@ printf '%s\n' "$REF" > "$FAKE/ref"
 check 'new attempts cannot overwrite retained backup' not run --update
 check 'backup remains after second attempt' test -s "$TX/snapshot/0"
 
+# Exercise the real SSH menu functions with fake config/service calls only.
+check_menu() (
+  # shellcheck source=../install.sh
+  source "$TPL"
+  init_colors
+  banner() { :; }
+  pause() { :; }
+  clear() { :; }
+  panel_running() { return 0; }
+  installed_core() {
+    case "$*" in
+      panel-url) printf '%s\n' 'http://127.0.0.1:19191/test/' ;;
+      panel-info) printf '%s\n' '面板地址: http://127.0.0.1:19191/test/' '访问令牌: test-only-token' ;;
+      *) return 1 ;;
+    esac
+  }
+  local_menu_out=$(main_menu <<< '0') || return 1
+  [[ "$local_menu_out" == *'1) 系统设置与运维'* && "$local_menu_out" == *'2) 检查更新'* && "$local_menu_out" == *'3) 卸载'* ]] || return 1
+  [[ "$local_menu_out" == *'http://127.0.0.1:19191/test/'* && "$local_menu_out" != *'test-only-token'* ]] || return 1
+  info_out=$(main_menu <<< $'1\n2\n0\n0') || return 1
+  [[ "$info_out" == *'访问令牌: test-only-token'* ]] || return 1
+  install_out=$(do_install_noninteractive) || return 1
+  [[ "$install_out" == *'访问令牌: test-only-token'* && "$install_out" == *'运行 nff 打开管理菜单'* ]]
+)
+do_install_noninteractive() (
+  ROOT=''
+  unset NFF_NO_SERVICE
+  release_operation() { [[ "$1" == install ]]; }
+  do_install </dev/null
+)
+check 'SSH main menu shows URL; explicit panel info and successful install show token' check_menu
+
+check_menu_settings() (
+  # shellcheck source=../install.sh
+  source "$TPL"
+  init_colors
+  APP_DIR="$WORK/unused-menu-app"
+  INIT_SYS=systemd
+  current_listen=0.0.0.0
+  current_interval=2
+  mock_active=1
+  restarts=0
+  failure=1
+  panel_get() {
+    case "$1" in
+      listen) printf '%s\n' "$current_listen" ;;
+      interval) printf '%s\n' "$current_interval" ;;
+      *) return 1 ;;
+    esac
+  }
+  service_inventory() { SERVICE_ACTIVE=$mock_active; }
+  panel_set() {
+    case "$1" in
+      listen) current_listen=$2 ;;
+      interval) current_interval=$2 ;;
+      *) return 1 ;;
+    esac
+  }
+  start_service() { restarts=$((restarts+1)); ((restarts != failure)); }
+  if change_panel_setting interval 5; then return 1; fi
+  [[ "$current_interval" == 2 && "$restarts" == 2 ]] || return 1
+  change_panel_setting listen 127.0.0.1 || return 1
+  [[ "$current_listen" == 127.0.0.1 && "$restarts" == 3 ]] || return 1
+  if change_panel_setting interval 61; then return 1; fi
+  mock_active=0
+  change_panel_setting interval 10 || return 1
+  [[ "$current_interval" == 10 && "$restarts" == 3 ]]
+)
+check 'panel settings verify health, restore on failure, and preserve stopped state' check_menu_settings
+
 # Keep firewall, sysctl, and version guardrails independent from subprocess mocks.
 CODE="$WORK/code"
 sed -e 's/#.*$//' -e 's/"[^"]*"//g' -e "s/'[^']*'//g" "$TPL" > "$CODE"

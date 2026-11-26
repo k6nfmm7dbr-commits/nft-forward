@@ -362,15 +362,15 @@ if awk '/^start_service\(\)/{seen_start=1} /rm -f "\$CORE_BIN.bak"/{if(!seen_sta
 ck "旧二进制备份不在替换后立即删除" 0 "$rc"
 
 # ---- N. 菜单极简 ----
-MENU=$(sed -n '/func menu()/,/^}/p' "$ROOT/cmd/nft-forward/ops.go")
-if printf '%s' "$MENU" | grep -qE '配置文件|数据库位于|sysctl|安装目录|程序目录|Web Root|/etc/'; then rc=1; else rc=0; fi
+MENU=$(rg -A 24 '^main_menu\(\)' "$ROOT/install.sh")
+if printf '%s' "$MENU" | rg -q '配置文件|数据库位于|sysctl|安装目录|程序目录|Web Root|/etc/'; then rc=1; else rc=0; fi
 ck "nff 菜单不显示配置/数据库/sysctl 路径" 0 "$rc"
-printf '%s' "$MENU" | grep -q '查看面板信息'; ck "菜单项为「查看面板信息」" 0 $?
-grep -q 'func panelInfo' "$ROOT/cmd/nft-forward/ops.go"; ck "存在 panel-info 输出" 0 $?
-PINFO=$(sed -n '/^func panelInfo/,/^}/p' "$ROOT/cmd/nft-forward/ops.go")
-printf '%s' "$PINFO" | grep -q '面板地址'; ck "面板信息含面板地址" 0 $?
-printf '%s' "$PINFO" | grep -q '访问令牌'; ck "面板信息含访问令牌" 0 $?
-if printf '%s' "$PINFO" | grep -qE 'panel.json|/etc/'; then rc=1; else rc=0; fi
+rg -q '查看面板信息' "$ROOT/install.sh"; ck "菜单项为「查看面板信息」" 0 $?
+rg -q '^func panelInfo' "$ROOT/cmd/nft-forward/ops.go"; ck "存在 panel-info 输出" 0 $?
+PINFO=$(rg -A 20 '^func printPanel\(' "$ROOT/cmd/nft-forward/ops.go")
+printf '%s' "$PINFO" | rg -q '面板地址'; ck "面板信息含面板地址" 0 $?
+printf '%s' "$PINFO" | rg -q '访问令牌'; ck "面板信息含访问令牌" 0 $?
+if printf '%s' "$PINFO" | rg -q 'panel.json|/etc/'; then rc=1; else rc=0; fi
 ck "面板信息不暴露令牌存储路径" 0 "$rc"
 SELFTEST=$(sed -n '/^func selfTest/,/^}/p' "$ROOT/cmd/nft-forward/ops.go")
 for item in SQLite nftables 'nft netlink' 'owned tables' ip_forward conntrack ct_acct 'web server' authentication; do
@@ -381,7 +381,7 @@ ck "自检正常输出不打印文件路径" 0 "$rc"
 # The read-only database probe may use the path, but successful output must not.
 if printf '%s' "$SELFTEST" | rg 'cfg\.DB' | rg -qv 'checkDatabase\(cfg\.DB\)'; then rc=1; else rc=0; fi
 ck "自检不把数据库路径作为展示文本" 0 "$rc"
-if grep -q '"\$CORE_BIN" panel-info' "$ROOT/install.sh"; then rc=0; else rc=1; fi
+if rg -q 'installed_core panel-info' "$ROOT/install.sh"; then rc=0; else rc=1; fi
 ck "安装器复用 panel-info 输出" 0 "$rc"
 if grep -q '令牌在 /etc' "$ROOT/install.sh"; then rc=1; else rc=0; fi
 ck "安装输出不提示令牌文件位置" 0 "$rc"

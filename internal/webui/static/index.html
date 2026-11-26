@@ -169,13 +169,15 @@
           <label for="new-listen-port">监听端口</label>
           <input type="number" id="new-listen-port" placeholder="留空则随机" min="1" max="65535" inputmode="numeric">
         </div>
-        <div class="field full">
-          <label for="new-target">目标地址</label>
-          <input type="text" id="new-target" placeholder="IP 或域名" autocomplete="off" spellcheck="false" autocapitalize="none">
-        </div>
-        <div class="field">
-          <label for="new-target-port">目标端口</label>
-          <input type="number" id="new-target-port" min="1" max="65535" inputmode="numeric">
+        <div class="forward-destination">
+          <div class="field">
+            <label for="new-target">目标地址</label>
+            <input type="text" id="new-target" placeholder="IP 或域名" autocomplete="off" spellcheck="false" autocapitalize="none">
+          </div>
+          <div class="field">
+            <label for="new-target-port">目标端口</label>
+            <input type="number" id="new-target-port" min="1" max="65535" inputmode="numeric">
+          </div>
         </div>
       </div>
     </section>
@@ -224,13 +226,15 @@
           <label for="pol-listen-port">监听端口</label>
           <input type="number" id="pol-listen-port" min="1" max="65535" inputmode="numeric">
         </div>
-        <div class="field full">
-          <label for="pol-target">目标地址</label>
-          <input type="text" id="pol-target" autocomplete="off" spellcheck="false" autocapitalize="none">
-        </div>
-        <div class="field">
-          <label for="pol-target-port">目标端口</label>
-          <input type="number" id="pol-target-port" min="1" max="65535" inputmode="numeric">
+        <div class="forward-destination">
+          <div class="field">
+            <label for="pol-target">目标地址</label>
+            <input type="text" id="pol-target" autocomplete="off" spellcheck="false" autocapitalize="none">
+          </div>
+          <div class="field">
+            <label for="pol-target-port">目标端口</label>
+            <input type="number" id="pol-target-port" min="1" max="65535" inputmode="numeric">
+          </div>
         </div>
       </div>
       <label class="switch-row">
@@ -315,6 +319,19 @@
   </header>
   <div class="drawer-body"><div class="drawer-note">仅查看在线及因 IP 上限被拒绝的地址。</div><div id="ips-list" class="ips-list"></div></div>
 </aside>
+
+<div class="typed-confirm-mask hidden" id="typed-confirm-mask">
+  <section class="typed-confirm" id="typed-confirm" role="dialog" aria-modal="true" aria-labelledby="typed-confirm-title" aria-describedby="typed-confirm-body" tabindex="-1">
+    <h3 id="typed-confirm-title">确认删除</h3>
+    <p id="typed-confirm-body"></p>
+    <label for="typed-confirm-input">请输入「我已确定」以继续：</label>
+    <input id="typed-confirm-input" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="done">
+    <div class="typed-confirm-actions">
+      <button type="button" class="btn danger" id="typed-confirm-ok" disabled>确定删除</button>
+      <button type="button" class="btn ghost" id="typed-confirm-cancel">取消</button>
+    </div>
+  </section>
+</div>
 
 <div id="toast" role="status"></div>
 

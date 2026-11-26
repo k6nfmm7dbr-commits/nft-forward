@@ -93,12 +93,13 @@ function harness(t, hash = '', host = '203.0.113.4') {
     },
     value(sel, value) {
       el(sel).value = value;
+      el(sel).dispatchEvent(new w.Event('input', { bubbles: true }));
       el(sel).dispatchEvent(new w.Event('change', { bubbles: true }));
     },
   };
 }
 
-test('renders overview, updates cards in place, and copies IPv6 host, port and whole address', async t => {
+test('renders overview, updates cards in place, and copies IPv6 without appending the port', async t => {
   const h = harness(t, '', '[2001:db8::5]');
   await h.start();
   assert.equal(h.text('#hero-rate'), '3.00 KiB/s');
@@ -112,11 +113,13 @@ test('renders overview, updates cards in place, and copies IPv6 host, port and w
   assert.equal(h.el('.node-card'), card);
   assert.equal(h.text('[data-rule-today]'), '2.00 KiB');
   assert.equal(h.text('[data-status="1"]'), '流量已达限');
-  h.click('[data-copy-val="2001:db8::5"]');
+  const copyIP = '.rule-addr .mini-btn';
+  assert.equal(h.text(copyIP), '复制 IP');
+  h.click('.addr-token[data-copy-val="2001:db8::5"]');
   h.click('[data-copy-val="10443"]');
-  h.click('[data-copy-val="2001:db8::5 10443"]');
+  h.click(copyIP);
   await settle();
-  assert.deepEqual(h.copied, ['2001:db8::5', '10443', '2001:db8::5 10443']);
+  assert.deepEqual(h.copied, ['2001:db8::5', '10443', '2001:db8::5']);
   // Plain-HTTP clipboard fallback and focus restoration inside the IP-target drawer.
   Object.defineProperty(h.w.navigator, 'clipboard', { value: undefined });
   h.w.document.execCommand = command => {
@@ -124,9 +127,10 @@ test('renders overview, updates cards in place, and copies IPv6 host, port and w
   };
   h.click('[data-manage="1"]');
   assert.ok(h.el('#pol-dns-sect').classList.contains('hidden'));
-  const copy = h.el('#pol-address [data-copy-val="2001:db8::5 10443"]');
+  const copy = h.el('#pol-address .mini-btn');
+  assert.equal(copy.textContent, '复制 IP');
   copy.focus(); copy.click();
-  assert.equal(h.copied.at(-1), '2001:db8::5 10443');
+  assert.equal(h.copied.at(-1), '2001:db8::5');
   assert.equal(h.w.document.activeElement, copy);
   assert.equal(h.el('.logout-form').getAttribute('method'), 'post');
   assert.equal(h.el('.logout-form').getAttribute('action'), 'logout');
@@ -134,7 +138,11 @@ test('renders overview, updates cards in place, and copies IPv6 host, port and w
 
 test('creates one rule with random-port sentinel, validates, and restores drawer focus', async t => {
   const h = harness(t); await h.start();
+  h.click('.rule-addr .mini-btn'); await settle();
+  assert.deepEqual(h.copied, ['203.0.113.4']);
   h.click('#btn-new-rule');
+  assert.equal(h.el('#new-target').closest('.forward-destination'), h.el('#new-target-port').closest('.forward-destination'));
+  assert.ok(h.el('#new-drawer .forward-destination'));
   assert.equal(h.w.document.activeElement.id, 'new-close');
   h.key('Tab', h.w.document, true);
   assert.equal(h.w.document.activeElement.id, 'new-submit');
@@ -162,6 +170,8 @@ test('creates one rule with random-port sentinel, validates, and restores drawer
 test('edits forwarding and policy, preserves read-only DNS, and separates resets and deletion', async t => {
   const h = harness(t); await h.start();
   h.click('[data-manage="2"]');
+  assert.equal(h.el('#pol-target').closest('.forward-destination'), h.el('#pol-target-port').closest('.forward-destination'));
+  assert.ok(h.el('#policy-drawer .forward-destination'));
   assert.equal(h.text('#pol-dns-host'), beta.target_address);
   assert.equal(h.text('#pol-dns-v6'), beta.resolved_ipv6);
   assert.equal(h.el('#pol-dns-sect').querySelectorAll('input, select, button').length, 0);
@@ -192,15 +202,60 @@ test('edits forwarding and policy, preserves read-only DNS, and separates resets
   assert.equal(h.el('#policy-drawer').getAttribute('aria-hidden'), 'true');
   h.take('api/summary').send(snap([alpha, { ...edited, ...policy.body }])); await settle();
   h.click('[data-manage="1"]');
-  h.w.confirm = () => false;
-  h.click('#pol-delete'); assert.ok(!h.calls.some(c => c.method === 'DELETE'));
-  h.w.confirm = () => true;
   h.click('#pol-quota-reset'); h.take('api/rules/1/quota/reset', 'POST').send({ quota_used_bytes: 0 }); await settle();
   assert.equal(h.text('#pol-quota-used'), '0 B');
   h.take('api/summary').send(snap([{ ...alpha, quota: { ...alpha.quota, quota_used_bytes: 0 } }, edited])); await settle();
-  h.click('#pol-delete'); h.take('api/rules/1', 'DELETE').send({}); await settle();
+  h.click('#pol-delete');
+  h.value('#typed-confirm-input', '我已确定');
+  h.click('#typed-confirm-ok');
+  h.take('api/rules/1', 'DELETE').send({}); await settle();
   h.take('api/summary').send(snap([edited])); await settle();
   assert.equal(h.w.document.querySelector('[data-manage="1"]'), null);
+});
+
+test('requires 我已确定 for the current rule and cancels without sending DELETE', async t => {
+  const h = harness(t); await h.start();
+  const mask = h.el('#typed-confirm-mask');
+  const input = h.el('#typed-confirm-input');
+  const ok = h.el('#typed-confirm-ok');
+  const drawer = h.el('#policy-drawer');
+  const noDelete = () => assert.ok(!h.calls.some(c => c.method === 'DELETE'));
+  h.w.confirm = () => { throw new Error('Delete must not use a native confirm'); };
+
+  h.click('[data-manage="1"]'); h.click('#pol-delete');
+  assert.ok(drawer.hasAttribute('inert'));
+  assert.match(h.text('#typed-confirm-body'), /IPv4 <demo>.*历史流量统计仍保留/);
+  assert.equal(h.el('#typed-confirm-body').children.length, 0);
+  h.key('Tab'); assert.equal(h.w.document.activeElement, input);
+  for (const value of ['', '我已确认', '我已确定删除']) {
+    h.value('#typed-confirm-input', value);
+    assert.ok(ok.disabled);
+    h.click('#typed-confirm-ok'); h.key('Enter', input); noDelete();
+  }
+  h.value('#typed-confirm-input', '我已确定');
+  assert.ok(!ok.disabled);
+  input.dispatchEvent(new h.w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, isComposing: true }));
+  noDelete();
+  h.key('Escape', input);
+  assert.ok(mask.classList.contains('hidden') && !drawer.hasAttribute('inert'));
+  assert.equal(h.w.document.activeElement.id, 'pol-delete');
+  noDelete();
+
+  h.click('#pol-delete');
+  assert.equal(input.value, ''); assert.ok(ok.disabled);
+  h.click('#typed-confirm-cancel'); noDelete();
+  h.click('#pol-delete'); h.click('#typed-confirm-mask'); noDelete();
+  h.click('#pol-delete'); h.value('#typed-confirm-input', '我已确定');
+  h.click('[data-manage="2"]');
+  assert.ok(mask.classList.contains('hidden'));
+  h.click('#typed-confirm-ok'); noDelete();
+
+  h.click('#pol-delete'); h.value('#typed-confirm-input', ' 我已确定 ');
+  h.key('Enter', input); h.key('Enter', input);
+  h.take('api/rules/2', 'DELETE').send({ error: '删除失败' }, 409); await settle();
+  noDelete();
+  assert.match(h.text('#pol-error'), /删除失败/);
+  h.click('#pol-delete'); assert.equal(input.value, ''); assert.ok(ok.disabled);
 });
 
 test('ignores old summary/live after SSE and old IP reads across drawer sessions and snapshots', async t => {
@@ -236,7 +291,10 @@ test('keeps late write results out of a different drawer', async t => {
   assert.equal(h.text('#drawer-rule-name'), beta.name);
   assert.equal(h.text('#pol-quota-used'), '—');
   h.take('api/summary').send(snap()); await settle();
-  h.click('#pol-delete'); const del = h.take('api/rules/2', 'DELETE');
+  h.click('#pol-delete');
+  h.value('#typed-confirm-input', '我已确定');
+  h.click('#typed-confirm-ok');
+  const del = h.take('api/rules/2', 'DELETE');
   h.key('Escape'); h.click('[data-manage="1"]');
   del.send({ error: 'previous drawer error' }, 409); await settle();
   assert.ok(h.el('#pol-error').classList.contains('hidden'));

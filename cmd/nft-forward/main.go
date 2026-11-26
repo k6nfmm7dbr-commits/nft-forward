@@ -13,6 +13,7 @@
 //	nft-forward config-ensure-all      一次完成上面三项（安装器用）
 //	nft-forward panel-port-check <p>   只校验新面板端口（不写入）
 //	nft-forward panel-port-set <p>     校验并写入新面板端口，输出 old_port=<旧端口>
+//	nft-forward panel-url              只打印面板地址
 //	nft-forward panel-info             打印面板地址与访问令牌
 //	nft-forward clear                  只删除 nff_* 自有表（不清系统规则）
 //	nft-forward（无参数）               运维菜单（不含规则 CRUD，规则统一走 Web 面板）
@@ -35,8 +36,7 @@ import (
 func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
-		menu()
-		return
+		os.Exit(menu())
 	}
 	switch args[0] {
 	case "serve":
@@ -152,19 +152,27 @@ func main() {
 			fmt.Printf("warn=%s\n", warn)
 		}
 		fmt.Println("ok")
-	case "panel-info":
+	case "panel-url", "--panel-url":
+		os.Exit(panelURL())
+	case "panel-info", "--panel-info":
 		os.Exit(panelInfo())
 	case "version", "--version", "-v":
 		fmt.Println(version.Name, "v"+version.Version)
 	case "menu":
-		menu()
+		os.Exit(menu())
+	case "help", "--help", "-h":
+		printUsage()
 	default:
 		fmt.Println("未知命令:", args[0])
-		fmt.Println("可用: serve / selftest / config-get / config-set / config-migrate / " +
-			"config-ensure-token / config-ensure-port / config-ensure-entry / config-ensure-all / config-restore-last-good / " +
-			"panel-port-check / panel-port-set / panel-info / clear / version")
+		printUsage()
 		os.Exit(1)
 	}
+}
+
+func printUsage() {
+	fmt.Println("可用: serve / selftest / config-get / config-set / config-migrate / " +
+		"config-ensure-token / config-ensure-port / config-ensure-entry / config-ensure-all / config-restore-last-good / " +
+		"panel-port-check / panel-port-set / panel-url / panel-info / menu / clear / version")
 }
 
 // ensureAll commits all three prerequisites together, or none on failure.

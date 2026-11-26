@@ -232,13 +232,12 @@ function ruleIPCount(r) {
   return ipCountText(ips.granted_count ?? r.active_ip_count, ips.limited ?? r.ip_limit_enabled, ips.max_ips ?? r.ip_limit_max);
 }
 function addressButtons(port, label) {
-  var host = addrHost();
-  var address = esc(host + ' ' + port);
+  var host = esc(addrHost());
   return '<div class="addr-group">' + (label ? '<span class="addr-label">转发地址</span>' : '') +
     '<div class="addr-text">' +
-    '<button type="button" class="addr-token" data-copy-val="' + esc(host) + '" title="复制主机" aria-label="复制主机 ' + esc(host) + '">' + esc(host) + '</button> ' +
+    '<button type="button" class="addr-token" data-copy-val="' + host + '" title="复制 IP" aria-label="复制 IP ' + host + '">' + host + '</button> ' +
     '<button type="button" class="addr-token" data-copy-val="' + esc(port) + '" title="复制端口" aria-label="复制端口 ' + esc(port) + '">' + esc(port) + '</button>' +
-    '</div></div><button type="button" class="mini-btn" data-copy-val="' + address + '" title="复制主机和端口" aria-label="复制地址 ' + address + '">复制地址</button>';
+    '</div></div><button type="button" class="mini-btn" data-copy-val="' + host + '" aria-label="复制 IP ' + host + '">复制 IP</button>';
 }
 function ruleCard(r) {
   var st = statusOf(r.status), id = esc(r.id);
@@ -541,6 +540,7 @@ function isDrawer(id, session) {
 }
 function closeDrawer(id) {
   if (!isDrawer(id)) return;
+  if (deleteConfirmation) closeDeleteConfirmation(false);
   drawer.classList.remove('on');
   drawer.setAttribute('inert', '');
   var closed = drawer;
@@ -837,9 +837,47 @@ function resetQuota() {
     setText('pol-quota-used', fmtBytes(d.quota_used_bytes || 0));
   });
 }
+var deleteConfirmation = null;
+var deletePhrase = '我已确定';
+
+function updateDeleteConfirmation() {
+  var input = document.getElementById('typed-confirm-input');
+  document.getElementById('typed-confirm-ok').disabled = !deleteConfirmation || input.value.trim() !== deletePhrase;
+}
+function closeDeleteConfirmation(restoreFocus) {
+  var pending = deleteConfirmation;
+  if (!pending) return;
+  deleteConfirmation = null;
+  document.getElementById('typed-confirm-mask').classList.add('hidden');
+  document.getElementById('typed-confirm-input').value = '';
+  updateDeleteConfirmation();
+  if (isDrawer('policy-drawer', pending.session)) {
+    drawer.removeAttribute('inert');
+    drawer.setAttribute('aria-hidden', 'false');
+    if (restoreFocus) {
+      var button = document.getElementById('pol-delete');
+      (button.disabled ? document.getElementById('drawer-close') : button).focus({ preventScroll: true });
+    }
+  }
+}
 function deleteRule() {
   var r = policyState.rule;
-  if (!r || policyBusy[r.id] || !window.confirm('确认删除规则「' + r.name + '」？\n转发会立即停止；历史流量统计仍保留。')) return;
+  var saved = r && ruleById(r.id);
+  if (deleteConfirmation || !isDrawer('policy-drawer') || !saved || policyBusy[r.id]) return;
+  deleteConfirmation = { id: r.id, session: drawerSession };
+  setText('typed-confirm-body', '删除「' + saved.name + '」后将停止转发，历史流量统计仍保留。');
+  document.getElementById('typed-confirm-input').value = '';
+  updateDeleteConfirmation();
+  document.getElementById('typed-confirm-mask').classList.remove('hidden');
+  document.getElementById('typed-confirm').focus({ preventScroll: true });
+  drawer.setAttribute('inert', '');
+  drawer.setAttribute('aria-hidden', 'true');
+}
+function confirmDeleteRule() {
+  var pending = deleteConfirmation;
+  if (!pending || document.getElementById('typed-confirm-input').value.trim() !== deletePhrase) return;
+  closeDeleteConfirmation(true);
+  if (!isDrawer('policy-drawer', pending.session) || !policyState.rule || policyState.rule.id !== pending.id) return;
   policyAction('pol-delete', function (id) {
     return mutate('DELETE', '/api/rules/' + id);
   }, '规则已删除', function () { closeDrawer('policy-drawer'); });
@@ -951,13 +989,25 @@ document.getElementById('pol-cancel').addEventListener('click', function () { cl
 document.getElementById('pol-save').addEventListener('click', savePolicy);
 document.getElementById('pol-quota-reset').addEventListener('click', resetQuota);
 document.getElementById('pol-delete').addEventListener('click', deleteRule);
+document.getElementById('typed-confirm-input').addEventListener('input', updateDeleteConfirmation);
+document.getElementById('typed-confirm-ok').addEventListener('click', confirmDeleteRule);
+document.getElementById('typed-confirm-cancel').addEventListener('click', function () { closeDeleteConfirmation(true); });
+document.getElementById('typed-confirm-mask').addEventListener('click', function (e) {
+  if (e.target === this) closeDeleteConfirmation(true);
+});
 document.getElementById('ips-close').addEventListener('click', function () { closeDrawer('ips-drawer'); });
 document.getElementById('drawer-mask').addEventListener('click', closeAllDrawers);
 document.addEventListener('keydown', function (e) {
   if (!drawer) return;
+  if (e.isComposing || e.keyCode === 229) return;
+  if (deleteConfirmation && e.key === 'Escape') { e.preventDefault(); closeDeleteConfirmation(true); return; }
+  if (deleteConfirmation && e.key === 'Enter' && e.target.id === 'typed-confirm-input') {
+    e.preventDefault(); confirmDeleteRule(); return;
+  }
   if (e.key === 'Escape') { e.preventDefault(); closeAllDrawers(); return; }
   if (e.key !== 'Tab') return;
-  var stops = Array.from(drawer.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled)'))
+  var focusScope = deleteConfirmation ? document.getElementById('typed-confirm') : drawer;
+  var stops = Array.from(focusScope.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled)'))
     .filter(function (el) { return !el.closest('.hidden'); });
   var first = stops[0], last = stops[stops.length - 1], current = document.activeElement;
   if (!stops.includes(current) || (e.shiftKey ? current === first : current === last)) {
