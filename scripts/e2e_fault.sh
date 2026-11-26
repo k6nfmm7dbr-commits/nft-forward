@@ -307,8 +307,13 @@ nff_curl -X DELETE "$API/api/rules/$RID" >/dev/null
 sleep 3
 if nft list table ip nff_nat4 2>/dev/null | grep -q "dport $PORT2"; then rc=1; else rc=0; fi
 ck "删除规则后 DNAT 真的撤销（API 成功 == nft 一致）" 0 "$rc"
-if nft list table inet nff_filter 2>/dev/null | grep -q "nff_filter_up_$RID"; then rc=1; else rc=0; fi
-ck "删除规则后遗留 counter 已清理" 0 "$rc"
+# 名称计数器继续保留，供采集器读取撤下规则前的最后一段流量。
+if nft list counter inet nff_filter "nff_filter_up_$RID" >/dev/null 2>&1 &&
+   nft list counter inet nff_filter "nff_filter_down_$RID" >/dev/null 2>&1; then rc=0; else rc=1; fi
+ck "删除规则后保留退役计数器供采集" 0 "$rc"
+if fwd=$(nft list chain inet nff_filter nff_filter_forward 2>/dev/null) &&
+   ! printf '%s\n' "$fwd" | grep -Eq "counter name nff_filter_(up|down)_${RID}([[:space:]]|$)"; then rc=0; else rc=1; fi
+ck "删除规则后转发链不再引用退役计数器" 0 "$rc"
 # 清理 IPv6 测试规则
 nff_curl -X DELETE "$API/api/rules/$RID6" >/dev/null
 
