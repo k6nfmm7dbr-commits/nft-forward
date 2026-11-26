@@ -169,7 +169,7 @@ for m in 'store.Create' 'store.Update(' 'store.SoftDelete' 'store.HardDelete' 'n
 done
 grep -q 's.rules.Create' "$ROOT/internal/api/rules.go"; ck "创建规则走 rulesvc" 0 $?
 grep -q 's.rules.UpdatePolicy' "$ROOT/internal/api/rules.go"; ck "配额/IP 限制走 rulesvc" 0 $?
-rg -q 'committed, rerr := s.store.ListActive\(rctx\)' "$ROOT/internal/rulesvc/service.go" && rg -q 's.enforcer.ApplyRules\(rctx, committed\)' "$ROOT/internal/rulesvc/service.go"; ck "rulesvc 失败后从已提交状态恢复" 0 $?
+grep -Fq 'committed, rerr := s.store.ListActive(rctx)' "$ROOT/internal/rulesvc/service.go" && grep -Fq 's.enforcer.ApplyRules(rctx, committed)' "$ROOT/internal/rulesvc/service.go"; ck "rulesvc 失败后从已提交状态恢复" 0 $?
 grep -q 'hold()' "$ROOT/internal/rulesvc/service.go"; ck "rulesvc 与周期 reconcile 互斥" 0 $?
 
 # ---- G. 无 Git Tag 依赖 ----
@@ -326,7 +326,7 @@ ck "已移除 per-rule QueryRow" 0 "$rc"
 grep -q 'placeholders(' "$ROOT/internal/api/handlers.go"; ck "批量查询用参数占位符（无拼接注入）" 0 $?
 grep -q 'dnsConcurrency' "$ROOT/internal/rulesvc/service.go"; ck "DNS 刷新有并发上限" 0 $?
 grep -q 's.mu.Unlock()' "$ROOT/internal/rulesvc/service.go"; ck "RefreshDNS 分段释放锁" 0 $?
-rg -Fq '!ok || *cur != *res.original' "$ROOT/internal/rulesvc/service.go"; ck "过期 DNS 结果被丢弃" 0 $?
+grep -Fq '!ok || *cur != *res.original' "$ROOT/internal/rulesvc/service.go"; ck "过期 DNS 结果被丢弃" 0 $?
 grep -q 'func (c \*Collector) LiveSnapshot' "$ROOT/internal/traffic/collector.go"; ck "collector 暴露实时快照" 0 $?
 grep -q 'live.Used(' "$ROOT/internal/policy/service.go"; ck "配额使用实时用量" 0 $?
 grep -q 'func (s \*Service) allLifetimeBytes' "$ROOT/internal/policy/service.go"; ck "配额兜底路径批量读库" 0 $?
@@ -362,15 +362,15 @@ if awk '/^start_service\(\)/{seen_start=1} /rm -f "\$CORE_BIN.bak"/{if(!seen_sta
 ck "旧二进制备份不在替换后立即删除" 0 "$rc"
 
 # ---- N. 菜单极简 ----
-MENU=$(rg -A 24 '^main_menu\(\)' "$ROOT/install.sh")
-if printf '%s' "$MENU" | rg -q '配置文件|数据库位于|sysctl|安装目录|程序目录|Web Root|/etc/'; then rc=1; else rc=0; fi
+MENU=$(sed -n '/^main_menu()/,/^}/p' "$ROOT/install.sh")
+if printf '%s' "$MENU" | grep -qE '配置文件|数据库位于|sysctl|安装目录|程序目录|Web Root|/etc/'; then rc=1; else rc=0; fi
 ck "nff 菜单不显示配置/数据库/sysctl 路径" 0 "$rc"
-rg -q '查看面板信息' "$ROOT/install.sh"; ck "菜单项为「查看面板信息」" 0 $?
-rg -q '^func panelInfo' "$ROOT/cmd/nft-forward/ops.go"; ck "存在 panel-info 输出" 0 $?
-PINFO=$(rg -A 20 '^func printPanel\(' "$ROOT/cmd/nft-forward/ops.go")
-printf '%s' "$PINFO" | rg -q '面板地址'; ck "面板信息含面板地址" 0 $?
-printf '%s' "$PINFO" | rg -q '访问令牌'; ck "面板信息含访问令牌" 0 $?
-if printf '%s' "$PINFO" | rg -q 'panel.json|/etc/'; then rc=1; else rc=0; fi
+grep -Fq '查看面板信息' "$ROOT/install.sh"; ck "菜单项为「查看面板信息」" 0 $?
+grep -q '^func panelInfo' "$ROOT/cmd/nft-forward/ops.go"; ck "存在 panel-info 输出" 0 $?
+PINFO=$(sed -n '/^func printPanel(/,/^}/p' "$ROOT/cmd/nft-forward/ops.go")
+printf '%s' "$PINFO" | grep -Fq '面板地址'; ck "面板信息含面板地址" 0 $?
+printf '%s' "$PINFO" | grep -Fq '访问令牌'; ck "面板信息含访问令牌" 0 $?
+if printf '%s' "$PINFO" | grep -qE 'panel\.json|/etc/'; then rc=1; else rc=0; fi
 ck "面板信息不暴露令牌存储路径" 0 "$rc"
 SELFTEST=$(sed -n '/^func selfTest/,/^}/p' "$ROOT/cmd/nft-forward/ops.go")
 for item in SQLite nftables 'nft netlink' 'owned tables' ip_forward conntrack ct_acct 'web server' authentication; do
@@ -379,9 +379,9 @@ done
 if printf '%s' "$SELFTEST" | grep -qE 'cfg\.SysctlConf|panel\.json|"/etc/'; then rc=1; else rc=0; fi
 ck "自检正常输出不打印文件路径" 0 "$rc"
 # The read-only database probe may use the path, but successful output must not.
-if printf '%s' "$SELFTEST" | rg 'cfg\.DB' | rg -qv 'checkDatabase\(cfg\.DB\)'; then rc=1; else rc=0; fi
+if printf '%s' "$SELFTEST" | grep -F 'cfg.DB' | grep -Fqv 'checkDatabase(cfg.DB)'; then rc=1; else rc=0; fi
 ck "自检不把数据库路径作为展示文本" 0 "$rc"
-if rg -q 'installed_core panel-info' "$ROOT/install.sh"; then rc=0; else rc=1; fi
+if grep -Fq 'installed_core panel-info' "$ROOT/install.sh"; then rc=0; else rc=1; fi
 ck "安装器复用 panel-info 输出" 0 "$rc"
 if grep -q '令牌在 /etc' "$ROOT/install.sh"; then rc=1; else rc=0; fi
 ck "安装输出不提示令牌文件位置" 0 "$rc"
@@ -434,12 +434,11 @@ grep -qx 'install.sh' "$ROOT/scripts/dist-manifest.txt"; ck "分发清单含 ins
 grep -qx 'install.sh.sha256' "$ROOT/scripts/dist-manifest.txt"; ck "分发清单含 install.sh.sha256" 0 $?
 grep -q 'install.sh.sha256' "$ROOT/scripts/artifact_check.sh"; ck "产物自检校验安装器哈希" 0 $?
 
-# M-4b Go 工具链与依赖：与 SBX 一致的 1.27.1（Go 1.23 的标准库带已知 CVE，
-# govulncheck 曾报出 10 条 net/http / crypto/tls / crypto/x509 / net/url 漏洞）。
+# M-4b Go 工具链与依赖：跟随 SBX 的标准库安全补丁。
 GOMOD="$ROOT/go.mod"
-grep -qE '^go 1\.27' "$GOMOD"; ck "go.mod 使用 Go 1.27 工具链" 0 $?
-grep -q 'x/sys v0.44.0' "$GOMOD"; ck "x/sys 已升到修复版（v0.44.0）" 0 $?
-grep -q 'go-version: "1.27.1"' "$ROOT/.github/workflows/ci.yml"; ck "CI 使用 Go 1.27.1" 0 $?
+grep -Fxq 'go 1.27.4' "$GOMOD"; ck "go.mod 使用 Go 1.27.4 工具链" 0 $?
+grep -Fq 'x/sys v0.44.0' "$GOMOD"; ck "x/sys 已升到修复版（v0.44.0）" 0 $?
+grep -Fq 'go-version: "1.27.4"' "$ROOT/.github/workflows/ci.yml"; ck "CI 使用 Go 1.27.4" 0 $?
 grep -q 'golang:1.27-alpine' "$ROOT/.github/workflows/ci.yml"; ck "musl 任务用 1.27 镜像" 0 $?
 
 # M-4c 单规则趋势必须有覆盖索引（否则每次都是全表扫描）。

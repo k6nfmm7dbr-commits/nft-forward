@@ -19,7 +19,7 @@ jobs:
       # actions/setup-go@v5
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: "1.27.1"
+          go-version: "1.27.4"
 
       - name: gofmt
         run: |
@@ -201,7 +201,7 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: "1.27.1"
+          go-version: "1.27.4"
 
       - name: govulncheck
         run: |
@@ -230,7 +230,7 @@ jobs:
       # actions/setup-go@v5
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: "1.27.1"
+          go-version: "1.27.4"
 
       - name: 判断是否影响产物/安装器（纯 docs 跳过）
         id: changed

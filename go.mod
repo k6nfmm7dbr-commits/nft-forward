@@ -1,6 +1,6 @@
 module github.com/k6nfmm7dbr-commits/nft-forward
 
-go 1.27.1
+go 1.27.4
 
 require modernc.org/sqlite v1.34.5
 

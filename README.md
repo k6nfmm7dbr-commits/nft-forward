@@ -4,7 +4,7 @@
 
 <p>
   <img alt="version" src="https://img.shields.io/badge/version-v0.4.0-blue">
-  <img alt="go" src="https://img.shields.io/badge/Go-1.27.1%2B-00ADD8">
+  <img alt="go" src="https://img.shields.io/badge/Go-1.27.4%2B-00ADD8">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
   <img alt="backend" src="https://img.shields.io/badge/dataplane-nftables--only-orange">
   <img alt="cgo" src="https://img.shields.io/badge/CGO-disabled-lightgrey">
@@ -213,7 +213,7 @@ conntrack 的状态被显式分成四种，只有第一种允许做在线判定�
 
 ## 构建
 
-要求 **Go 1.27.1+**（与 CI、musl 任务、发布产物使用同一版本）。固定在更早的
+要求 **Go 1.27.4+**（与 CI、musl 任务、发布产物使用同一版本）。固定在更早的
 Go 1.23 会让标准库带着已知 CVE（`govulncheck` 曾报出 10 条 `net/http` /
 `crypto/tls` / `crypto/x509` / `net/url` 漏洞），因此工具链版本属于安全约束。
 
